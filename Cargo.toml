@@ -1,0 +1,14 @@
+# The "workspace": one list of all the code packages (crates) in this project,
+# so they are built and tested together.
+[workspace]
+resolver = "2"
+members = [
+    "crates/park-core",
+    "crates/park-sim",
+    # "crates/park-web" is left out on purpose until the browser previewer starts.
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"

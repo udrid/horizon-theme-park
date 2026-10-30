@@ -1,0 +1,8 @@
+[package]
+name = "park-core"
+description = "Pure Rust logic for Horizon Theme Park (track maths, physics, rides). No Minecraft code."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

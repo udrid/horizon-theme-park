@@ -1,0 +1,20 @@
+# Rust build output (big, rebuilt any time)
+target/
+
+# Horizon's local data and any Minecraft/Mojang files must never be committed
+.local/
+*.jar
+.minecraft/
+versions/
+assets/indexes/
+assets/objects/
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Secrets: never commit keys
+.env
+*.key

@@ -1,0 +1,23 @@
+# CI: GitHub runs these checks on every push and pull request.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # Download a copy of the repo onto the robot's computer
+      - uses: actions/checkout@v4
+      # Install Rust with the formatting and linting tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # 1. Is the code formatted neatly?
+      - run: cargo fmt --all --check
+      # 2. Does the linter find mistakes or bad habits? (warnings count as failures)
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # 3. Do all the tests pass?
+      - run: cargo test --workspace

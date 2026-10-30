@@ -1,0 +1,9 @@
+[package]
+name = "park-sim"
+description = "Command-line tool that runs park-core and prints results (later: speed and g-force tables)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+park-core = { path = "../park-core" }
