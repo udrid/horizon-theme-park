@@ -8,6 +8,7 @@
 //! with a default that says "not available", so this stays the only door [D7].
 
 use glam::DVec3;
+use std::path::PathBuf;
 
 /// What park-core knows about one player who is fully in the world.
 #[derive(Clone, Debug, PartialEq)]
@@ -36,6 +37,11 @@ pub trait Host {
     fn action_bar(&mut self, _player: u128, _text: &str) -> bool {
         false
     }
+    /// The open world's folder (F5), where rides are saved. `None` when no world is open (or the
+    /// host does not know); nothing is saved then.
+    fn world_dir(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// A pretend game for tests: it records every call, in order.
@@ -55,6 +61,8 @@ pub struct FakeHost {
     pub logs: Vec<String>,
     /// Every action-bar line, as (player, text).
     pub action_bars: Vec<(u128, String)>,
+    /// The world folder the pretend game reports (`None` = no folder).
+    pub world: Option<PathBuf>,
 }
 
 impl FakeHost {
@@ -97,6 +105,10 @@ impl Host for FakeHost {
     fn action_bar(&mut self, player: u128, text: &str) -> bool {
         self.action_bars.push((player, text.to_string()));
         true
+    }
+
+    fn world_dir(&self) -> Option<PathBuf> {
+        self.world.clone()
     }
 }
 

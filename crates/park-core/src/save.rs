@@ -156,7 +156,9 @@ impl std::fmt::Display for LoadError {
                 f,
                 "it was saved by a newer version of the mod (format {found}, this one knows {known}); it was left untouched"
             ),
-            LoadError::Broken(why) => write!(f, "the file is damaged ({why}); it was left untouched"),
+            LoadError::Broken(why) => {
+                write!(f, "the file is damaged ({why}); it was left untouched")
+            }
             LoadError::Unreadable(why) => write!(f, "the file could not be read ({why})"),
         }
     }
@@ -226,7 +228,9 @@ pub fn parse_ride(text: &str) -> Result<RideFile, LoadError> {
         .iter()
         .any(|n| n.pos.iter().any(|c| !c.is_finite()))
     {
-        return Err(LoadError::Broken("a node has a position that is not a number".to_string()));
+        return Err(LoadError::Broken(
+            "a node has a position that is not a number".to_string(),
+        ));
     }
     Ok(ride)
 }

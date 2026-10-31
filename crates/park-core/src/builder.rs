@@ -70,7 +70,9 @@ pub fn check_name(name: &str) -> Result<(), String> {
         && !rest.is_empty()
         && rest.chars().all(|c| c.is_ascii_digit())
     {
-        return Err("Please pick another name: \"s\" and a number is kept for the mod itself.".to_string());
+        return Err(
+            "Please pick another name: \"s\" and a number is kept for the mod itself.".to_string(),
+        );
     }
     if name == "demo" {
         return Err("\"demo\" is the name of /coaster demo; please pick another name.".to_string());
@@ -101,8 +103,15 @@ pub struct Session {
     pub editing: Option<String>,
     /// The tick of the last wand use.
     pub last_use: u64,
-    /// Are the node markers and the preview on show right now?
-    pub showing: bool,
+    /// How many node markers are on show in the world right now (kept in step by the runtime).
+    pub markers: usize,
+    /// Count of changes to `nodes`; the preview is redrawn when it moves on.
+    pub version: u64,
+    /// The preview points for `preview_version` (worked out by the runtime).
+    pub preview: Vec<DVec3>,
+    pub preview_version: u64,
+    /// The markers belong to other nodes (after `edit` or `create`): remove them all first.
+    pub reload: bool,
 }
 
 /// All wand sessions, one per player.
@@ -149,7 +158,11 @@ impl Builder {
                     mode: Kind::Track,
                     editing: None,
                     last_use: now,
-                    showing: false,
+                    markers: 0,
+                    version: 0,
+                    preview: Vec::new(),
+                    preview_version: u64::MAX,
+                    reload: false,
                 });
                 self.sessions.len() - 1
             }
@@ -168,6 +181,7 @@ impl Builder {
             roll: 0.0,
             kind,
         });
+        session.version += 1;
         session.nodes.len()
     }
 
@@ -185,6 +199,7 @@ impl Builder {
     pub fn undo(&mut self, uuid: u128, now: u64) -> Option<usize> {
         let session = self.entry(uuid, now);
         session.nodes.pop()?;
+        session.version += 1;
         Some(session.nodes.len() + 1)
     }
 
@@ -194,7 +209,8 @@ impl Builder {
         session.nodes = ride.nodes.clone();
         session.mode = Kind::Track;
         session.editing = Some(ride.id.clone());
-        session.showing = false;
+        session.version += 1;
+        session.reload = true;
     }
 
     /// Start over with no nodes (after a successful `create`).
@@ -203,6 +219,8 @@ impl Builder {
             session.nodes.clear();
             session.mode = Kind::Track;
             session.editing = None;
+            session.version += 1;
+            session.reload = true;
         }
     }
 
@@ -272,7 +290,11 @@ fn node_distances(track: &Track, table: &Table) -> Vec<f64> {
         sums.push(sums[sums.len() - 1] + length);
     }
     let total = sums[sums.len() - 1];
-    let scale = if total > 0.0 { table.length() / total } else { 0.0 };
+    let scale = if total > 0.0 {
+        table.length() / total
+    } else {
+        0.0
+    };
     sums.iter().map(|s| s * scale).collect()
 }
 
@@ -398,7 +420,9 @@ pub fn course_from(ride: &RideFile) -> Result<Course, String> {
         return Err("There is no station. Right-click the air until the wand says \"station\", place the station's nodes, then switch back to track.".to_string());
     }
     if stations > 1 {
-        return Err("There is more than one station. A ride has exactly one station stretch.".to_string());
+        return Err(
+            "There is more than one station. A ride has exactly one station stretch.".to_string(),
+        );
     }
 
     // Vertical track would break the level frames (D59): refuse it with the place.
@@ -419,7 +443,7 @@ pub fn course_from(ride: &RideFile) -> Result<Course, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn node(pos: [f64; 3], kind: Kind) -> NodeFile {
@@ -495,7 +519,10 @@ mod tests {
         // Two nodes closer than a block.
         b.click_block(1, [10, 64, 10], 0); // the same spot twice
         let error = b.create(1, "x", none).unwrap_err();
-        assert!(error.starts_with("Nodes 4 and 5 are only 0.0 blocks apart"), "{error}");
+        assert!(
+            error.starts_with("Nodes 4 and 5 are only 0.0 blocks apart"),
+            "{error}"
+        );
         // The wrap-around pair counts too.
         let mut wrap = ride_with(loop_nodes());
         wrap.nodes[7].pos = [0.5, 70.0, 0.3];
@@ -534,11 +561,19 @@ mod tests {
     fn a_station_across_the_first_node_or_two_stations_are_refused() {
         let mut ride = ride_with(loop_nodes());
         ride.nodes[7].kind = Kind::Station;
-        assert!(course_from(&ride).unwrap_err().contains("first and the last"));
+        assert!(
+            course_from(&ride)
+                .unwrap_err()
+                .contains("first and the last")
+        );
         let mut two = ride_with(loop_nodes());
         two.nodes[5].kind = Kind::Station;
         two.nodes[6].kind = Kind::Station;
-        assert!(course_from(&two).unwrap_err().contains("more than one station"));
+        assert!(
+            course_from(&two)
+                .unwrap_err()
+                .contains("more than one station")
+        );
     }
 
     #[test]

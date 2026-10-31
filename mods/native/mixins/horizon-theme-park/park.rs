@@ -9,6 +9,652 @@
 // game in `host`, the exact command texts in `commands`, what to draw in `render`
 // and the per-tick loop in `runtime`.
 
+pub mod builder {
+// The track wand's brain (D62–D66): who has which nodes, what the wand's mode is, undo,
+// and turning a list of nodes into a real ride (`create`).
+//
+// Nothing here touches the game. The runtime feeds it wand clicks and asks it for answers, so
+// `cargo test` can check every rule.
+//
+// How building works, in order:
+//   1. right-click a block with the wand: a node appears 1 block above that block's centre;
+//   2. right-click the air: the wand's mode changes (track -> lift -> brake -> station);
+//      the mode is written on every node you place next, and applies from that node to the next;
+//   3. `/coaster create <name>`: the nodes close into a loop, are checked, and become a ride.
+
+use crate::game::htp_park::coaster::elements::{Course, Element, Placed};
+use crate::game::htp_park::coaster::physics::{CAR_SPACING, MAX_CARS, Physics, Train};
+use crate::game::htp_park::coaster::spline::Track;
+use crate::game::htp_park::coaster::table::Table;
+use crate::game::htp_park::save::{Kind, NodeFile, RideFile};
+use glam::DVec3;
+
+/// A ride needs at least this many nodes (D65).
+pub const MIN_NODES: usize = 4;
+/// Two neighbouring nodes must be at least this far apart, in blocks (D65).
+pub const MIN_GAP: f64 = 1.0;
+/// The longest ride name (S1).
+pub const MAX_NAME: usize = 32;
+/// The preview and the node markers stay for this many ticks after the last wand use (S2: 30 s).
+pub const PREVIEW_TICKS: u64 = 600;
+/// A node is placed this far above the clicked block's centre (D62).
+pub const NODE_LIFT: f64 = 1.0;
+/// The front car stops this far before the end of the station (the demo: 10 of 12.5 blocks).
+pub const STOP_MARGIN: f64 = 2.5;
+/// Extra room behind the last car in the station.
+pub const STATION_REAR: f64 = 1.0;
+/// A track steeper than this (the sine of its angle, about 82 degrees) is "vertical": not allowed yet.
+const MAX_STEEP: f64 = 0.99;
+
+/// The mode after `kind` when the player right-clicks the air (D63).
+pub fn next_mode(kind: Kind) -> Kind {
+    match kind {
+        Kind::Track => Kind::Lift,
+        Kind::Lift => Kind::Brake,
+        Kind::Brake => Kind::Station,
+        Kind::Station => Kind::Track,
+    }
+}
+
+/// The word shown on the action bar.
+pub fn mode_name(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Track => "track",
+        Kind::Lift => "lift",
+        Kind::Brake => "brake",
+        Kind::Station => "station",
+    }
+}
+
+/// Is `name` allowed for a ride (S1)? Lowercase letters, digits and `-`, up to 32 characters.
+/// Also refused: `s` followed only by digits, which would clash with the session tag `htp_s<n>` (D66).
+pub fn check_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.chars().count() > MAX_NAME {
+        return Err(format!("A ride name needs 1 to {MAX_NAME} characters."));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err("A ride name may only use lowercase letters, digits and -.".to_string());
+    }
+    if let Some(rest) = name.strip_prefix('s')
+        && !rest.is_empty()
+        && rest.chars().all(|c| c.is_ascii_digit())
+    {
+        return Err(
+            "Please pick another name: \"s\" and a number is kept for the mod itself.".to_string(),
+        );
+    }
+    if name == "demo" {
+        return Err("\"demo\" is the name of /coaster demo; please pick another name.".to_string());
+    }
+    Ok(())
+}
+
+/// Where a node goes when `block` is clicked (D62): 1 block above the block's centre.
+pub fn node_for_block(block: [i32; 3]) -> [f64; 3] {
+    [
+        block[0] as f64 + 0.5,
+        block[1] as f64 + 0.5 + NODE_LIFT,
+        block[2] as f64 + 0.5,
+    ]
+}
+
+fn vec(p: [f64; 3]) -> DVec3 {
+    DVec3::new(p[0], p[1], p[2])
+}
+
+/// One player's wand: the nodes so far, the mode, and what is on show.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Session {
+    pub uuid: u128,
+    pub nodes: Vec<NodeFile>,
+    pub mode: Kind,
+    /// Set by `/coaster edit`: this session may save over that ride.
+    pub editing: Option<String>,
+    /// The tick of the last wand use.
+    pub last_use: u64,
+    /// How many node markers are on show in the world right now (kept in step by the runtime).
+    pub markers: usize,
+    /// Count of changes to `nodes`; the preview is redrawn when it moves on.
+    pub version: u64,
+    /// The preview points for `preview_version` (worked out by the runtime).
+    pub preview: Vec<DVec3>,
+    pub preview_version: u64,
+    /// The markers belong to other nodes (after `edit` or `create`): remove them all first.
+    pub reload: bool,
+}
+
+/// All wand sessions, one per player.
+#[derive(Clone, Debug, Default)]
+pub struct Builder {
+    sessions: Vec<Session>,
+}
+
+impl Builder {
+    /// No sessions yet. `const`, so the runtime (kept in a `static` by the glue) can start with it.
+    pub const fn new() -> Builder {
+        Builder {
+            sessions: Vec::new(),
+        }
+    }
+
+    /// Forget everything (a new world opened).
+    pub fn clear_all(&mut self) {
+        self.sessions.clear();
+    }
+
+    /// The session of `uuid`, if they ever used the wand.
+    pub fn session(&self, uuid: u128) -> Option<&Session> {
+        self.sessions.iter().find(|s| s.uuid == uuid)
+    }
+
+    /// Every session (for the runtime's preview).
+    pub fn sessions(&self) -> &[Session] {
+        &self.sessions
+    }
+
+    /// Mutable access to every session (the runtime switches `showing` off when time is up).
+    pub fn sessions_mut(&mut self) -> &mut [Session] {
+        &mut self.sessions
+    }
+
+    fn entry(&mut self, uuid: u128, now: u64) -> &mut Session {
+        let at = match self.sessions.iter().position(|s| s.uuid == uuid) {
+            Some(at) => at,
+            None => {
+                self.sessions.push(Session {
+                    uuid,
+                    nodes: Vec::new(),
+                    mode: Kind::Track,
+                    editing: None,
+                    last_use: now,
+                    markers: 0,
+                    version: 0,
+                    preview: Vec::new(),
+                    preview_version: u64::MAX,
+                    reload: false,
+                });
+                self.sessions.len() - 1
+            }
+        };
+        let session = &mut self.sessions[at];
+        session.last_use = now;
+        session
+    }
+
+    /// Right-click on a block: add a node (D62). Returns its number (1 is the first).
+    pub fn click_block(&mut self, uuid: u128, block: [i32; 3], now: u64) -> usize {
+        let session = self.entry(uuid, now);
+        let kind = session.mode;
+        session.nodes.push(NodeFile {
+            pos: node_for_block(block),
+            roll: 0.0,
+            kind,
+        });
+        session.version += 1;
+        session.nodes.len()
+    }
+
+    /// Right-click on the air: next mode (D63).
+    pub fn click_air(&mut self, uuid: u128, now: u64) -> Kind {
+        let session = self.entry(uuid, now);
+        session.mode = next_mode(session.mode);
+        session.mode
+    }
+
+    /// Take the last node away. Returns the number it had, or `None` if there was none.
+    ///
+    /// (Horizon's stable helpers do not say whether a player is sneaking, so D62's "sneak +
+    /// right-click" cannot be heard; the runtime offers this as `/coaster undo` instead.)
+    pub fn undo(&mut self, uuid: u128, now: u64) -> Option<usize> {
+        let session = self.entry(uuid, now);
+        session.nodes.pop()?;
+        session.version += 1;
+        Some(session.nodes.len() + 1)
+    }
+
+    /// Put a saved ride's nodes into the wand to change them (`/coaster edit`).
+    pub fn load_for_edit(&mut self, uuid: u128, ride: &RideFile, now: u64) {
+        let session = self.entry(uuid, now);
+        session.nodes = ride.nodes.clone();
+        session.mode = Kind::Track;
+        session.editing = Some(ride.id.clone());
+        session.version += 1;
+        session.reload = true;
+    }
+
+    /// Start over with no nodes (after a successful `create`).
+    pub fn reset(&mut self, uuid: u128) {
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.uuid == uuid) {
+            session.nodes.clear();
+            session.mode = Kind::Track;
+            session.editing = None;
+            session.version += 1;
+            session.reload = true;
+        }
+    }
+
+    /// Check the player's nodes and make the ride `name` (D65, C4). `exists` says whether a ride
+    /// of that name is already there. A name that exists is refused unless this session loaded it
+    /// with `edit` (no silent overwrite). Returns the ride to save, with its course already checked.
+    pub fn create(
+        &self,
+        uuid: u128,
+        name: &str,
+        exists: impl Fn(&str) -> bool,
+    ) -> Result<RideFile, String> {
+        check_name(name)?;
+        let Some(session) = self.session(uuid) else {
+            return Err("You have no nodes yet. Get the wand with /coaster wand.".to_string());
+        };
+        if exists(name) && session.editing.as_deref() != Some(name) {
+            return Err(format!(
+                "A ride called {name} already exists. Use /coaster edit {name} to change it."
+            ));
+        }
+        let ride = RideFile::new(name, session.nodes.clone());
+        course_from(&ride)?;
+        Ok(ride)
+    }
+}
+
+/// The points the preview draws: the curve through the nodes every `step` blocks (S2: 0.5).
+/// With fewer than 3 nodes there is no loop yet, so only the nodes (and a line for two) show.
+/// At most `max_points` points: a long track gets a wider step instead.
+pub fn preview_points(nodes: &[NodeFile], step: f64, max_points: usize) -> Vec<DVec3> {
+    let points: Vec<DVec3> = nodes.iter().map(|n| vec(n.pos)).collect();
+    if points.len() < 3 {
+        let mut out = points.clone();
+        if let [a, b] = points[..] {
+            let n = (a.distance(b) / step).floor() as usize;
+            out.extend((1..n).map(|i| a.lerp(b, i as f64 / n as f64)));
+        }
+        return out;
+    }
+    let table = Table::new_level(&Track::closed(&points));
+    if table.is_empty() {
+        return points;
+    }
+    let step = step.max(table.length() / max_points.max(1) as f64);
+    let mut out = Vec::new();
+    let mut s = 0.0;
+    while s < table.length() {
+        out.push(table.position(s));
+        s += step;
+    }
+    out
+}
+
+/// The distance along the lap of every node, plus the lap's length at the end (so `n + 1` numbers).
+/// Each curve between two nodes is measured with 64 little steps, then scaled to the table's length.
+fn node_distances(track: &Track, table: &Table) -> Vec<f64> {
+    let mut sums = vec![0.0];
+    for segment in track.segments() {
+        let mut length = 0.0;
+        let mut last = segment.point(0.0);
+        for i in 1..=64 {
+            let p = segment.point(i as f64 / 64.0);
+            length += p.distance(last);
+            last = p;
+        }
+        sums.push(sums[sums.len() - 1] + length);
+    }
+    let total = sums[sums.len() - 1];
+    let scale = if total > 0.0 {
+        table.length() / total
+    } else {
+        0.0
+    };
+    sums.iter().map(|s| s * scale).collect()
+}
+
+/// The physics numbers saved with a ride.
+pub fn physics_of(ride: &RideFile) -> Physics {
+    Physics {
+        gravity_scale: ride.settings.gravity_scale,
+        friction: ride.settings.friction,
+        drag: ride.settings.drag,
+    }
+}
+
+/// How many cars the ride's first train has.
+pub fn cars_of(ride: &RideFile) -> usize {
+    ride.trains
+        .first()
+        .map_or(3, |t| t.cars as usize)
+        .clamp(1, MAX_CARS)
+}
+
+/// The gap between car middles of the ride's first train.
+pub fn spacing_of(ride: &RideFile) -> f64 {
+    ride.trains.first().map_or(CAR_SPACING, |t| t.spacing)
+}
+
+/// A train standing in the station of `course`, ready for riders.
+pub fn train_of(ride: &RideFile, course: &Course) -> Train {
+    let stop = course.station().map_or(0.0, |(_, stop, _)| stop);
+    Train {
+        spacing: spacing_of(ride),
+        ..Train::held(cars_of(ride), stop)
+    }
+}
+
+/// Turn a ride's nodes into a course a train can run on, or say plainly why not (D65).
+pub fn course_from(ride: &RideFile) -> Result<Course, String> {
+    let n = ride.nodes.len();
+    if n < MIN_NODES {
+        return Err(format!(
+            "A coaster needs at least {MIN_NODES} nodes; you have {n}."
+        ));
+    }
+    let points: Vec<DVec3> = ride.nodes.iter().map(|node| vec(node.pos)).collect();
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let gap = points[i].distance(points[j]);
+        if gap < MIN_GAP {
+            return Err(format!(
+                "Nodes {} and {} are only {:.1} blocks apart; they must be at least {MIN_GAP} block apart.",
+                i + 1,
+                j + 1,
+                gap
+            ));
+        }
+    }
+    let kinds: Vec<Kind> = ride.nodes.iter().map(|node| node.kind).collect();
+    if kinds[0] == Kind::Station && kinds[n - 1] == Kind::Station {
+        return Err(
+            "The station may not hold both the first and the last node. Put your first node before the station."
+                .to_string(),
+        );
+    }
+
+    let track = Track::closed(&points);
+    let table = Table::new_level(&track);
+    if table.is_empty() {
+        return Err("The track could not be measured. Check the nodes.".to_string());
+    }
+    let node_s = node_distances(&track, &table);
+
+    // Runs of the same non-track kind become one element each (D63): it covers the track from
+    // the run's first node to the node after its last.
+    let mut placed = Vec::new();
+    let mut stations = 0;
+    let mut i = 0;
+    while i < n {
+        let kind = kinds[i];
+        let mut j = i;
+        while j < n && kinds[j] == kind {
+            j += 1;
+        }
+        let (s0, s1) = (node_s[i], node_s[j]);
+        match kind {
+            Kind::Track => {}
+            Kind::Lift => placed.push(Placed {
+                s0,
+                s1,
+                element: Element::Lift {
+                    speed: ride.settings.lift_speed,
+                },
+            }),
+            Kind::Brake => placed.push(Placed {
+                s0,
+                s1,
+                element: Element::Brake {
+                    target_v: ride.settings.brake_target,
+                    decel: ride.settings.brake_decel,
+                },
+            }),
+            Kind::Station => {
+                stations += 1;
+                let cars = cars_of(ride);
+                let need = (cars - 1) as f64 * spacing_of(ride) + STOP_MARGIN + STATION_REAR;
+                if s1 - s0 < need {
+                    return Err(format!(
+                        "The station is {:.1} blocks long, but {cars} cars need at least {need:.1}. Make the station longer or use fewer cars.",
+                        s1 - s0
+                    ));
+                }
+                placed.push(Placed {
+                    s0,
+                    s1,
+                    element: Element::Station {
+                        stop: s1 - STOP_MARGIN,
+                        push: ride.settings.station_push,
+                    },
+                });
+            }
+        }
+        i = j;
+    }
+    if stations == 0 {
+        return Err("There is no station. Right-click the air until the wand says \"station\", place the station's nodes, then switch back to track.".to_string());
+    }
+    if stations > 1 {
+        return Err(
+            "There is more than one station. A ride has exactly one station stretch.".to_string(),
+        );
+    }
+
+    // Vertical track would break the level frames (D59): refuse it with the place.
+    let mut s = 0.0;
+    while s < table.length() {
+        if table.frame(s).forward.y.abs() > MAX_STEEP {
+            let node = node_s.partition_point(|&x| x <= s).clamp(1, n);
+            return Err(format!(
+                "The track goes almost straight up or down near node {node}. Vertical track is not supported yet; make that stretch less steep."
+            ));
+        }
+        s += 0.25;
+    }
+
+    let course = Course { table, placed };
+    course.validate()?;
+    Ok(course)
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    fn node(pos: [f64; 3], kind: Kind) -> NodeFile {
+        NodeFile {
+            pos,
+            roll: 0.0,
+            kind,
+        }
+    }
+
+    /// A valid little loop: a 20-block station, a lift and a gentle turnaround.
+    pub(crate) fn loop_nodes() -> Vec<NodeFile> {
+        vec![
+            node([0.0, 70.0, 0.0], Kind::Station),
+            node([10.0, 70.0, 0.0], Kind::Station),
+            node([20.0, 70.0, 0.0], Kind::Track),
+            node([30.0, 72.0, 5.0], Kind::Lift),
+            node([35.0, 74.0, 15.0], Kind::Track),
+            node([25.0, 74.0, 25.0], Kind::Track),
+            node([10.0, 72.0, 25.0], Kind::Track),
+            node([0.0, 70.0, 15.0], Kind::Track),
+        ]
+    }
+
+    fn ride_with(nodes: Vec<NodeFile>) -> RideFile {
+        RideFile::new("test", nodes)
+    }
+
+    // Test 5.
+    #[test]
+    fn clicks_add_nodes_one_block_above_the_block_centre_and_modes_cycle() {
+        let mut b = Builder::new();
+        assert_eq!(b.click_block(1, [10, 64, -3], 0), 1);
+        assert_eq!(b.click_block(1, [11, 64, -3], 1), 2);
+        let nodes = &b.session(1).unwrap().nodes;
+        assert_eq!(nodes[0].pos, [10.5, 65.5, -2.5]);
+        assert_eq!(nodes[1].pos, [11.5, 65.5, -2.5]);
+        assert!(nodes.iter().all(|n| n.kind == Kind::Track));
+
+        // The mode is written on the next node placed.
+        assert_eq!(b.click_air(1, 2), Kind::Lift);
+        b.click_block(1, [12, 64, -3], 3);
+        assert_eq!(b.click_air(1, 4), Kind::Brake);
+        assert_eq!(b.click_air(1, 5), Kind::Station);
+        assert_eq!(b.click_air(1, 6), Kind::Track);
+        assert_eq!(b.session(1).unwrap().nodes[2].kind, Kind::Lift);
+
+        // Undo takes the last one away; another player has their own wand.
+        assert_eq!(b.undo(1, 7), Some(3));
+        assert_eq!(b.session(1).unwrap().nodes.len(), 2);
+        b.click_block(2, [0, 0, 0], 8);
+        assert_eq!(b.session(2).unwrap().nodes.len(), 1);
+        assert_eq!(b.undo(3, 9), None);
+    }
+
+    // Test 6.
+    #[test]
+    fn create_refuses_too_few_nodes_no_station_and_nodes_too_close() {
+        let none = |_: &str| false;
+        let mut b = Builder::new();
+        assert!(b.create(1, "x", none).unwrap_err().contains("wand"));
+        for i in 0..3 {
+            b.click_block(1, [i * 5, 64, 0], 0);
+        }
+        assert_eq!(
+            b.create(1, "x", none).unwrap_err(),
+            "A coaster needs at least 4 nodes; you have 3."
+        );
+        // Four nodes but no station.
+        b.click_block(1, [10, 64, 10], 0);
+        let error = b.create(1, "x", none).unwrap_err();
+        assert!(error.contains("no station"), "{error}");
+        // Two nodes closer than a block.
+        b.click_block(1, [10, 64, 10], 0); // the same spot twice
+        let error = b.create(1, "x", none).unwrap_err();
+        assert!(
+            error.starts_with("Nodes 4 and 5 are only 0.0 blocks apart"),
+            "{error}"
+        );
+        // The wrap-around pair counts too.
+        let mut wrap = ride_with(loop_nodes());
+        wrap.nodes[7].pos = [0.5, 70.0, 0.3];
+        let error = course_from(&wrap).unwrap_err();
+        assert!(error.starts_with("Nodes 8 and 1 are only"), "{error}");
+    }
+
+    #[test]
+    fn a_good_loop_makes_a_course_with_one_station_a_lift_and_room_for_the_train() {
+        let ride = ride_with(loop_nodes());
+        let course = course_from(&ride).unwrap();
+        let (station, stop, _) = course.station().unwrap();
+        assert!((station.s1 - station.s0 - 20.0).abs() < 1.5, "{station:?}");
+        assert!((stop - (station.s1 - STOP_MARGIN)).abs() < 1e-9);
+        assert_eq!(
+            course
+                .placed
+                .iter()
+                .filter(|p| matches!(p.element, Element::Lift { .. }))
+                .count(),
+            1
+        );
+        let train = train_of(&ride, &course);
+        assert!(train.is_held() && train.cars == 3 && train.s == stop);
+    }
+
+    #[test]
+    fn a_station_that_is_too_short_for_the_cars_says_how_long_it_must_be() {
+        let mut ride = ride_with(loop_nodes());
+        ride.trains[0].cars = 8;
+        let error = course_from(&ride).unwrap_err();
+        assert!(error.contains("8 cars need at least 25.9"), "{error}");
+    }
+
+    #[test]
+    fn a_station_across_the_first_node_or_two_stations_are_refused() {
+        let mut ride = ride_with(loop_nodes());
+        ride.nodes[7].kind = Kind::Station;
+        assert!(
+            course_from(&ride)
+                .unwrap_err()
+                .contains("first and the last")
+        );
+        let mut two = ride_with(loop_nodes());
+        two.nodes[5].kind = Kind::Station;
+        two.nodes[6].kind = Kind::Station;
+        assert!(
+            course_from(&two)
+                .unwrap_err()
+                .contains("more than one station")
+        );
+    }
+
+    #[test]
+    fn straight_up_track_is_refused_and_names_the_node() {
+        let mut ride = ride_with(loop_nodes());
+        ride.nodes[3].pos = [30.0, 72.0, 5.0];
+        ride.nodes[4].pos = [30.5, 90.0, 5.0];
+        ride.nodes[5].pos = [30.5, 72.0, 5.5];
+        let error = course_from(&ride).unwrap_err();
+        assert!(error.contains("almost straight up or down"), "{error}");
+    }
+
+    // Test 7.
+    #[test]
+    fn a_name_that_exists_asks_for_edit_unless_you_are_editing_it() {
+        let mut b = Builder::new();
+        for node in loop_nodes() {
+            let s = b.sessions.iter().position(|s| s.uuid == 1);
+            if s.is_none() {
+                b.click_block(1, [0, 0, 0], 0);
+                b.sessions[0].nodes.clear();
+            }
+            b.sessions[0].nodes.push(node);
+        }
+        let taken = |name: &str| name == "thunder";
+        let error = b.create(1, "thunder", taken).unwrap_err();
+        assert_eq!(
+            error,
+            "A ride called thunder already exists. Use /coaster edit thunder to change it."
+        );
+        assert!(b.create(1, "fresh", taken).is_ok());
+        // With `edit thunder` the same name is fine.
+        let old = ride_with(loop_nodes());
+        let old = RideFile {
+            id: "thunder".into(),
+            ..old
+        };
+        b.load_for_edit(1, &old, 5);
+        assert!(b.create(1, "thunder", taken).is_ok());
+        // ...but not another name that exists.
+        assert!(b.create(1, "other", |_| true).is_err());
+    }
+
+    #[test]
+    fn names_follow_the_rules() {
+        assert!(check_name("thunder-run-2").is_ok());
+        assert!(check_name("").is_err());
+        assert!(check_name(&"a".repeat(33)).is_err());
+        assert!(check_name("Thunder").is_err());
+        assert!(check_name("a b").is_err());
+        assert!(check_name("a_b").is_err());
+        assert!(check_name("s12").is_err());
+        assert!(check_name("sky").is_ok());
+        assert!(check_name("demo").is_err());
+    }
+
+    #[test]
+    fn the_preview_follows_the_curve_and_is_capped() {
+        let nodes = loop_nodes();
+        let points = preview_points(&nodes, 0.5, 10_000);
+        assert!(points.len() > 100);
+        let capped = preview_points(&nodes, 0.5, 40);
+        assert!(capped.len() <= 41, "{}", capped.len());
+        // One node shows itself; two nodes show a line.
+        assert_eq!(preview_points(&nodes[..1], 0.5, 40).len(), 1);
+        assert!(preview_points(&nodes[..2], 0.5, 40).len() > 5);
+    }
+}
+}
 pub mod coaster {
 // Coaster maths: the track curve, its arc-length table, frames, forces, physics, elements and the demo layout.
 
@@ -2403,11 +3049,38 @@ pub fn tag_seat(ride: &str, index: usize) -> String {
     format!("htp_seat_{ride}_{index}")
 }
 
-/// `Tags:["htp","htp_demo","…"]` with one extra tag for the specific piece.
-fn tags(ride: &str, extra: Option<String>) -> String {
+/// The session tag (D66): `htp_s<n>`. Every entity of one world opening carries the same one,
+/// so leftovers of an earlier opening can be told apart and removed.
+pub fn tag_session(session: u64) -> String {
+    format!("htp_s{session}")
+}
+
+/// The tag of one group of rails, or of the train (`group` = "t"), e.g. `htp_g_thunder_3` (D30).
+/// The underscore can't appear in a ride name, so it never clashes with a ride's own tag.
+pub fn tag_group(ride: &str, group: &str) -> String {
+    format!("htp_g_{ride}_{group}")
+}
+
+/// The generation tag (D30): which drawing of a group an entity belongs to.
+pub fn tag_gen(generation: u32) -> String {
+    format!("htp_gen_{generation}")
+}
+
+/// The tags every piece of a ride carries: the session, the group and the generation.
+pub fn piece_tags(ride: &str, group: &str, generation: u32, session: u64) -> Vec<String> {
+    vec![
+        tag_session(session),
+        tag_group(ride, group),
+        tag_gen(generation),
+    ]
+}
+
+/// `Tags:["htp","htp_demo","…"]`: the mod's tag, the ride's tag, any `extra` tags, and one more
+/// for the specific piece.
+fn tags(ride: &str, extra: &[String], specific: Option<String>) -> String {
     let mut list = format!("\"{TAG_ALL}\",\"{}\"", tag_ride(ride));
-    if let Some(extra) = extra {
-        list.push_str(&format!(",\"{extra}\""));
+    for tag in extra.iter().chain(specific.iter()) {
+        list.push_str(&format!(",\"{tag}\""));
     }
     format!("Tags:[{list}]")
 }
@@ -2428,20 +3101,28 @@ fn transformation(rotation: DQuat, scale: DVec3) -> String {
 
 /// Put one piece of rail on the track. `rotation` turns the model so its long side follows the
 /// track, `scale` is (width, height, length) in blocks. Rails never move, so no `teleport_duration`.
-pub fn summon_rail(ride: &str, pos: DVec3, rotation: DQuat, scale: DVec3) -> String {
+pub fn summon_rail(
+    ride: &str,
+    extra: &[String],
+    pos: DVec3,
+    rotation: DQuat,
+    scale: DVec3,
+) -> String {
     format!(
         "summon minecraft:item_display {} {{{},item:{{id:\"{RAIL_ITEM}\",count:1}},{}}}",
         xyz(pos),
-        tags(ride, None),
+        tags(ride, extra, None),
         transformation(rotation, scale)
     )
 }
 
 /// Put a car on the track. `teleport_ticks` is how long the display glides to each new spot
 /// (it can't be changed later, D44); `scale` is the size of the car's shell model.
+#[allow(clippy::too_many_arguments)]
 pub fn summon_car(
     ride: &str,
     index: usize,
+    extra: &[String],
     pos: DVec3,
     yaw: f64,
     pitch: f64,
@@ -2451,7 +3132,7 @@ pub fn summon_car(
     format!(
         "summon minecraft:item_display {} {{{},Rotation:[{},{}],item:{{id:\"{CAR_ITEM}\",count:1}},teleport_duration:{teleport_ticks},{}}}",
         xyz(pos),
-        tags(ride, Some(tag_car(ride, index))),
+        tags(ride, extra, Some(tag_car(ride, index))),
         float(yaw),
         float(pitch),
         transformation(DQuat::IDENTITY, scale)
@@ -2475,11 +3156,11 @@ pub fn move_car(ride: &str, index: usize, pos: DVec3, yaw: f64, pitch: f64) -> S
 /// invisible pig (the fallback in D49) the list would be:
 /// `summon minecraft:pig … {…,equipment:{saddle:{id:"minecraft:saddle",count:1}}}` followed by
 /// `effect give @e[tag=<seat tag>] minecraft:invisibility infinite 0 true`.
-pub fn summon_seat(ride: &str, index: usize, pos: DVec3) -> Vec<String> {
+pub fn summon_seat(ride: &str, index: usize, extra: &[String], pos: DVec3) -> Vec<String> {
     vec![format!(
         "summon {SEAT_ENTITY} {} {{{}}}",
         xyz(pos),
-        tags(ride, Some(tag_seat(ride, index)))
+        tags(ride, extra, Some(tag_seat(ride, index)))
     )]
 }
 
@@ -2526,6 +3207,75 @@ pub fn kill_all() -> String {
     kill_tag(TAG_ALL)
 }
 
+/// The wand item and the node marker of the content mod (D62).
+pub const WAND_ITEM: &str = "htp:wand";
+pub const NODE_ITEM: &str = "htp:node";
+
+/// The tag of everything one player's wand shows, e.g. `htp_wand_1f3a` (their uuid in hex).
+pub fn tag_wand(uuid: u128) -> String {
+    format!("htp_wand_{uuid:x}")
+}
+
+/// The tag of one node marker.
+pub fn tag_node(uuid: u128, index: usize) -> String {
+    format!("htp_wn_{uuid:x}_{index}")
+}
+
+/// A small marker at a wand node (S2).
+pub fn summon_node(uuid: u128, index: usize, session: u64, pos: DVec3) -> String {
+    format!(
+        "summon minecraft:item_display {} {{Tags:[\"{TAG_ALL}\",\"{}\",\"{}\",\"{}\"],item:{{id:\"{NODE_ITEM}\",count:1}},{}}}",
+        xyz(pos),
+        tag_session(session),
+        tag_wand(uuid),
+        tag_node(uuid, index),
+        transformation(DQuat::IDENTITY, DVec3::splat(0.3))
+    )
+}
+
+/// Take away one node marker.
+pub fn kill_node(uuid: u128, index: usize) -> String {
+    kill_tag(&tag_node(uuid, index))
+}
+
+/// Take away every marker of one player's wand.
+pub fn kill_wand(uuid: u128) -> String {
+    kill_tag(&tag_wand(uuid))
+}
+
+/// One dot of the build preview, shown only to `player_name` (S2, F4).
+pub fn particle(player_name: &str, pos: DVec3) -> String {
+    format!(
+        "particle minecraft:end_rod {} 0 0 0 0 1 force {player_name}",
+        xyz(pos)
+    )
+}
+
+/// Give a player one of the mod's items.
+pub fn give(player_name: &str, item: &str) -> String {
+    format!("give {player_name} {item}")
+}
+
+/// Clear leftovers of earlier sessions near `pos` (D66, S4). The console stands at the world spawn,
+/// so the search is moved to the player's position first.
+pub fn scrub_session(pos: DVec3, session: u64) -> String {
+    format!(
+        "execute positioned {} run kill @e[tag={TAG_ALL},tag=!{},distance=..128]",
+        xyz(pos),
+        tag_session(session)
+    )
+}
+
+/// Clear entities of an older drawing of one group near `pos` (D30).
+pub fn scrub_generation(pos: DVec3, ride: &str, group: &str, generation: u32) -> String {
+    format!(
+        "execute positioned {} run kill @e[tag={},tag=!{},distance=..128]",
+        xyz(pos),
+        tag_group(ride, group),
+        tag_gen(generation)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2552,6 +3302,7 @@ mod tests {
         let q = DQuat::from_rotation_y(std::f64::consts::FRAC_PI_2);
         let text = summon_rail(
             DEMO,
+            &[],
             DVec3::new(1.5, 70.0, -2.25),
             q,
             DVec3::new(0.5, 0.15, 4.0),
@@ -2567,6 +3318,7 @@ mod tests {
         let text = summon_car(
             DEMO,
             0,
+            &[],
             DVec3::new(0.0, 64.0, 0.0),
             -90.0,
             12.5,
@@ -2590,7 +3342,7 @@ mod tests {
     #[test]
     fn seat_summon_and_move_text() {
         assert_eq!(
-            summon_seat(DEMO, 1, DVec3::new(5.0, 70.5, 6.0)),
+            summon_seat(DEMO, 1, &[], DVec3::new(5.0, 70.5, 6.0)),
             vec![
                 "summon minecraft:minecart 5.0000 70.5000 6.0000 {Tags:[\"htp\",\"htp_demo\",\"htp_seat_demo_1\"]}"
                     .to_string()
@@ -2628,6 +3380,43 @@ mod tests {
         assert_eq!(kill_ride(DEMO), "kill @e[tag=htp_demo]");
         assert_eq!(kill_tag("htp_seat_demo_0"), "kill @e[tag=htp_seat_demo_0]");
     }
+
+    #[test]
+    fn extra_tags_come_before_the_specific_one() {
+        let extra = piece_tags("thunder", "3", 2, 7);
+        assert_eq!(extra, vec!["htp_s7", "htp_g_thunder_3", "htp_gen_2"]);
+        let text = summon_seat("thunder", 1, &extra, DVec3::ZERO);
+        assert_eq!(
+            text,
+            vec![
+                "summon minecraft:minecart 0.0000 0.0000 0.0000 {Tags:[\"htp\",\"htp_thunder\",\"htp_s7\",\"htp_g_thunder_3\",\"htp_gen_2\",\"htp_seat_thunder_1\"]}"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn wand_marker_particle_give_and_scrub_texts() {
+        assert_eq!(
+            summon_node(0xAB, 2, 5, DVec3::new(1.5, 66.5, 2.5)),
+            "summon minecraft:item_display 1.5000 66.5000 2.5000 {Tags:[\"htp\",\"htp_s5\",\"htp_wand_ab\",\"htp_wn_ab_2\"],item:{id:\"htp:node\",count:1},transformation:{left_rotation:[0.0000f,0.0000f,0.0000f,1.0000f],right_rotation:[0.0000f,0.0000f,0.0000f,1.0000f],translation:[0.0000f,0.0000f,0.0000f],scale:[0.3000f,0.3000f,0.3000f]}}"
+        );
+        assert_eq!(kill_node(0xAB, 2), "kill @e[tag=htp_wn_ab_2]");
+        assert_eq!(kill_wand(0xAB), "kill @e[tag=htp_wand_ab]");
+        assert_eq!(
+            particle("Alex", DVec3::new(1.0, 2.0, 3.0)),
+            "particle minecraft:end_rod 1.0000 2.0000 3.0000 0 0 0 0 1 force Alex"
+        );
+        assert_eq!(give("Alex", WAND_ITEM), "give Alex htp:wand");
+        assert_eq!(
+            scrub_session(DVec3::new(1.0, 2.0, 3.0), 4),
+            "execute positioned 1.0000 2.0000 3.0000 run kill @e[tag=htp,tag=!htp_s4,distance=..128]"
+        );
+        assert_eq!(
+            scrub_generation(DVec3::ZERO, "a", "t", 3),
+            "execute positioned 0.0000 0.0000 0.0000 run kill @e[tag=htp_g_a_t,tag=!htp_gen_3,distance=..128]"
+        );
+    }
 }
 }
 pub mod host {
@@ -2641,6 +3430,7 @@ pub mod host {
 // with a default that says "not available", so this stays the only door [D7].
 
 use glam::DVec3;
+use std::path::PathBuf;
 
 /// What park-core knows about one player who is fully in the world.
 #[derive(Clone, Debug, PartialEq)]
@@ -2669,6 +3459,11 @@ pub trait Host {
     fn action_bar(&mut self, _player: u128, _text: &str) -> bool {
         false
     }
+    /// The open world's folder (F5), where rides are saved. `None` when no world is open (or the
+    /// host does not know); nothing is saved then.
+    fn world_dir(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// A pretend game for tests: it records every call, in order.
@@ -2688,6 +3483,8 @@ pub struct FakeHost {
     pub logs: Vec<String>,
     /// Every action-bar line, as (player, text).
     pub action_bars: Vec<(u128, String)>,
+    /// The world folder the pretend game reports (`None` = no folder).
+    pub world: Option<PathBuf>,
 }
 
 impl FakeHost {
@@ -2730,6 +3527,10 @@ impl Host for FakeHost {
     fn action_bar(&mut self, player: u128, text: &str) -> bool {
         self.action_bars.push((player, text.to_string()));
         true
+    }
+
+    fn world_dir(&self) -> Option<PathBuf> {
+        self.world.clone()
     }
 }
 
@@ -3149,32 +3950,413 @@ mod tests {
     }
 }
 }
+pub mod report {
+// The realism report (D64): one dry lap of a ride, compared with D58's limits.
+//
+// The lap is run on paper (as `park-sim` does), so nothing here touches the game. Anything past
+// a limit becomes an `Issue` that says what, how far, and where on the track (block numbers),
+// and the ride still opens: it is the builder's own coaster.
+
+use crate::game::htp_park::coaster::elements::{Course, Element};
+use crate::game::htp_park::coaster::forces::Felt;
+use crate::game::htp_park::coaster::physics::{Physics, Train};
+use crate::game::htp_park::coaster::sim::{self, Sample};
+use glam::DVec3;
+
+/// Drops must fall at between these angles, in degrees (D58).
+pub const DROP_MIN: f64 = 50.0;
+pub const DROP_MAX: f64 = 65.0;
+/// A valley may push at most this many g (D58).
+pub const VALLEY_MAX_G: f64 = 4.0;
+/// An airtime hill may reach at most this far below zero g (D58).
+pub const AIRTIME_MIN_G: f64 = -0.5;
+/// Sideways push on unbanked track, in g (D58).
+pub const LATERAL_MAX_G: f64 = 1.0;
+/// Vertical g may change by at most this much per second (D58).
+pub const RATE_MAX_G_PER_S: f64 = 3.0;
+/// A lift hill is between these heights, in blocks (D58).
+pub const LIFT_MIN: f64 = 20.0;
+pub const LIFT_MAX: f64 = 30.0;
+/// The dry lap gives up after this many seconds.
+const MAX_LAP_SECONDS: f64 = 300.0;
+
+/// One limit that was passed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Issue {
+    /// A plain sentence: what and how far past, e.g. "Sideways push reaches 2.3 g (limit 1.0 g)".
+    pub text: String,
+    /// Where it happens, if known.
+    pub at: Option<DVec3>,
+}
+
+/// What one dry lap showed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Report {
+    /// False when the train never got back to the station.
+    pub completes: bool,
+    pub seconds: f64,
+    pub length: f64,
+    /// Blocks per second.
+    pub top_speed: f64,
+    pub max_vertical: f64,
+    pub min_vertical: f64,
+    pub max_lateral: f64,
+    pub max_vertical_rate: f64,
+    /// Lowest vertical g of each airtime dip.
+    pub airtime_dips: Vec<f64>,
+    /// The steepest fall of each drop, in degrees.
+    pub drops: Vec<f64>,
+    /// Height of the tallest lift hill, in blocks.
+    pub lift_height: Option<f64>,
+    pub issues: Vec<Issue>,
+}
+
+fn at(p: DVec3) -> String {
+    format!("near {} {} {}", p.x.round(), p.y.round(), p.z.round())
+}
+
+/// Where the front car is at `sample`, or the car with the extreme value.
+fn find_extreme(
+    course: &Course,
+    samples: &[Sample],
+    spacing: f64,
+    score: impl Fn(&Felt) -> f64,
+) -> DVec3 {
+    let mut best = (f64::MIN, 0.0);
+    for sample in samples {
+        for i in 0..sample.cars {
+            let value = score(&sample.felt[i]);
+            if value > best.0 {
+                best = (value, sample.s - i as f64 * spacing);
+            }
+        }
+    }
+    course.table.position(best.1)
+}
+
+/// Run one dry lap of `course` with `cars` cars and compare it with D58's limits.
+pub fn analyse(course: &Course, cars: usize, spacing: f64, physics: &Physics) -> Report {
+    let stop = course.station().map_or(0.0, |(_, stop, _)| stop);
+    let train = Train {
+        spacing,
+        ..Train::held(cars, stop)
+    };
+    let samples = sim::run_lap(course, train, physics, MAX_LAP_SECONDS);
+    let st = sim::stats(&samples);
+    let mut issues = Vec::new();
+
+    let completes = st.seconds < MAX_LAP_SECONDS - 0.1;
+    if !completes {
+        // Where did it get stuck? The slowest moment after the start.
+        let stuck = samples
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| *k > 20)
+            .min_by(|a, b| a.1.v.total_cmp(&b.1.v))
+            .map(|(_, s)| course.table.position(s.s));
+        issues.push(Issue {
+            text: "The train cannot finish a lap: it runs out of speed and stalls. Make the lift longer or the hills lower".to_string(),
+            at: stuck,
+        });
+    }
+
+    if st.max_vertical > VALLEY_MAX_G {
+        issues.push(Issue {
+            text: format!(
+                "A valley pushes {:.1} g (limit {VALLEY_MAX_G:.1} g). Round the bottom of the drop more",
+                st.max_vertical
+            ),
+            at: Some(find_extreme(course, &samples, spacing, |f| f.vertical)),
+        });
+    }
+    if st.min_vertical < AIRTIME_MIN_G {
+        issues.push(Issue {
+            text: format!(
+                "A hill throws riders out of their seat: {:.1} g (limit {AIRTIME_MIN_G:.1} g). Make the crest rounder or lower",
+                st.min_vertical
+            ),
+            at: Some(find_extreme(course, &samples, spacing, |f| -f.vertical)),
+        });
+    }
+    if st.max_lateral > LATERAL_MAX_G {
+        issues.push(Issue {
+            text: format!(
+                "A turn pushes sideways {:.1} g (limit {LATERAL_MAX_G:.1} g). Make that turn wider",
+                st.max_lateral
+            ),
+            at: Some(find_extreme(course, &samples, spacing, |f| f.lateral.abs())),
+        });
+    }
+    if st.max_vertical_rate > RATE_MAX_G_PER_S {
+        issues.push(Issue {
+            text: format!(
+                "The vertical g changes too fast: {:.1} g per second (limit {RATE_MAX_G_PER_S:.1}). Use gentler transitions",
+                st.max_vertical_rate
+            ),
+            at: rate_spot(course, &samples, spacing),
+        });
+    }
+
+    // Drops: every stretch steeper than 30 degrees, measured at its steepest.
+    let mut drops: Vec<f64> = Vec::new();
+    let mut steepest = (0.0_f64, 0.0_f64);
+    let mut s = 0.0;
+    while s < course.table.length() {
+        let fall = (-course.table.frame(s).forward.y)
+            .clamp(-1.0, 1.0)
+            .asin()
+            .to_degrees();
+        if fall > 30.0 {
+            if fall > steepest.0 {
+                steepest = (fall, s);
+            }
+        } else if steepest.0 > 0.0 {
+            let (angle, where_s) = steepest;
+            drops.push(angle);
+            if !(DROP_MIN..=DROP_MAX).contains(&angle) {
+                issues.push(Issue {
+                    text: format!(
+                        "A drop falls at {angle:.0} degrees (it should be {DROP_MIN:.0} to {DROP_MAX:.0})"
+                    ),
+                    at: Some(course.table.position(where_s)),
+                });
+            }
+            steepest = (0.0, 0.0);
+        }
+        s += 0.1;
+    }
+
+    // Lift hills: from the lift's foot to its highest point, searched a little past its end.
+    let mut lift_height = None;
+    for placed in &course.placed {
+        if matches!(placed.element, Element::Lift { .. }) {
+            let foot = course.table.position(placed.s0).y;
+            let mut top = f64::MIN;
+            let mut s = placed.s0;
+            while s < (placed.s1 + 30.0).min(course.table.length()) {
+                top = top.max(course.table.position(s).y);
+                s += 0.5;
+            }
+            let height = top - foot;
+            lift_height = Some(lift_height.map_or(height, |h: f64| h.max(height)));
+            if !(LIFT_MIN..=LIFT_MAX).contains(&height) {
+                issues.push(Issue {
+                    text: format!(
+                        "A lift hill is {height:.0} blocks tall (it should be {LIFT_MIN:.0} to {LIFT_MAX:.0})"
+                    ),
+                    at: Some(course.table.position(placed.s0)),
+                });
+            }
+        }
+    }
+
+    Report {
+        completes,
+        seconds: st.seconds,
+        length: course.table.length(),
+        top_speed: st.top_speed,
+        max_vertical: st.max_vertical,
+        min_vertical: st.min_vertical,
+        max_lateral: st.max_lateral,
+        max_vertical_rate: st.max_vertical_rate,
+        airtime_dips: sim::airtime_dips(&samples),
+        drops,
+        lift_height,
+        issues,
+    }
+}
+
+/// Where the vertical g changes fastest over one second.
+fn rate_spot(course: &Course, samples: &[Sample], spacing: f64) -> Option<DVec3> {
+    let mut best = (0.0, None);
+    for k in 20..samples.len() {
+        for i in 0..samples[k].cars {
+            let change = (samples[k].felt[i].vertical - samples[k - 20].felt[i].vertical).abs();
+            if change > best.0 {
+                best = (change, Some(samples[k].s - i as f64 * spacing));
+            }
+        }
+    }
+    best.1.map(|s| course.table.position(s))
+}
+
+impl Report {
+    /// The chat lines (D64). Passed limits are written in red with `§c`; the rest is plain.
+    pub fn lines(&self, name: &str) -> Vec<String> {
+        let mut out = vec![format!(
+            "Realism report for {name}: {:.0} blocks of track, a lap of {:.0} s, top speed {:.0} km/h.",
+            self.length,
+            self.seconds,
+            self.top_speed * 3.6
+        )];
+        out.push(format!(
+            "Up-down push {:.1} to {:.1} g, sideways up to {:.1} g, {} airtime hill(s).",
+            self.min_vertical,
+            self.max_vertical,
+            self.max_lateral,
+            self.airtime_dips.len()
+        ));
+        if !self.drops.is_empty() {
+            let drops: Vec<String> = self.drops.iter().map(|d| format!("{d:.0}")).collect();
+            out.push(format!("Drops: {} degrees.", drops.join(", ")));
+        }
+        if let Some(height) = self.lift_height {
+            out.push(format!("Lift hill: {height:.0} blocks tall."));
+        }
+        if self.issues.is_empty() {
+            out.push("All within the realism limits.".to_string());
+        } else {
+            for issue in &self.issues {
+                let place = issue.at.map_or(String::new(), |p| format!(" ({})", at(p)));
+                out.push(format!("§c{}{place}.§r", issue.text));
+            }
+            out.push("The ride still opens: it is your coaster.".to_string());
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::htp_park::coaster::demo::{self, Shape};
+
+    fn report_for(shape: &Shape) -> (Course, Report) {
+        let course = demo::course_for(shape, DVec3::new(100.0, 73.0, -40.0));
+        let report = analyse(
+            &course,
+            demo::CARS,
+            crate::game::htp_park::coaster::physics::CAR_SPACING,
+            &Physics::default(),
+        );
+        (course, report)
+    }
+
+    // Test 8, first half.
+    #[test]
+    fn the_m2_demo_passes_every_limit() {
+        let (_, report) = report_for(&Shape::demo());
+        assert!(report.completes);
+        assert!(report.issues.is_empty(), "{:?}", report.issues);
+        assert!(report.drops.len() >= 2);
+        let lift = report.lift_height.unwrap();
+        assert!((20.0..=30.0).contains(&lift), "{lift}");
+        let lines = report.lines("demo");
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .contains("All within the realism limits")
+        );
+        assert!(lines.iter().all(|l| !l.contains('§')));
+    }
+
+    // Test 8, second half: the same layout with much tighter half circles throws riders sideways.
+    #[test]
+    fn a_sharp_hand_made_track_fails_lateral_g_with_the_right_numbers() {
+        let sharp = Shape {
+            radius: 6.0,
+            ..Shape::demo()
+        };
+        let (course, report) = report_for(&sharp);
+        // The report's number is exactly what the simulation measures...
+        let stop = course.station().unwrap().1;
+        let samples = sim::run_lap(
+            &course,
+            Train::held(demo::CARS, stop),
+            &Physics::default(),
+            300.0,
+        );
+        let st = sim::stats(&samples);
+        assert_eq!(report.max_lateral, st.max_lateral);
+        assert!(st.max_lateral > 1.0, "{}", st.max_lateral);
+        // ...and it is reported in red, with the number and a place.
+        let issue = report
+            .issues
+            .iter()
+            .find(|i| i.text.contains("sideways"))
+            .expect("a lateral issue");
+        assert!(
+            issue.text.contains(&format!("{:.1} g", st.max_lateral)),
+            "{}",
+            issue.text
+        );
+        assert!(issue.at.is_some());
+        let lines = report.lines("sharp");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("§c") && l.contains("sideways") && l.contains("near "))
+        );
+        assert!(lines.last().unwrap().contains("still opens"));
+    }
+
+    #[test]
+    fn a_train_that_cannot_climb_is_reported_as_stalling() {
+        // Without a lift, the flat demo-like loop has nothing to push the train round.
+        let (mut course, _) = report_for(&Shape::demo());
+        course
+            .placed
+            .retain(|p| !matches!(p.element, Element::Lift { .. }));
+        let report = analyse(
+            &course,
+            3,
+            crate::game::htp_park::coaster::physics::CAR_SPACING,
+            &Physics::default(),
+        );
+        assert!(!report.completes);
+        assert!(report.issues[0].text.contains("cannot finish a lap"));
+        assert!(report.issues[0].at.is_some());
+    }
+}
+}
 pub mod runtime {
 // The per-tick loop (D21): `Runtime` is the one object that holds all of the mod's state.
 //
 // The game calls `Runtime::tick` once per server tick. A tick does, in order:
-//   1. say hello (once per world) and clean up leftovers from an earlier session;
-//   2. carry out orders typed by players (`/coaster demo`, `/coaster remove`);
-//   3. send the next batch of "build" commands (rails, cars, seats);
-//   4. see who sits in which seat, run the station countdown, and let the physics move the train;
-//   5. move the cars (every few ticks), the seats (every tick) and show riders their speed.
+//   1. say hello (once per world), clean up leftovers of an earlier session, and load the saved
+//      rides from the world's folder (D20);
+//   2. carry out orders (typed commands, and wand clicks queued by the item hooks);
+//   3. send waiting build commands (platform, node markers);
+//   4. for every ride: see who sits where, run the station countdown, and let the physics move the train;
+//   5. park and unpark (D30): remove the displays of track far from every player, and draw them
+//      again when someone comes close (at most 50 pieces a tick);
+//   6. move the cars (every few ticks) and the seats (every tick) of the rides near players;
+//   7. show wand markers and the build preview, and sweep up leftovers every 5 seconds (D66);
+//   8. save the rides that changed.
 //
 // It never touches the game directly: it asks a `Host` (see `host.rs`) to run command text
 // from `commands.rs`. So all of this is checked by `cargo test` with a `FakeHost`.
 
+use crate::game::htp_park::builder::{self, Builder, PREVIEW_TICKS};
 use crate::game::htp_park::coaster::demo;
 use crate::game::htp_park::coaster::elements::{Course, DWELL};
-use crate::game::htp_park::coaster::physics::{Physics, Train};
+use crate::game::htp_park::coaster::physics::{MAX_CARS, Physics, Train};
 use crate::game::htp_park::coaster::sim;
 use crate::game::htp_park::commands;
 use crate::game::htp_park::host::{Host, PlayerInfo};
 use crate::game::htp_park::render;
+use crate::game::htp_park::report;
+use crate::game::htp_park::save::{self, Kind, ParkFile, RideFile};
 use crate::game::htp_park::welcome::Welcome;
 use glam::DVec3;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 
 /// The usages the glue registers with the game (they all share the word `coaster`).
-pub const COMMAND_USAGES: [&str; 3] = ["coaster demo", "coaster ride", "coaster remove"];
+pub const COMMAND_USAGES: [&str; 11] = [
+    "coaster demo",
+    "coaster ride",
+    "coaster remove",
+    "coaster wand",
+    "coaster undo",
+    "coaster list",
+    "coaster create <name:word>",
+    "coaster edit <name:word>",
+    "coaster delete <name:word>",
+    "coaster set <name:word> cars <count:integer>",
+    "coaster help",
+];
 
 /// The most commands sent in one tick [D21]; the rest wait for the next tick.
 pub const MAX_COMMANDS_PER_TICK: usize = 400;
@@ -3192,50 +4374,420 @@ pub const RIDER_OFF_DISTANCE: f64 = 2.0;
 const DEMO_EAST: f64 = 3.0 + demo::STATION_LENGTH;
 /// The rails float this high above the player's feet (D60, raised from 3 by D47's first value).
 const DEMO_HEIGHT: f64 = 5.0;
-/// Seats per car in the demo (D49).
+/// Seats per car (D49).
 const SEATS_PER_CAR: usize = 2;
-/// Cars in the demo train (D55).
-const CARS: usize = demo::CARS;
-/// Seats in the whole train.
-const SEATS: usize = CARS * SEATS_PER_CAR;
 /// Riders see their speed (or the station countdown) every this many ticks (D57).
 const ACTION_BAR_EVERY: u32 = 5;
 
-/// Who typed a command, and where they stand and look.
+/// Rail pieces per parking group (D30).
+pub const GROUP_SIZE: usize = 16;
+/// A group is removed when no player is within this many blocks (D30).
+pub const PARK_DISTANCE: f64 = 96.0;
+/// A group is drawn again when a player comes within this many blocks (D30).
+pub const DRAW_DISTANCE: f64 = 80.0;
+/// At most this many pieces are drawn in one tick (D30).
+pub const DRAWS_PER_TICK: usize = 50;
+/// The display budget (D27) is counted within this distance of each player...
+pub const BUDGET_RADIUS: f64 = 160.0;
+/// ...and may not pass this many displays.
+pub const DISPLAY_BUDGET: usize = 1500;
+/// Leftovers are swept up every this many ticks (5 seconds, D66).
+const SCRUB_EVERY: u64 = 100;
+/// How long to wait for the world folder to show up before giving up on saving (F5), in ticks.
+const WORLD_WAIT_TICKS: u64 = 40;
+/// A `delete` must be repeated within this many ticks (10 seconds, S3).
+const DELETE_WINDOW: u64 = 200;
+/// The preview: a dot every 0.5 block, redrawn every 10 ticks, at most this many dots (S2).
+const PREVIEW_STEP: f64 = 0.5;
+const PREVIEW_EVERY: u64 = 10;
+const PREVIEW_MAX_POINTS: usize = 400;
+/// Wand node markers summoned in one tick at most.
+const MARKERS_PER_TICK: usize = 50;
+
+/// Who typed a command, and where they stand.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Caller {
     pub uuid: u128,
+    pub name: String,
     pub pos: DVec3,
 }
 
-/// A job waiting for the next tick (commands can't run inside the command hook).
+/// A click with the track wand, as the item hooks hear it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WandClick {
+    /// Right-click on a block: the block's position.
+    Block([i32; 3]),
+    /// Right-click on the air.
+    Air,
+}
+
+/// A job waiting for the next tick (commands can't run inside the command or item hooks).
 #[derive(Clone, Debug, PartialEq)]
 enum Order {
     Demo(Caller),
-    Remove,
+    RemoveDemo,
+    Give(Caller),
+    Wand { uuid: u128, click: WandClick },
+    Create { uuid: u128, ride: RideFile },
+    Delete { uuid: u128, id: String },
+    SetCars { uuid: u128, id: String, cars: usize },
 }
 
-/// The one demo ride that exists in the world.
+/// One seat of a train.
 #[derive(Clone, Debug)]
-struct Demo {
+struct Seat {
+    occupied: bool,
+    rider: Option<u128>,
+    /// Where the seat was sent last (so we can tell who sits there).
+    pos: DVec3,
+}
+
+/// About 16 rail pieces that are drawn and parked together (D30).
+#[derive(Clone, Debug)]
+struct Group {
+    /// The pieces `first..end` of the ride.
+    first: usize,
+    end: usize,
+    center: DVec3,
+    radius: f64,
+    drawn: bool,
+    /// How many times it was drawn; the number is in the entities' tags (D30).
+    generation: u32,
+}
+
+/// One ride in the world: its track, its train, and what is drawn of it.
+#[derive(Clone, Debug)]
+struct Ride {
+    id: String,
+    /// What is saved. `None` for the demo, which is not saved.
+    file: Option<RideFile>,
     course: Course,
     physics: Physics,
     train: Train,
-    /// The stone platform beside the station (D60), so it can be cleared again.
-    platform: render::Platform,
+    cars: usize,
+    /// Seconds the train waits after someone sits (D56).
+    dwell: f64,
     /// Ticks between moves of each car (D44), worked out once from a dry lap (S3).
-    k: [u32; CARS],
-    /// Ticks since the train last left the station (a car is sent when this divides by its `k`).
+    k: u32,
+    pieces: Vec<render::Piece>,
+    groups: Vec<Group>,
+    /// Are the cars and seats in the world right now?
+    train_drawn: bool,
+    train_gen: u32,
+    /// Set in the tick the train was drawn: it is already where it should be, so no move is sent.
+    just_drawn: bool,
+    /// The stone platform beside the station (D60), for the demo only.
+    platform: Option<render::Platform>,
+    /// Ticks since the train last left the station (a car is sent when this divides by `k`).
     phase: u32,
-    /// Was the train standing in the station at the end of the last tick?
     was_held: bool,
-    /// Counts ticks for the action bar.
     bar_clock: u32,
-    /// Is somebody sitting in each seat, and who?
-    occupied: [bool; SEATS],
-    rider: [Option<u128>; SEATS],
-    /// Where each seat was sent last (so we can tell who sits there).
-    seat_pos: [DVec3; SEATS],
+    seats: Vec<Seat>,
+    /// The car moves worked out for this tick.
+    car_moves: Vec<Option<render::Pose>>,
+    /// Needs saving.
+    dirty: bool,
+}
+
+impl Ride {
+    fn new(
+        id: String,
+        file: Option<RideFile>,
+        course: Course,
+        physics: Physics,
+        train: Train,
+        dwell: f64,
+    ) -> Ride {
+        // S3: how often a car may be moved comes from one dry lap (the sharpest speed² × bend).
+        let worst = sim::worst_speed_sq_curvature(&course, &train, &physics);
+        let k = render::teleport_ticks_for(worst);
+        let pieces = render::rail_pieces(&course.table);
+        let centres: Vec<DVec3> = pieces
+            .iter()
+            .map(|&p| render::rail_pose(&course.table, p).pos)
+            .collect();
+        let groups = centres
+            .chunks(GROUP_SIZE)
+            .enumerate()
+            .map(|(i, chunk)| {
+                let sum = chunk.iter().fold(DVec3::ZERO, |a, &b| a + b);
+                let center = sum / chunk.len() as f64;
+                let radius = chunk.iter().map(|p| p.distance(center)).fold(0.0, f64::max);
+                Group {
+                    first: i * GROUP_SIZE,
+                    end: i * GROUP_SIZE + chunk.len(),
+                    center,
+                    radius,
+                    drawn: false,
+                    generation: 0,
+                }
+            })
+            .collect();
+        let cars = train.cars;
+        Ride {
+            id,
+            file,
+            course,
+            physics,
+            train,
+            cars,
+            dwell,
+            k,
+            pieces,
+            groups,
+            train_drawn: false,
+            train_gen: 0,
+            just_drawn: false,
+            platform: None,
+            phase: 0,
+            was_held: true,
+            bar_clock: 0,
+            seats: vec![
+                Seat {
+                    occupied: false,
+                    rider: None,
+                    pos: DVec3::ZERO,
+                };
+                cars * SEATS_PER_CAR
+            ],
+            car_moves: vec![None; cars],
+            dirty: false,
+        }
+    }
+
+    /// A ride from its saved file, or the reason it can't be built.
+    fn from_file(file: RideFile) -> Result<Ride, String> {
+        let course = builder::course_from(&file)?;
+        let physics = builder::physics_of(&file);
+        let train = builder::train_of(&file, &course);
+        let dwell = file.settings.dwell;
+        Ok(Ride::new(
+            file.id.clone(),
+            Some(file),
+            course,
+            physics,
+            train,
+            dwell,
+        ))
+    }
+
+    /// The pose of seat `index` when the front car is at `front`.
+    fn seat_pose_at(&self, front: f64, index: usize) -> render::Pose {
+        let car = index / SEATS_PER_CAR;
+        let car_s = front - car as f64 * self.train.spacing;
+        render::seat_pose(&self.course.table, car_s, index % SEATS_PER_CAR)
+    }
+
+    fn front_pos(&self) -> DVec3 {
+        self.course.table.position(self.train.s)
+    }
+
+    /// Everything drawn of this ride, in the world right now?
+    fn anything_drawn(&self) -> bool {
+        self.train_drawn || self.groups.iter().any(|g| g.drawn)
+    }
+
+    /// The summon commands for rail group `g`; counts as a new drawing (D30).
+    fn rail_commands(&mut self, g: usize, session: u64) -> Vec<String> {
+        self.groups[g].generation += 1;
+        let group = &self.groups[g];
+        let tags = commands::piece_tags(&self.id, &g.to_string(), group.generation, session);
+        (group.first..group.end)
+            .map(|i| {
+                let pose = render::rail_pose(&self.course.table, self.pieces[i]);
+                commands::summon_rail(&self.id, &tags, pose.pos, pose.rotation, pose.scale)
+            })
+            .collect()
+    }
+
+    /// The summon commands for the cars and seats, where the train stands now.
+    fn train_commands(&mut self, session: u64) -> Vec<String> {
+        self.train_gen += 1;
+        let tags = commands::piece_tags(&self.id, "t", self.train_gen, session);
+        let mut out = Vec::new();
+        for car in 0..self.cars {
+            let pose = render::car_pose(
+                &self.course.table,
+                self.train.s - car as f64 * self.train.spacing,
+            );
+            out.push(commands::summon_car(
+                &self.id,
+                car,
+                &tags,
+                pose.pos,
+                pose.yaw,
+                pose.pitch,
+                self.k,
+                render::CAR_SCALE,
+            ));
+        }
+        for i in 0..self.seats.len() {
+            let pose = self.seat_pose_at(self.train.s, i);
+            self.seats[i] = Seat {
+                occupied: false,
+                rider: None,
+                pos: pose.pos,
+            };
+            out.extend(commands::summon_seat(&self.id, i, &tags, pose.pos));
+        }
+        self.train_drawn = true;
+        self.just_drawn = true;
+        out
+    }
+
+    /// Who sits where, the station, and the physics for one tick (steps 4 of the tick).
+    fn step<H: Host>(&mut self, host: &mut H, players: &[PlayerInfo]) {
+        if self.course.table.is_empty() {
+            return;
+        }
+
+        // Who sits in which seat? Close = yes, far = no, in between = no change.
+        if self.train_drawn {
+            for i in 0..self.seats.len() {
+                let point = render::rider_point(self.seats[i].pos);
+                let nearest = players
+                    .iter()
+                    .min_by(|a, b| a.pos.distance(point).total_cmp(&b.pos.distance(point)));
+                let distance = nearest.map_or(f64::INFINITY, |p| p.pos.distance(point));
+                if distance <= RIDER_ON_DISTANCE {
+                    if let Some(p) = nearest {
+                        if !self.seats[i].occupied {
+                            // Once per boarding: write down where the rider really is, so the heights
+                            // can be checked in the log (D49: the cart's fall may move them).
+                            let d = p.pos - self.seats[i].pos;
+                            host.log(&format!(
+                                "Horizon Theme Park: seat {i} boarded, rider minus seat = {} {} {}",
+                                commands::num(d.x),
+                                commands::num(d.y),
+                                commands::num(d.z)
+                            ));
+                        }
+                        self.seats[i].rider = Some(p.uuid);
+                    }
+                    self.seats[i].occupied = true;
+                } else if distance > RIDER_OFF_DISTANCE {
+                    self.seats[i].occupied = false;
+                    self.seats[i].rider = None;
+                }
+            }
+        }
+        let anyone = self.seats.iter().any(|s| s.occupied);
+
+        // The station (D56): the countdown starts when someone sits, and stops if everyone leaves.
+        // With nobody aboard the train waits.
+        if self.train.is_held() {
+            if anyone {
+                self.train.start_countdown(self.dwell);
+            } else {
+                self.train.cancel_countdown();
+            }
+        }
+
+        // The physics: one tick (ten substeps). It runs even while the track is parked (D30).
+        self.train.step(&self.course, &self.physics);
+        let held = self.train.is_held();
+        if self.was_held && !held {
+            self.phase = 0; // just left the station
+        }
+        let arrived = !self.was_held && held;
+
+        // Each car glides for `k` ticks to where it WILL be `k` ticks later (D32, D44), so it is
+        // sent every `k` ticks. Physics is exactly repeatable (D12), so "where it will be" comes
+        // from running a copy of the train `k` ticks forward. On arrival it is sent where it stands.
+        for slot in self.car_moves.iter_mut() {
+            *slot = None;
+        }
+        let due = (!held && self.phase.is_multiple_of(self.k)) || arrived;
+        if self.train_drawn && due {
+            let mut ahead = self.train;
+            if !arrived {
+                for _ in 0..self.k {
+                    ahead.step(&self.course, &self.physics);
+                }
+            }
+            for car in 0..self.cars {
+                let car_s = ahead.s - car as f64 * ahead.spacing;
+                self.car_moves[car] = Some(render::car_pose(&self.course.table, car_s));
+            }
+        }
+        if !held {
+            self.phase += 1;
+        }
+        self.was_held = held;
+
+        // Riders (and only riders) see the speed, or the station countdown, four times a second.
+        if self.train_drawn {
+            self.bar_clock += 1;
+            if self.bar_clock.is_multiple_of(ACTION_BAR_EVERY) {
+                let text = match self.train.countdown() {
+                    Some(left) => format!("Leaving in {} s", left.ceil() as i64),
+                    None if held => "Waiting for riders".to_string(),
+                    None => format!("Speed: {} km/h", (self.train.v * 3.6).round() as i64),
+                };
+                let mut shown: Vec<u128> = Vec::new();
+                for seat in &self.seats {
+                    let Some(uuid) = seat.rider else { continue };
+                    if shown.contains(&uuid) {
+                        continue;
+                    }
+                    shown.push(uuid);
+                    show(host, players, uuid, &text);
+                }
+            }
+        }
+    }
+
+    /// Send this tick's car and seat moves (step 6). Nothing is sent for a train that is not drawn.
+    fn emit_moves<H: Host>(&mut self, host: &mut H) {
+        if !self.train_drawn {
+            return;
+        }
+        if self.just_drawn {
+            self.just_drawn = false;
+            return;
+        }
+        for car in 0..self.cars {
+            if let Some(pose) = self.car_moves[car] {
+                host.run(&commands::move_car(
+                    &self.id, car, pose.pos, pose.yaw, pose.pitch,
+                ));
+            }
+        }
+        // Seats are moved every tick, ridden or not, so an empty minecart never falls or drifts.
+        for i in 0..self.seats.len() {
+            let pose = self.seat_pose_at(self.train.s, i);
+            self.seats[i].pos = pose.pos;
+            host.run(&commands::move_seat(
+                &self.id, i, pose.pos, pose.yaw, pose.pitch,
+            ));
+        }
+    }
+
+    /// How many commands this ride sends in a tick when it is drawn (an upper bound).
+    fn move_cost(&self) -> usize {
+        if self.train_drawn {
+            self.cars + self.seats.len()
+        } else {
+            0
+        }
+    }
+}
+
+/// Show `text` on one player's action bar, or by command when the host has no direct way.
+fn show<H: Host>(host: &mut H, players: &[PlayerInfo], uuid: u128, text: &str) {
+    if !host.action_bar(uuid, text)
+        && let Some(p) = players.iter().find(|p| p.uuid == uuid)
+    {
+        host.run(&commands::action_bar(&p.name, text));
+    }
+}
+
+/// The smallest distance from `at` to any of `points`, or infinity when there are none.
+fn nearest(points: &[DVec3], at: DVec3) -> f64 {
+    points
+        .iter()
+        .map(|p| p.distance(at))
+        .fold(f64::INFINITY, f64::min)
 }
 
 /// All of the mod's state.
@@ -3245,22 +4797,36 @@ pub struct Runtime {
     orders: VecDeque<Order>,
     /// True until the mod's leftover entities from an earlier session were removed (D20).
     cleanup_pending: bool,
-    demo: Option<Demo>,
     /// Build commands that did not fit into earlier ticks.
     build_queue: VecDeque<String>,
+    /// Have the saved rides been loaded for this world?
+    loaded: bool,
+    /// Ticks spent waiting for the world folder.
+    waited: u64,
+    /// The world folder, when there is one: only then are rides saved.
+    world: Option<PathBuf>,
+    /// The session number in the tag `htp_s<n>` (D66).
+    session: u64,
+    rides: Vec<Ride>,
+    /// Ride files that exist but could not be used (newer, broken): never overwritten.
+    locked: Vec<String>,
+    builder: Builder,
+    /// Ticks since the world opened.
+    now: u64,
+    /// The last `delete` that is waiting to be repeated: player, ride, tick (S3).
+    pending_delete: Option<(u128, String, u64)>,
+    /// `park.json` needs writing.
+    park_dirty: bool,
+    /// The display budget (D27); a field so a test can lower it.
+    display_budget: usize,
+    /// The tick of the last budget warning (one a minute).
+    last_budget_warning: Option<u64>,
 }
 
 impl Default for Runtime {
     fn default() -> Self {
         Runtime::new()
     }
-}
-
-/// The pose of seat `index` (0 .. SEATS) when the train's front car is at `front`.
-fn seat_pose_at(course: &Course, train: &Train, front: f64, index: usize) -> render::Pose {
-    let car = index / SEATS_PER_CAR;
-    let car_s = front - car as f64 * train.spacing;
-    render::seat_pose(&course.table, car_s, index % SEATS_PER_CAR)
 }
 
 impl Runtime {
@@ -3270,8 +4836,19 @@ impl Runtime {
             welcome: Welcome::new(),
             orders: VecDeque::new(),
             cleanup_pending: true,
-            demo: None,
             build_queue: VecDeque::new(),
+            loaded: false,
+            waited: 0,
+            world: None,
+            session: 0,
+            rides: Vec::new(),
+            locked: Vec::new(),
+            builder: Builder::new(),
+            now: 0,
+            pending_delete: None,
+            park_dirty: false,
+            display_budget: DISPLAY_BUDGET,
+            last_budget_warning: None,
         }
     }
 
@@ -3280,8 +4857,41 @@ impl Runtime {
         self.welcome.world_opened();
         self.orders.clear();
         self.build_queue.clear();
-        self.demo = None;
+        self.rides.clear();
+        self.locked.clear();
+        self.builder.clear_all();
+        self.pending_delete = None;
         self.cleanup_pending = true;
+        self.loaded = false;
+        self.waited = 0;
+        self.world = None;
+        self.session = 0;
+        self.now = 0;
+        self.park_dirty = false;
+        self.last_budget_warning = None;
+    }
+
+    /// The world is closing: write down anything not saved yet (D20).
+    pub fn world_closing<H: Host>(&mut self, host: &mut H) {
+        host.log(&format!(
+            "Horizon Theme Park: world closing, world folder = {:?}",
+            host.world_dir()
+        ));
+        self.save_dirty(host);
+    }
+
+    /// The track wand was used (a hook heard it). The work is queued for the next tick: commands
+    /// are refused inside player hooks (F1).
+    pub fn wand_click(&mut self, uuid: u128, click: WandClick) {
+        self.orders.push_back(Order::Wand { uuid, click });
+    }
+
+    fn ride_index(&self, id: &str) -> Option<usize> {
+        self.rides.iter().position(|r| r.id == id)
+    }
+
+    fn name_taken(&self, id: &str) -> bool {
+        self.ride_index(id).is_some() || self.locked.iter().any(|l| l == id)
     }
 
     /// A player typed `line` (without the slash). Returns the answer to show them, or `None`
@@ -3291,31 +4901,164 @@ impl Runtime {
         if words.first() != Some(&"coaster") {
             return None;
         }
-        let answer = match words.get(1).copied() {
-            Some("demo") if words.len() == 2 => {
+        let uuid = caller.uuid;
+        let answer = match (words.get(1).copied(), words.len()) {
+            (Some("demo"), 2) => {
                 self.orders.push_back(Order::Demo(caller));
-                "Building the demo coaster to your east."
+                "Building the demo coaster to your east.".to_string()
             }
-            Some("ride") if words.len() == 2 => {
-                if self.demo.is_some() {
-                    "Right-click a seat in the car to ride."
+            (Some("ride"), 2) => {
+                if self.rides.is_empty() {
+                    "There is no coaster yet. Type /coaster demo first.".to_string()
                 } else {
-                    "There is no coaster yet. Type /coaster demo first."
+                    "Right-click a seat in the car to ride.".to_string()
                 }
             }
-            Some("remove") if words.len() == 2 => {
-                self.orders.push_back(Order::Remove);
-                "Removing the demo coaster."
+            (Some("remove"), 2) => {
+                self.orders.push_back(Order::RemoveDemo);
+                "Removing the demo coaster.".to_string()
             }
-            _ => "Usage: /coaster demo, /coaster ride or /coaster remove.",
+            (Some("wand"), 2) => {
+                self.orders.push_back(Order::Give(caller));
+                "Here is the track wand. Right-click a block to place a node. Right-click the air to switch between track, lift, brake and station. /coaster undo removes the last node. /coaster create <name> makes the ride.".to_string()
+            }
+            (Some("undo"), 2) => match self.builder.undo(uuid, self.now) {
+                Some(n) => format!("Removed node {n}."),
+                None => "You have no nodes to remove.".to_string(),
+            },
+            (Some("list"), 2) => self.list_text(),
+            (Some("create"), 3) => {
+                let name = words[2];
+                let exists = |n: &str| self.name_taken(n);
+                match self.builder.create(uuid, name, exists) {
+                    Err(message) => message,
+                    Ok(ride) => {
+                        self.orders.push_back(Order::Create { uuid, ride });
+                        format!("Checking your track for {name}...")
+                    }
+                }
+            }
+            (Some("edit"), 3) => self.edit_text(uuid, words[2]),
+            (Some("delete"), 3) => self.delete_text(uuid, words[2]),
+            (Some("set"), 5) if words[3] == "cars" => self.set_cars_text(uuid, words[2], words[4]),
+            (Some("help"), 2) | (_, _) => {
+                "Usage: /coaster wand, undo, create <name>, edit <name>, delete <name>, list, set <name> cars <1-8>, demo, ride or remove.".to_string()
+            }
         };
-        Some(answer.to_string())
+        Some(answer)
+    }
+
+    fn list_text(&self) -> String {
+        let mut parts: Vec<String> = self
+            .rides
+            .iter()
+            .map(|r| {
+                if r.file.is_some() {
+                    format!(
+                        "{} ({:.0} blocks, {} cars)",
+                        r.id,
+                        r.course.table.length(),
+                        r.cars
+                    )
+                } else {
+                    format!("{} (the demo)", r.id)
+                }
+            })
+            .collect();
+        parts.extend(
+            self.locked
+                .iter()
+                .map(|l| format!("{l} (file could not be used)")),
+        );
+        if parts.is_empty() {
+            "There are no rides yet.".to_string()
+        } else {
+            format!("Rides: {}", parts.join(", "))
+        }
+    }
+
+    fn edit_text(&mut self, uuid: u128, name: &str) -> String {
+        if self.locked.iter().any(|l| l == name) {
+            return format!("The file of {name} could not be used, so it can't be edited.");
+        }
+        let file = self
+            .ride_index(name)
+            .and_then(|i| self.rides[i].file.clone());
+        match file {
+            Some(file) => {
+                self.builder.load_for_edit(uuid, &file, self.now);
+                format!(
+                    "Loaded the {} nodes of {name} into your wand. Change them, then /coaster create {name} to save.",
+                    file.nodes.len()
+                )
+            }
+            None => format!("There is no ride called {name}."),
+        }
+    }
+
+    fn delete_text(&mut self, uuid: u128, name: &str) -> String {
+        if self
+            .ride_index(name)
+            .is_none_or(|i| self.rides[i].file.is_none())
+        {
+            return format!("There is no saved ride called {name}.");
+        }
+        let again = matches!(
+            &self.pending_delete,
+            Some((who, id, at)) if *who == uuid && id == name && self.now.saturating_sub(*at) <= DELETE_WINDOW
+        );
+        if again {
+            self.pending_delete = None;
+            self.orders.push_back(Order::Delete {
+                uuid,
+                id: name.to_string(),
+            });
+            format!("Deleting {name}. Its file is kept as {name}.json.deleted.")
+        } else {
+            self.pending_delete = Some((uuid, name.to_string(), self.now));
+            format!("Type /coaster delete {name} again within 10 seconds to delete it.")
+        }
+    }
+
+    fn set_cars_text(&mut self, uuid: u128, name: &str, count: &str) -> String {
+        let Ok(cars) = count.parse::<usize>() else {
+            return "Cars must be a number from 1 to 8.".to_string();
+        };
+        if !(1..=MAX_CARS).contains(&cars) {
+            return format!("Cars must be a number from 1 to {MAX_CARS}.");
+        }
+        let Some(file) = self
+            .ride_index(name)
+            .and_then(|i| self.rides[i].file.clone())
+        else {
+            return format!("There is no ride called {name}.");
+        };
+        // The station must still be long enough for the new train.
+        let mut changed = file;
+        if let Some(train) = changed.trains.first_mut() {
+            train.cars = cars as u32;
+        }
+        if let Err(why) = builder::course_from(&changed) {
+            return why;
+        }
+        self.orders.push_back(Order::SetCars {
+            uuid,
+            id: name.to_string(),
+            cars,
+        });
+        format!("Giving {name} {cars} cars.")
     }
 
     /// One server tick.
     pub fn tick<H: Host>(&mut self, host: &mut H) {
+        self.now += 1;
         // Reading the player list costs a little, so only do it when something needs it.
-        let need_players = self.welcome.waiting() || self.cleanup_pending || self.demo.is_some();
+        let need_players = self.welcome.waiting()
+            || self.cleanup_pending
+            || !self.loaded
+            || !self.rides.is_empty()
+            || !self.orders.is_empty()
+            || !self.builder.sessions().is_empty();
         let players = if need_players {
             host.players()
         } else {
@@ -3326,232 +5069,523 @@ impl Runtime {
             host.broadcast(line);
         }
         if self.cleanup_pending && !players.is_empty() {
-            // D20: nothing is saved yet, so anything of ours left in the world is stale.
+            // D20: anything of ours left in the world is stale.
             host.run(&commands::kill_all());
             self.cleanup_pending = false;
         }
-
-        while let Some(order) = self.orders.pop_front() {
-            match order {
-                Order::Demo(caller) => self.build_demo(host, &caller),
-                Order::Remove => {
-                    host.run(&commands::kill_ride(commands::DEMO));
-                    self.clear_platform(host);
-                    self.build_queue.clear();
-                    self.demo = None;
-                }
-            }
+        if !self.cleanup_pending && !self.loaded {
+            self.load_world(host);
         }
 
-        // Build commands first, keeping room for this tick's moves (every seat and every car)
-        // and the action-bar fallbacks (at most one per seat).
-        let room = MAX_COMMANDS_PER_TICK - (SEATS + CARS + SEATS);
+        self.run_orders(host, &players);
+
+        // Build commands first, keeping room for this tick's moves.
+        let reserved: usize = self.rides.iter().map(Ride::move_cost).sum();
+        let room = MAX_COMMANDS_PER_TICK.saturating_sub(reserved);
         for _ in 0..room.min(self.build_queue.len()) {
             if let Some(command) = self.build_queue.pop_front() {
                 host.run(&command);
             }
         }
 
-        self.move_train(host, &players);
+        for ride in &mut self.rides {
+            ride.step(host, &players);
+        }
+        self.park_and_draw(host, &players, reserved);
+        for ride in &mut self.rides {
+            ride.emit_moves(host);
+        }
+        self.wand_display(host, &players);
+        self.sweep(host, &players);
+        self.save_dirty(host);
     }
 
-    /// Remove the old demo's stone platform, and only those exact blocks (D60).
-    fn clear_platform<H: Host>(&self, host: &mut H) {
-        if let Some(demo) = &self.demo {
-            host.run(&commands::fill(
-                demo.platform.min,
-                demo.platform.max,
-                "minecraft:air",
-            ));
+    // ---- loading (step 1) ----
+
+    /// Read the saved rides from the world folder (D20), once per world.
+    fn load_world<H: Host>(&mut self, host: &mut H) {
+        let Some(dir) = host.world_dir() else {
+            self.waited += 1;
+            if self.waited >= WORLD_WAIT_TICKS {
+                host.log("Horizon Theme Park: no world folder was found; rides will not be saved");
+                host.broadcast(
+                    "Horizon Theme Park: this world has no save folder, so rides cannot be saved.",
+                );
+                self.loaded = true;
+            }
+            return;
+        };
+        host.log(&format!(
+            "Horizon Theme Park: world folder {} (after {} ticks)",
+            dir.display(),
+            self.waited
+        ));
+        self.loaded = true;
+        match save::load_park(&dir) {
+            Err(error) => {
+                host.broadcast(&format!(
+                    "Horizon Theme Park: park.json: {error}. Rides will not be saved this time."
+                ));
+                return;
+            }
+            Ok(park) => {
+                self.session = park.session + 1;
+                self.world = Some(dir.clone());
+                self.park_dirty = true;
+            }
+        }
+        let found = save::load_all(&dir);
+        for problem in &found.problems {
+            host.broadcast(&format!("Horizon Theme Park: {problem}"));
+        }
+        self.locked = found.locked;
+        // The demo (if one was typed in the first moments) was drawn with the old session tag.
+        for ride in &mut self.rides {
+            if ride.anything_drawn() {
+                host.run(&commands::kill_ride(&ride.id));
+                ride.train_drawn = false;
+                for group in &mut ride.groups {
+                    group.drawn = false;
+                }
+            }
+        }
+        for file in found.rides {
+            let id = file.id.clone();
+            match Ride::from_file(file) {
+                Ok(ride) => self.rides.push(ride),
+                Err(why) => {
+                    host.broadcast(&format!(
+                        "Horizon Theme Park: ride {id} can't be built: {why}"
+                    ));
+                    self.locked.push(id);
+                }
+            }
+        }
+        host.log(&format!(
+            "Horizon Theme Park: session {}, {} ride(s) loaded",
+            self.session,
+            self.rides.len()
+        ));
+    }
+
+    // ---- orders (step 2) ----
+
+    fn run_orders<H: Host>(&mut self, host: &mut H, players: &[PlayerInfo]) {
+        while let Some(order) = self.orders.pop_front() {
+            // Orders that touch the saved rides wait until they are loaded (the demo and the
+            // wand do not need them). Order is kept.
+            let needs_world = matches!(
+                order,
+                Order::Create { .. } | Order::Delete { .. } | Order::SetCars { .. }
+            );
+            if needs_world && !self.loaded {
+                self.orders.push_front(order);
+                break;
+            }
+            match order {
+                Order::Demo(caller) => {
+                    self.remove_demo(host);
+                    self.build_demo(&caller);
+                }
+                Order::RemoveDemo => self.remove_demo(host),
+                Order::Give(caller) => {
+                    host.run(&commands::give(&caller.name, commands::WAND_ITEM));
+                }
+                Order::Wand { uuid, click } => {
+                    let text = match click {
+                        WandClick::Block(block) => {
+                            let n = self.builder.click_block(uuid, block, self.now);
+                            let mode = self.builder.session(uuid).map_or(Kind::Track, |s| s.mode);
+                            format!("Node {n} placed ({})", builder::mode_name(mode))
+                        }
+                        WandClick::Air => {
+                            let mode = self.builder.click_air(uuid, self.now);
+                            format!("Wand mode: {}", builder::mode_name(mode))
+                        }
+                    };
+                    show(host, players, uuid, &text);
+                }
+                Order::Create { uuid, ride } => self.finish_create(host, uuid, ride),
+                Order::Delete { uuid, id } => self.finish_delete(host, uuid, &id),
+                Order::SetCars { uuid, id, cars } => self.finish_set_cars(host, uuid, &id, cars),
+            }
         }
     }
 
-    /// Turn a `/coaster demo` order into the list of build commands.
-    fn build_demo<H: Host>(&mut self, host: &mut H, caller: &Caller) {
+    fn remove_demo<H: Host>(&mut self, host: &mut H) {
         host.run(&commands::kill_ride(commands::DEMO));
-        self.clear_platform(host);
-        self.build_queue.clear();
+        if let Some(i) = self.ride_index(commands::DEMO) {
+            if let Some(platform) = self.rides[i].platform {
+                host.run(&commands::fill(platform.min, platform.max, "minecraft:air"));
+            }
+            self.rides.remove(i);
+        }
+    }
 
+    /// Turn a `/coaster demo` order into a ride; its rails, car and seats are drawn by parking.
+    fn build_demo(&mut self, caller: &Caller) {
         // East of the player (+X), so the mod never has to read which way they look (D52).
         let origin = caller.pos + DVec3::new(DEMO_EAST, DEMO_HEIGHT, 0.0);
         let course = demo::demo_course(origin);
         let physics = Physics::default();
         let stop = course.station().map_or(0.0, |(_, stop, _)| stop);
-        let train = Train::held(CARS, stop);
-
-        // S3: how often a car may be moved comes from one dry lap (the sharpest speed² × bend).
-        let worst = sim::worst_speed_sq_curvature(&course, &train, &physics);
-        let k = render::teleport_ticks_for(worst);
-
-        // The station platform first (D60), then the rails, the cars and the seats.
-        let platform = render::station_platform(&course.table, stop, CARS, train.spacing);
+        let train = Train::held(demo::CARS, stop);
+        let platform = render::station_platform(&course.table, stop, demo::CARS, train.spacing);
         self.build_queue.push_back(commands::fill(
             platform.min,
             platform.max,
             commands::PLATFORM_BLOCK,
         ));
-        for piece in render::rail_pieces(&course.table) {
-            let pose = render::rail_pose(&course.table, piece);
-            self.build_queue.push_back(commands::summon_rail(
-                commands::DEMO,
-                pose.pos,
-                pose.rotation,
-                pose.scale,
-            ));
-        }
-        for car in 0..CARS {
-            let pose = render::car_pose(&course.table, stop - car as f64 * train.spacing);
-            self.build_queue.push_back(commands::summon_car(
-                commands::DEMO,
-                car,
-                pose.pos,
-                pose.yaw,
-                pose.pitch,
-                k,
-                render::CAR_SCALE,
-            ));
-        }
-        let mut seat_pos = [DVec3::ZERO; SEATS];
-        for (i, slot) in seat_pos.iter_mut().enumerate() {
-            let pose = seat_pose_at(&course, &train, stop, i);
-            *slot = pose.pos;
-            self.build_queue
-                .extend(commands::summon_seat(commands::DEMO, i, pose.pos));
-        }
-
-        self.demo = Some(Demo {
+        let mut ride = Ride::new(
+            commands::DEMO.to_string(),
+            None,
             course,
             physics,
             train,
-            platform,
-            k: [k; CARS],
-            phase: 0,
-            was_held: true,
-            bar_clock: 0,
-            occupied: [false; SEATS],
-            rider: [None; SEATS],
-            seat_pos,
-        });
+            DWELL,
+        );
+        ride.platform = Some(platform);
+        self.rides.push(ride);
     }
 
-    /// Steps 4 and 5 of the tick: who sits where, the station, the physics, the cars and seats.
-    fn move_train<H: Host>(&mut self, host: &mut H, players: &[PlayerInfo]) {
-        let Some(demo) = self.demo.as_mut() else {
+    /// Put `file`'s ride in the world, replacing a ride of the same name. Returns the ride.
+    fn install<H: Host>(&mut self, host: &mut H, file: RideFile) -> Result<usize, String> {
+        let mut ride = Ride::from_file(file)?;
+        if let Some(i) = self.ride_index(&ride.id) {
+            host.run(&commands::kill_ride(&ride.id));
+            self.rides.remove(i);
+        }
+        ride.dirty = true;
+        self.park_dirty = true;
+        self.rides.push(ride);
+        Ok(self.rides.len() - 1)
+    }
+
+    fn finish_create<H: Host>(&mut self, host: &mut H, uuid: u128, mut file: RideFile) {
+        let editing = self.builder.session(uuid).and_then(|s| s.editing.clone());
+        if self.name_taken(&file.id) && editing.as_deref() != Some(file.id.as_str()) {
+            host.tell(
+                uuid,
+                &format!(
+                    "A ride called {} already exists. Use /coaster edit {} to change it.",
+                    file.id, file.id
+                ),
+            );
+            return;
+        }
+        // Editing keeps the old ride's train and settings.
+        if let Some(old) = self
+            .ride_index(&file.id)
+            .and_then(|i| self.rides[i].file.as_ref())
+        {
+            file.settings = old.settings.clone();
+            file.trains = old.trains.clone();
+        }
+        let id = file.id.clone();
+        match self.install(host, file) {
+            Err(why) => host.tell(uuid, &why),
+            Ok(i) => {
+                self.builder.reset(uuid);
+                let ride = &self.rides[i];
+                let report =
+                    report::analyse(&ride.course, ride.cars, ride.train.spacing, &ride.physics);
+                host.tell(
+                    uuid,
+                    &format!("Ride {id} is built. The train waits in the station."),
+                );
+                for line in report.lines(&id) {
+                    host.tell(uuid, &line);
+                }
+                if self.world.is_none() {
+                    host.tell(
+                        uuid,
+                        "This world has no save folder, so this ride will not be saved.",
+                    );
+                }
+            }
+        }
+    }
+
+    fn finish_delete<H: Host>(&mut self, host: &mut H, uuid: u128, id: &str) {
+        let Some(i) = self.ride_index(id) else {
+            host.tell(uuid, &format!("There is no ride called {id}."));
             return;
         };
-        if demo.course.table.is_empty() {
+        host.run(&commands::kill_ride(id));
+        self.rides.remove(i);
+        self.park_dirty = true;
+        if let Some(dir) = &self.world
+            && let Err(why) = save::delete_ride(dir, id)
+        {
+            host.tell(uuid, &why);
             return;
         }
+        host.tell(
+            uuid,
+            &format!("Ride {id} is deleted (its file is kept as {id}.json.deleted)."),
+        );
+    }
 
-        // Who sits in which seat? Close = yes, far = no, in between = no change.
-        for i in 0..SEATS {
-            let point = render::rider_point(demo.seat_pos[i]);
-            let nearest = players
-                .iter()
-                .min_by(|a, b| a.pos.distance(point).total_cmp(&b.pos.distance(point)));
-            let distance = nearest.map_or(f64::INFINITY, |p| p.pos.distance(point));
-            if distance <= RIDER_ON_DISTANCE {
-                if let Some(p) = nearest {
-                    if !demo.occupied[i] {
-                        // Once per boarding: write down where the rider really is, so the heights
-                        // can be checked in the log (D49: the cart's fall may move them).
-                        let d = p.pos - demo.seat_pos[i];
-                        host.log(&format!(
-                            "Horizon Theme Park: seat {i} boarded, rider minus seat = {} {} {}",
-                            commands::num(d.x),
-                            commands::num(d.y),
-                            commands::num(d.z)
-                        ));
+    fn finish_set_cars<H: Host>(&mut self, host: &mut H, uuid: u128, id: &str, cars: usize) {
+        let Some(mut file) = self.ride_index(id).and_then(|i| self.rides[i].file.clone()) else {
+            host.tell(uuid, &format!("There is no ride called {id}."));
+            return;
+        };
+        match file.trains.first_mut() {
+            Some(train) => train.cars = cars as u32,
+            None => file.trains.push(save::TrainFile {
+                cars: cars as u32,
+                spacing: crate::game::htp_park::coaster::physics::CAR_SPACING,
+            }),
+        }
+        match self.install(host, file) {
+            Ok(_) => host.tell(uuid, &format!("{id} now has {cars} cars.")),
+            Err(why) => host.tell(uuid, &why),
+        }
+    }
+
+    // ---- parking (step 5) ----
+
+    /// Remove the displays of track far from everyone, and draw track near someone (D30).
+    fn park_and_draw<H: Host>(&mut self, host: &mut H, players: &[PlayerInfo], reserved: usize) {
+        let here: Vec<DVec3> = players
+            .iter()
+            .filter(|p| p.dimension == "minecraft:overworld")
+            .map(|p| p.pos)
+            .collect();
+        let session = self.session;
+
+        // Park first, so the freed room counts for this tick's drawing.
+        for ride in &mut self.rides {
+            let riding = ride.seats.iter().any(|s| s.occupied);
+            if ride.train_drawn && !riding && nearest(&here, ride.front_pos()) > PARK_DISTANCE {
+                host.run(&commands::kill_tag(&commands::tag_group(&ride.id, "t")));
+                ride.train_drawn = false;
+                for seat in &mut ride.seats {
+                    seat.occupied = false;
+                    seat.rider = None;
+                }
+            }
+            for (g, group) in ride.groups.iter_mut().enumerate() {
+                if group.drawn && nearest(&here, group.center) - group.radius > PARK_DISTANCE {
+                    host.run(&commands::kill_tag(&commands::tag_group(
+                        &ride.id,
+                        &g.to_string(),
+                    )));
+                    group.drawn = false;
+                }
+            }
+        }
+
+        // How many displays each player has near them now (D27).
+        let mut load: Vec<usize> = here
+            .iter()
+            .map(|&p| {
+                self.rides
+                    .iter()
+                    .map(|r| {
+                        let rails: usize = r
+                            .groups
+                            .iter()
+                            .filter(|g| g.drawn && g.center.distance(p) - g.radius <= BUDGET_RADIUS)
+                            .map(|g| g.end - g.first)
+                            .sum();
+                        let cars = if r.train_drawn && r.front_pos().distance(p) <= BUDGET_RADIUS {
+                            r.cars
+                        } else {
+                            0
+                        };
+                        rails + cars
+                    })
+                    .sum()
+            })
+            .collect();
+
+        let mut budget = DRAWS_PER_TICK.min(MAX_COMMANDS_PER_TICK.saturating_sub(reserved));
+        let mut over_budget = false;
+        let budget_limit = self.display_budget;
+        for ride in &mut self.rides {
+            // The train first, so riders have their seats.
+            if !ride.train_drawn {
+                let cost = ride.cars + ride.seats.len();
+                let near = nearest(&here, ride.front_pos()) <= DRAW_DISTANCE;
+                if near && cost <= budget {
+                    for command in ride.train_commands(session) {
+                        host.run(&command);
                     }
-                    demo.rider[i] = Some(p.uuid);
-                }
-                demo.occupied[i] = true;
-            } else if distance > RIDER_OFF_DISTANCE {
-                demo.occupied[i] = false;
-                demo.rider[i] = None;
-            }
-        }
-        let anyone = demo.occupied.iter().any(|&o| o);
-
-        // The station (D56): the countdown starts when someone sits, and stops if everyone leaves.
-        // With nobody aboard the train waits.
-        if demo.train.is_held() {
-            if anyone {
-                demo.train.start_countdown(DWELL);
-            } else {
-                demo.train.cancel_countdown();
-            }
-        }
-
-        // The physics: one tick (ten substeps).
-        demo.train.step(&demo.course, &demo.physics);
-        let held = demo.train.is_held();
-        if demo.was_held && !held {
-            demo.phase = 0; // just left the station
-        }
-        let arrived = !demo.was_held && held;
-
-        // Each car glides for `k` ticks to where it WILL be `k` ticks later (D32, D44), so it is
-        // sent every `k` ticks. Physics is exactly repeatable (D12), so "where it will be" comes
-        // from running a copy of the train `k` ticks forward. On arrival it is sent where it stands.
-        for car in 0..CARS {
-            let due = (!held && demo.phase % demo.k[car] == 0) || arrived;
-            if !due {
-                continue;
-            }
-            let mut ahead = demo.train;
-            if !arrived {
-                for _ in 0..demo.k[car] {
-                    ahead.step(&demo.course, &demo.physics);
+                    budget -= cost;
                 }
             }
-            let car_s = ahead.s - car as f64 * ahead.spacing;
-            let pose = render::car_pose(&demo.course.table, car_s);
-            host.run(&commands::move_car(
-                commands::DEMO,
-                car,
-                pose.pos,
-                pose.yaw,
-                pose.pitch,
-            ));
-        }
-        if !held {
-            demo.phase += 1;
-        }
-        demo.was_held = held;
-
-        // Seats are moved every tick, ridden or not, so an empty minecart never falls or drifts.
-        for i in 0..SEATS {
-            let pose = seat_pose_at(&demo.course, &demo.train, demo.train.s, i);
-            demo.seat_pos[i] = pose.pos;
-            host.run(&commands::move_seat(
-                commands::DEMO,
-                i,
-                pose.pos,
-                pose.yaw,
-                pose.pitch,
-            ));
-        }
-
-        // Riders (and only riders) see the speed, or the station countdown, four times a second.
-        demo.bar_clock += 1;
-        if demo.bar_clock % ACTION_BAR_EVERY == 0 {
-            let text = match demo.train.countdown() {
-                Some(left) => format!("Leaving in {} s", left.ceil() as i64),
-                None if held => "Waiting for riders".to_string(),
-                None => format!("Speed: {} km/h", (demo.train.v * 3.6).round() as i64),
-            };
-            let mut shown: Vec<u128> = Vec::new();
-            for uuid in demo.rider.iter().flatten() {
-                if shown.contains(uuid) {
+            for g in 0..ride.groups.len() {
+                let (center, radius, len, drawn) = {
+                    let group = &ride.groups[g];
+                    (
+                        group.center,
+                        group.radius,
+                        group.end - group.first,
+                        group.drawn,
+                    )
+                };
+                if drawn || nearest(&here, center) - radius > DRAW_DISTANCE || len > budget {
                     continue;
                 }
-                shown.push(*uuid);
-                if !host.action_bar(*uuid, &text)
-                    && let Some(p) = players.iter().find(|p| p.uuid == *uuid)
-                {
-                    host.run(&commands::action_bar(&p.name, &text));
+                // Past the display budget near a player: wait (the player is warned).
+                let affected: Vec<usize> = (0..here.len())
+                    .filter(|&i| here[i].distance(center) - radius <= BUDGET_RADIUS)
+                    .collect();
+                if affected.iter().any(|&i| load[i] + len > budget_limit) {
+                    over_budget = true;
+                    continue;
                 }
+                for command in ride.rail_commands(g, session) {
+                    host.run(&command);
+                }
+                ride.groups[g].drawn = true;
+                budget -= len;
+                for i in affected {
+                    load[i] += len;
+                }
+            }
+        }
+        if over_budget
+            && self
+                .last_budget_warning
+                .is_none_or(|at| self.now.saturating_sub(at) >= 1200)
+        {
+            self.last_budget_warning = Some(self.now);
+            host.broadcast("Horizon Theme Park: too many rides near you; some track is not drawn until you move away.");
+        }
+    }
+
+    // ---- wand markers and preview (step 7) ----
+
+    fn wand_display<H: Host>(&mut self, host: &mut H, players: &[PlayerInfo]) {
+        let now = self.now;
+        let session = self.session;
+        let mut markers_left = MARKERS_PER_TICK;
+        for s in self.builder.sessions_mut() {
+            if s.reload {
+                if s.markers > 0 {
+                    host.run(&commands::kill_wand(s.uuid));
+                }
+                s.markers = 0;
+                s.reload = false;
+                s.preview.clear();
+                s.preview_version = u64::MAX;
+            }
+            let live = now.saturating_sub(s.last_use) <= PREVIEW_TICKS && !s.nodes.is_empty();
+            if !live {
+                if s.markers > 0 {
+                    host.run(&commands::kill_wand(s.uuid));
+                    s.markers = 0;
+                }
+                s.preview.clear();
+                s.preview_version = u64::MAX;
+                continue;
+            }
+            while s.markers > s.nodes.len() {
+                s.markers -= 1;
+                host.run(&commands::kill_node(s.uuid, s.markers));
+            }
+            while s.markers < s.nodes.len() && markers_left > 0 {
+                let p = s.nodes[s.markers].pos;
+                host.run(&commands::summon_node(
+                    s.uuid,
+                    s.markers,
+                    session,
+                    DVec3::new(p[0], p[1], p[2]),
+                ));
+                s.markers += 1;
+                markers_left -= 1;
+            }
+            if s.preview_version != s.version {
+                s.preview = builder::preview_points(&s.nodes, PREVIEW_STEP, PREVIEW_MAX_POINTS);
+                s.preview_version = s.version;
+            }
+            // The dots are spread over the 10 ticks between redraws, and only the player who built sees them.
+            if let Some(player) = players.iter().find(|p| p.uuid == s.uuid) {
+                let phase = (now % PREVIEW_EVERY) as usize;
+                for (i, point) in s.preview.iter().enumerate() {
+                    if i % PREVIEW_EVERY as usize == phase {
+                        host.run(&commands::particle(&player.name, *point));
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- sweeping (step 7) ----
+
+    /// Every 5 seconds, remove leftovers near each player: entities of an earlier session (D66),
+    /// and entities of an older drawing of a group (D30). Chunks that were unloaded when we
+    /// removed things bring their old entities back (spike R8).
+    fn sweep<H: Host>(&mut self, host: &mut H, players: &[PlayerInfo]) {
+        if !self.loaded || !self.now.is_multiple_of(SCRUB_EVERY) {
+            return;
+        }
+        for p in players
+            .iter()
+            .filter(|p| p.dimension == "minecraft:overworld")
+        {
+            host.run(&commands::scrub_session(p.pos, self.session));
+            for ride in &self.rides {
+                for (g, group) in ride.groups.iter().enumerate() {
+                    if group.drawn && group.center.distance(p.pos) - group.radius <= 128.0 {
+                        host.run(&commands::scrub_generation(
+                            p.pos,
+                            &ride.id,
+                            &g.to_string(),
+                            group.generation,
+                        ));
+                    }
+                }
+                if ride.train_drawn && ride.front_pos().distance(p.pos) <= 128.0 {
+                    host.run(&commands::scrub_generation(
+                        p.pos,
+                        &ride.id,
+                        "t",
+                        ride.train_gen,
+                    ));
+                }
+            }
+        }
+    }
+
+    // ---- saving (step 8) ----
+
+    fn save_dirty<H: Host>(&mut self, host: &mut H) {
+        let Some(dir) = self.world.clone() else {
+            for ride in &mut self.rides {
+                ride.dirty = false;
+            }
+            self.park_dirty = false;
+            return;
+        };
+        for ride in self.rides.iter_mut().filter(|r| r.dirty) {
+            ride.dirty = false;
+            if let Some(file) = &ride.file
+                && let Err(why) = save::save_ride(&dir, file)
+            {
+                host.broadcast(&format!("Horizon Theme Park: {why}"));
+            }
+        }
+        if self.park_dirty {
+            self.park_dirty = false;
+            let mut ids: Vec<String> = self
+                .rides
+                .iter()
+                .filter(|r| r.file.is_some())
+                .map(|r| r.id.clone())
+                .chain(self.locked.iter().cloned())
+                .collect();
+            ids.sort();
+            let park = ParkFile {
+                format: save::FORMAT,
+                session: self.session,
+                rides: ids,
+            };
+            if let Err(why) = save::save_park(&dir, &park) {
+                host.broadcast(&format!("Horizon Theme Park: {why}"));
             }
         }
     }
@@ -3561,6 +5595,9 @@ impl Runtime {
 mod tests {
     use super::*;
     use crate::game::htp_park::host::{FakeHost, PlayerInfo};
+    use std::fs;
+
+    const SEATS: usize = demo::CARS * SEATS_PER_CAR;
 
     fn player(uuid: u128, pos: DVec3) -> PlayerInfo {
         PlayerInfo {
@@ -3571,33 +5608,63 @@ mod tests {
         }
     }
 
+    /// Far from everything: nothing is drawn near this player.
     fn far_away() -> DVec3 {
-        DVec3::new(500.0, 70.0, 500.0)
+        DVec3::new(5000.0, 70.0, 5000.0)
+    }
+
+    /// Standing beside the demo's station: the train and the nearest track are drawn.
+    fn bystander() -> DVec3 {
+        DVec3::new(10.0, 70.0, 0.0)
     }
 
     fn caller() -> Caller {
         Caller {
             uuid: 1,
+            name: "Player1".to_string(),
             pos: DVec3::new(0.0, 70.0, 0.0),
         }
     }
 
-    /// A runtime with a built demo, one player far away, and all build commands already sent.
+    /// An empty scratch world folder for one test.
+    fn world(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("htp-test-runtime-{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Tick until a tick draws nothing new (no summons).
+    fn settle(rt: &mut Runtime, host: &mut FakeHost) {
+        for _ in 0..200 {
+            rt.tick(host);
+            let sent = host.take_commands();
+            if !sent
+                .iter()
+                .any(|c| c.starts_with("summon") || c.starts_with("fill"))
+                && rt.now > 3
+            {
+                return;
+            }
+        }
+        panic!("never settled");
+    }
+
+    /// A runtime with a built demo, one player beside the station, and everything near drawn.
     fn built() -> (Runtime, FakeHost) {
         let mut rt = Runtime::new();
         let mut host = FakeHost::new();
-        host.players.push(player(1, far_away()));
+        host.players.push(player(1, bystander()));
         rt.tick(&mut host); // greeting + cleanup
         rt.command("coaster demo", caller());
-        while rt.demo.is_none() || !rt.build_queue.is_empty() {
-            rt.tick(&mut host);
-        }
+        rt.tick(&mut host);
+        settle(&mut rt, &mut host);
         host.take_commands();
         (rt, host)
     }
 
-    fn demo(rt: &Runtime) -> &Demo {
-        rt.demo.as_ref().unwrap()
+    fn demo_ride(rt: &Runtime) -> &Ride {
+        &rt.rides[rt.ride_index("demo").unwrap()]
     }
 
     fn seat_move_count(commands: &[String]) -> usize {
@@ -3616,7 +5683,7 @@ mod tests {
 
     /// Put player 0 exactly where seat 0's rider sits.
     fn sit_in_seat_zero(rt: &Runtime, host: &mut FakeHost) {
-        host.players[0].pos = render::rider_point(demo(rt).seat_pos[0]);
+        host.players[0].pos = render::rider_point(demo_ride(rt).seats[0].pos);
     }
 
     /// Tick with the player riding along in seat 0.
@@ -3642,18 +5709,17 @@ mod tests {
     fn a_new_world_greets_and_cleans_up_again() {
         let (mut rt, mut host) = built();
         rt.world_opened();
-        assert!(rt.demo.is_none());
+        assert!(rt.rides.is_empty());
         rt.tick(&mut host);
         assert_eq!(host.broadcasts.len(), 2);
         assert_eq!(host.commands, vec!["kill @e[tag=htp]"]);
     }
 
-    // Test 16: several cars.
     #[test]
-    fn demo_builds_rails_then_three_cars_then_six_seats() {
+    fn demo_draws_the_train_and_the_nearby_rails_and_the_ride_command_is_only_a_hint() {
         let mut rt = Runtime::new();
         let mut host = FakeHost::new();
-        host.players.push(player(1, far_away()));
+        host.players.push(player(1, bystander()));
         rt.tick(&mut host);
         host.take_commands();
 
@@ -3667,7 +5733,7 @@ mod tests {
             "nothing runs inside the command hook"
         );
         let mut per_tick = Vec::new();
-        for _ in 0..8 {
+        for _ in 0..10 {
             rt.tick(&mut host);
             per_tick.push(host.take_commands());
         }
@@ -3676,33 +5742,44 @@ mod tests {
 
         assert_eq!(all[0], "kill @e[tag=htp_demo]");
         let summons: Vec<&&String> = all.iter().filter(|c| c.starts_with("summon")).collect();
+        let cars: Vec<&&&String> = summons
+            .iter()
+            .filter(|c| c.contains("\"htp_car_demo_"))
+            .collect();
+        assert_eq!(cars.len(), demo::CARS);
+        for (i, c) in cars.iter().enumerate() {
+            assert!(
+                c.contains(&format!("\"htp_car_demo_{i}\"")) && c.contains("teleport_duration:")
+            );
+            assert!(c.contains("\"htp_s0\"") || c.contains("\"htp_s1\""), "{c}");
+            assert!(c.contains("\"htp_g_demo_t\"") && c.contains("\"htp_gen_1\""));
+        }
+        let seats = summons
+            .iter()
+            .filter(|c| c.starts_with("summon minecraft:minecart"))
+            .count();
+        assert_eq!(seats, SEATS);
         let rails = summons.iter().filter(|c| c.contains("htp:rail")).count();
-        assert!(rails >= 100, "only {rails} rail pieces");
-        // Rails first, then one car per car, then one minecart per seat.
-        assert!(summons[..rails].iter().all(|c| c.contains("htp:rail")));
-        for car in 0..CARS {
-            assert!(
-                summons[rails + car].contains(&format!("\"htp_car_demo_{car}\""))
-                    && summons[rails + car].contains("teleport_duration:")
-            );
-        }
-        for seat in 0..SEATS {
-            let c = summons[rails + CARS + seat];
-            assert!(
-                c.starts_with("summon minecraft:minecart")
-                    && c.contains(&format!("htp_seat_demo_{seat}"))
-            );
-        }
-        assert_eq!(summons.len(), rails + CARS + SEATS);
+        // Only the track near the player is drawn: some, but not the whole 300 blocks.
+        let all_pieces = demo_ride(&rt).pieces.len();
+        assert!(
+            rails >= GROUP_SIZE && rails < all_pieces,
+            "{rails} of {all_pieces}"
+        );
+        assert!(
+            rt.command("coaster ride", caller())
+                .unwrap()
+                .starts_with("Right-click a seat")
+        );
     }
 
     #[test]
     fn the_station_is_three_blocks_east_of_the_player_and_the_rails_float_five_blocks_above_their_feet()
      {
         let (rt, _) = built();
-        let table = &demo(&rt).course.table;
+        let table = &demo_ride(&rt).course.table;
         // The player stands at (0, 70, 0). The station's near end is 3 blocks east.
-        let (station, stop, _) = demo(&rt).course.station().unwrap();
+        let (station, stop, _) = demo_ride(&rt).course.station().unwrap();
         let near = table
             .position(station.s1)
             .x
@@ -3751,9 +5828,11 @@ mod tests {
         for _ in 0..200 {
             rt.tick(&mut host);
             let cmds = host.take_commands();
-            assert_eq!(cmds.len(), SEATS, "only the seat moves");
+            // Only the seats move (and the 5-second sweep, which has no leftovers to report here).
+            assert_eq!(seat_move_count(&cmds), SEATS);
+            assert!(car_moves(&cmds).is_empty());
         }
-        let d = demo(&rt);
+        let d = demo_ride(&rt);
         assert!(d.train.is_held() && d.train.countdown().is_none());
         assert!(host.action_bars.is_empty());
     }
@@ -3763,9 +5842,9 @@ mod tests {
         let (mut rt, mut host) = built();
         sit_in_seat_zero(&rt, &mut host);
         rt.tick(&mut host);
-        assert!(demo(&rt).train.countdown().is_some());
+        assert!(demo_ride(&rt).train.countdown().is_some());
         let mut ticks = 1;
-        while demo(&rt).train.is_held() {
+        while demo_ride(&rt).train.is_held() {
             ride_tick(&mut rt, &mut host);
             ticks += 1;
             assert!(ticks < 300, "never left");
@@ -3781,14 +5860,14 @@ mod tests {
         for _ in 0..30 {
             ride_tick(&mut rt, &mut host);
         }
-        assert!(demo(&rt).train.countdown().is_some());
-        host.players[0].pos = far_away();
+        assert!(demo_ride(&rt).train.countdown().is_some());
+        host.players[0].pos = bystander();
         rt.tick(&mut host);
-        assert!(demo(&rt).train.is_held());
-        assert!(demo(&rt).train.countdown().is_none());
+        assert!(demo_ride(&rt).train.is_held());
+        assert!(demo_ride(&rt).train.countdown().is_none());
     }
 
-    // Test 13: cars aimed k ticks ahead by running the physics forward.
+    // Test 13 (M2): cars aimed k ticks ahead by running the physics forward.
     #[test]
     fn a_cars_move_goes_to_where_the_physics_puts_it_k_ticks_later() {
         let (mut rt, mut host) = built();
@@ -3803,9 +5882,10 @@ mod tests {
             let cmds = host.take_commands();
             let sent = car_moves(&cmds);
             if let Some(first) = sent.first().filter(|c| c.contains("htp_car_demo_0,")) {
-                let d = demo(&rt);
+                let d = demo_ride(&rt);
+                // `step` ran before this tick's moves, so the copy of the train is one tick on.
                 let mut ahead = d.train;
-                for _ in 0..d.k[0] {
+                for _ in 0..d.k {
                     ahead.step(&d.course, &d.physics);
                 }
                 let want = render::car_pose(&d.course.table, ahead.s);
@@ -3813,10 +5893,7 @@ mod tests {
                     **first,
                     commands::move_car(commands::DEMO, 0, want.pos, want.yaw, want.pitch)
                 );
-                assert!(
-                    d.k.iter()
-                        .all(|k| (1..=render::MAX_TELEPORT_TICKS).contains(k))
-                );
+                assert!((1..=render::MAX_TELEPORT_TICKS).contains(&d.k));
                 return;
             }
         }
@@ -3833,14 +5910,17 @@ mod tests {
             assert_eq!(seat_move_count(&cmds), SEATS, "tick {tick}");
             assert!(cmds.len() <= MAX_COMMANDS_PER_TICK);
         }
-        assert!(!demo(&rt).train.is_held(), "it should be on its way by now");
+        assert!(
+            !demo_ride(&rt).train.is_held(),
+            "it should be on its way by now"
+        );
     }
 
     // Test 14: the action bar.
     #[test]
     fn riders_and_only_riders_see_the_countdown_and_then_their_speed() {
         let (mut rt, mut host) = built();
-        host.players.push(player(2, far_away())); // a bystander
+        host.players.push(player(2, bystander())); // a bystander
         sit_in_seat_zero(&rt, &mut host);
         for _ in 0..400 {
             ride_tick(&mut rt, &mut host);
@@ -3892,10 +5972,10 @@ mod tests {
         }
         let (mut rt, host) = built();
         let mut plain = Plain(host);
-        plain.0.players[0].pos = render::rider_point(demo(&rt).seat_pos[0]);
+        plain.0.players[0].pos = render::rider_point(demo_ride(&rt).seats[0].pos);
         for _ in 0..10 {
             rt.tick(&mut plain);
-            plain.0.players[0].pos = render::rider_point(demo(&rt).seat_pos[0]);
+            plain.0.players[0].pos = render::rider_point(demo_ride(&rt).seats[0].pos);
         }
         assert!(
             plain
@@ -3913,13 +5993,13 @@ mod tests {
         let mut left = false;
         for tick in 0..1500 {
             ride_tick(&mut rt, &mut host);
-            let held = demo(&rt).train.is_held();
+            let held = demo_ride(&rt).train.is_held();
             if !held {
                 left = true;
             }
             if left && held {
                 // Back in the station at the stop point.
-                let d = demo(&rt);
+                let d = demo_ride(&rt);
                 let stop = d.course.station().unwrap().1;
                 assert!((d.train.s - stop).abs() < 0.2);
                 assert!(tick > 400, "lap took only {tick} ticks");
@@ -3933,17 +6013,18 @@ mod tests {
     fn boarding_is_logged_once_with_the_measured_offset_and_a_loose_fit_still_counts() {
         let (mut rt, mut host) = built();
         // A rider hanging 0.9 block off the expected spot still counts as sitting.
-        let seat = demo(&rt).seat_pos[0];
+        let seat = demo_ride(&rt).seats[0].pos;
         host.players[0].pos = render::rider_point(seat) + DVec3::new(0.0, -0.9, 0.0);
         for _ in 0..5 {
             rt.tick(&mut host);
             host.players[0].pos =
-                render::rider_point(demo(&rt).seat_pos[0]) + DVec3::new(0.0, -0.9, 0.0);
+                render::rider_point(demo_ride(&rt).seats[0].pos) + DVec3::new(0.0, -0.9, 0.0);
         }
-        assert!(demo(&rt).occupied[0]);
-        assert_eq!(host.logs.len(), 1, "{:?}", host.logs);
+        assert!(demo_ride(&rt).seats[0].occupied);
+        let boarded: Vec<&String> = host.logs.iter().filter(|l| l.contains("boarded")).collect();
+        assert_eq!(boarded.len(), 1, "{:?}", host.logs);
         assert_eq!(
-            host.logs[0],
+            boarded[0],
             "Horizon Theme Park: seat 0 boarded, rider minus seat = 0.0000 -2.1125 0.0000"
         );
     }
@@ -3952,20 +6033,20 @@ mod tests {
     fn a_player_between_the_two_distances_changes_nothing() {
         let (mut rt, mut host) = built();
         // Standing 1.5 blocks from the rider point: not close enough to count as sitting.
-        host.players[0].pos = render::rider_point(demo(&rt).seat_pos[0]) + DVec3::X * 1.5;
+        host.players[0].pos = render::rider_point(demo_ride(&rt).seats[0].pos) + DVec3::X * 1.5;
         rt.tick(&mut host);
-        assert!(!demo(&rt).occupied[0]);
+        assert!(!demo_ride(&rt).seats[0].occupied);
         // Sitting, then stepping 1 block away: still counts as sitting.
         sit_in_seat_zero(&rt, &mut host);
         rt.tick(&mut host);
-        assert!(demo(&rt).occupied[0]);
+        assert!(demo_ride(&rt).seats[0].occupied);
         host.players[0].pos += DVec3::X * 1.0;
         rt.tick(&mut host);
-        assert!(demo(&rt).occupied[0]);
+        assert!(demo_ride(&rt).seats[0].occupied);
         // Walking right away (more than 2 blocks): off.
-        host.players[0].pos = far_away();
+        host.players[0].pos = bystander();
         rt.tick(&mut host);
-        assert!(!demo(&rt).occupied[0]);
+        assert!(!demo_ride(&rt).seats[0].occupied);
     }
 
     #[test]
@@ -3977,15 +6058,7 @@ mod tests {
             before.as_deref(),
             Some("There is no coaster yet. Type /coaster demo first.")
         );
-        let (mut rt, mut host2) = built();
-        let after = rt.command("coaster ride", caller());
-        assert_eq!(
-            after.as_deref(),
-            Some("Right-click a seat in the car to ride.")
-        );
-        rt.tick(&mut host2);
-        assert_eq!(host2.take_commands().len(), SEATS, "only the seat moves");
-        // And a runtime with no demo sends nothing at all.
+        // And a runtime with no ride sends nothing at all.
         empty.tick(&mut host);
         assert!(host.commands.is_empty());
     }
@@ -3999,7 +6072,7 @@ mod tests {
         assert_eq!(cmds[0], "kill @e[tag=htp_demo]");
         assert!(cmds[1].starts_with("fill ") && cmds[1].ends_with(" minecraft:air"));
         assert_eq!(cmds.len(), 2);
-        assert!(rt.demo.is_none());
+        assert!(rt.rides.is_empty());
         rt.tick(&mut host);
         assert!(host.take_commands().is_empty());
     }
@@ -4033,25 +6106,26 @@ mod tests {
         // The old platform is cleared before the new one is placed (D60).
         assert!(host.commands[1].ends_with(" minecraft:air"));
         assert!(host.commands.iter().any(|c| c.contains("htp:rail")));
+        assert_eq!(rt.rides.len(), 1);
     }
 
     #[test]
     fn the_demo_places_a_smooth_stone_platform_first_and_remove_clears_exactly_those_blocks() {
         let mut rt = Runtime::new();
         let mut host = FakeHost::new();
-        host.players.push(player(1, far_away()));
+        host.players.push(player(1, bystander()));
         rt.tick(&mut host);
         host.take_commands();
         // The player stands at (0, 70, 0): the station track is at y 75, z 0, x -9.5 .. 3 east of them.
         rt.command("coaster demo", caller());
         let mut all = Vec::new();
-        while rt.demo.is_none() || !rt.build_queue.is_empty() {
+        for _ in 0..10 {
             rt.tick(&mut host);
             all.extend(host.take_commands());
         }
         let place: Vec<&String> = all.iter().filter(|c| c.starts_with("fill ")).collect();
         assert_eq!(place.len(), 1, "{place:?}");
-        let platform = demo(&rt).platform;
+        let platform = demo_ride(&rt).platform.unwrap();
         assert_eq!(
             *place[0],
             commands::fill(platform.min, platform.max, "minecraft:smooth_stone")
@@ -4077,8 +6151,8 @@ mod tests {
     #[test]
     fn the_platform_stays_clear_of_the_rails_and_the_cars_and_sits_on_the_outer_side() {
         let (rt, _) = built();
-        let d = demo(&rt);
-        let p = d.platform;
+        let d = demo_ride(&rt);
+        let p = d.platform.unwrap();
         let (x0, x1) = (p.min[0] as f64, p.max[0] as f64 + 1.0);
         let (z0, z1) = (p.min[2] as f64, p.max[2] as f64 + 1.0);
         let (y0, y1) = (p.min[1] as f64, p.min[1] as f64 + 1.0);
@@ -4100,6 +6174,1055 @@ mod tests {
         assert!(z0 > stop.z, "the platform is on the far side from the turn");
         // The top is below the track's line.
         assert!(y1 < stop.y);
+    }
+
+    // ---- M3 ----
+
+    /// A file for a ride made from the builder test's loop, moved to `at`.
+    fn ride_file(id: &str, at: DVec3) -> RideFile {
+        let mut nodes = builder::tests::loop_nodes();
+        for n in &mut nodes {
+            n.pos = [n.pos[0] + at.x, n.pos[1] + at.y - 70.0, n.pos[2] + at.z];
+        }
+        RideFile::new(id, nodes)
+    }
+
+    /// A runtime in a scratch world with `rides` saved on disk, one player, loaded and settled.
+    fn world_with(
+        name: &str,
+        rides: &[(&str, DVec3)],
+        player_at: DVec3,
+    ) -> (Runtime, FakeHost, PathBuf) {
+        let dir = world(name);
+        for (id, at) in rides {
+            save::save_ride(&dir, &ride_file(id, *at)).unwrap();
+        }
+        let mut host = FakeHost::new();
+        host.world = Some(dir.clone());
+        host.players.push(player(1, player_at));
+        (Runtime::new(), host, dir)
+    }
+
+    // Test 9.
+    #[test]
+    fn on_world_open_one_kill_then_rides_load_and_only_the_near_ones_are_drawn() {
+        let (mut rt, mut host, _) = world_with(
+            "open",
+            &[
+                ("near", DVec3::new(0.0, 70.0, 0.0)),
+                ("far", DVec3::new(2000.0, 70.0, 0.0)),
+            ],
+            DVec3::new(10.0, 70.0, 10.0),
+        );
+        rt.world_opened();
+        rt.tick(&mut host);
+        let first = host.take_commands();
+        assert_eq!(first[0], "kill @e[tag=htp]");
+        assert_eq!(first.iter().filter(|c| c.starts_with("kill ")).count(), 1);
+        assert_eq!(rt.rides.len(), 2);
+        assert_eq!(rt.session, 1);
+        let summons: Vec<&String> = first.iter().filter(|c| c.starts_with("summon")).collect();
+        assert!(!summons.is_empty());
+        assert!(
+            summons
+                .iter()
+                .all(|c| c.contains("\"htp_near\"") && c.contains("\"htp_s1\"")),
+            "{summons:?}"
+        );
+        // The new session number was written down, and the train waits in its station.
+        assert_eq!(
+            save::load_park(&host.world.clone().unwrap())
+                .unwrap()
+                .session,
+            1
+        );
+        assert!(rt.rides.iter().all(|r| r.train.is_held()));
+        // A second opening bumps the session.
+        rt.world_opened();
+        rt.tick(&mut host);
+        assert_eq!(rt.session, 2);
+    }
+
+    #[test]
+    fn a_world_with_no_folder_waits_a_little_then_says_rides_cannot_be_saved() {
+        let mut rt = Runtime::new();
+        let mut host = FakeHost::new();
+        host.players.push(player(1, bystander()));
+        for _ in 0..WORLD_WAIT_TICKS + 2 {
+            rt.tick(&mut host);
+        }
+        assert!(rt.loaded && rt.world.is_none());
+        assert!(
+            host.broadcasts
+                .iter()
+                .any(|b| b.contains("cannot be saved"))
+        );
+    }
+
+    // Test 10.
+    #[test]
+    fn wand_clicks_are_queued_and_run_on_the_next_tick_in_order() {
+        let (mut rt, mut host, _) = world_with("wand-orders", &[], bystander());
+        rt.tick(&mut host);
+        host.take_commands();
+        rt.wand_click(1, WandClick::Block([10, 64, 10]));
+        rt.wand_click(1, WandClick::Air);
+        rt.wand_click(1, WandClick::Block([12, 64, 10]));
+        assert!(host.commands.is_empty() && host.action_bars.is_empty());
+        assert!(
+            rt.builder.session(1).is_none(),
+            "nothing happens inside the hook"
+        );
+        rt.tick(&mut host);
+        let s = rt.builder.session(1).unwrap();
+        assert_eq!(s.nodes.len(), 2);
+        assert_eq!(s.nodes[0].kind, Kind::Track);
+        assert_eq!(s.nodes[1].kind, Kind::Lift);
+        let texts: Vec<&str> = host.action_bars.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "Node 1 placed (track)",
+                "Wand mode: lift",
+                "Node 2 placed (lift)"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_wand_shows_markers_and_dots_only_to_the_builder_and_stops_after_thirty_seconds() {
+        let (mut rt, mut host, _) = world_with("wand-show", &[], bystander());
+        rt.tick(&mut host);
+        host.take_commands();
+        for i in 0..5 {
+            rt.wand_click(1, WandClick::Block([i * 3, 64, 0]));
+        }
+        host.players.push(player(2, bystander()));
+        rt.tick(&mut host);
+        let sent = host.take_commands();
+        assert_eq!(sent.iter().filter(|c| c.contains("htp:node")).count(), 5);
+        // Over the next 10 ticks every preview dot is sent once, to player 1 only.
+        let mut dots = Vec::new();
+        for _ in 0..10 {
+            rt.tick(&mut host);
+            dots.extend(
+                host.take_commands()
+                    .into_iter()
+                    .filter(|c| c.starts_with("particle")),
+            );
+        }
+        assert!(dots.len() > 20);
+        assert!(dots.iter().all(|c| c.ends_with(" force Player1")));
+        // Undo takes the last marker away.
+        assert_eq!(
+            rt.command("coaster undo", caller()).unwrap(),
+            "Removed node 5."
+        );
+        rt.tick(&mut host);
+        assert!(
+            host.take_commands()
+                .iter()
+                .any(|c| c == "kill @e[tag=htp_wn_1_4]")
+        );
+        // After 30 s without the wand everything is removed.
+        for _ in 0..PREVIEW_TICKS + 5 {
+            rt.tick(&mut host);
+        }
+        let later = host.take_commands();
+        assert!(later.iter().any(|c| c == "kill @e[tag=htp_wand_1]"));
+        let before = host.commands.len();
+        rt.tick(&mut host);
+        assert_eq!(host.commands.len(), before, "nothing more is sent");
+    }
+
+    #[test]
+    fn create_builds_a_ride_saves_it_tells_the_report_and_edit_brings_the_nodes_back() {
+        let (mut rt, mut host, dir) = world_with("create", &[], bystander());
+        rt.tick(&mut host);
+        host.take_commands();
+        // Place the loop with the wand: mode changes to station first.
+        let nodes = builder::tests::loop_nodes();
+        for (i, n) in nodes.iter().enumerate() {
+            let wanted = n.kind;
+            while rt.builder.session(1).map_or(Kind::Track, |s| s.mode) != wanted
+                || (i == 0 && rt.builder.session(1).is_none())
+            {
+                rt.builder.click_air(1, 0);
+                if wanted == Kind::Track {
+                    break;
+                }
+            }
+            // Click a block so the node lands at the wanted spot (x, y - 1.5, z) block centre.
+            rt.builder.click_block(
+                1,
+                [
+                    (n.pos[0] - 0.5) as i32,
+                    (n.pos[1] - 1.5) as i32,
+                    (n.pos[2] - 0.5) as i32,
+                ],
+                0,
+            );
+        }
+        // Nodes use the modes they were placed in: fix the kinds exactly as the loop wants.
+        for (i, n) in nodes.iter().enumerate() {
+            rt.builder.sessions_mut()[0].nodes[i].kind = n.kind;
+        }
+        let answer = rt.command("coaster create thunder", caller()).unwrap();
+        assert!(
+            answer.starts_with("Checking your track for thunder"),
+            "{answer}"
+        );
+        rt.tick(&mut host);
+        let told: Vec<&str> = host.tells.iter().map(|(_, t)| t.as_str()).collect();
+        assert!(told[0].starts_with("Ride thunder is built"), "{told:?}");
+        assert!(
+            told.iter()
+                .any(|t| t.starts_with("Realism report for thunder"))
+        );
+        assert!(dir.join("horizon-theme-park/rides/thunder.json").exists());
+        assert_eq!(save::load_park(&dir).unwrap().rides, vec!["thunder"]);
+        assert!(rt.builder.session(1).unwrap().nodes.is_empty());
+        // The same name is refused until you ask to edit it.
+        rt.builder.click_block(1, [0, 0, 0], 0);
+        assert!(
+            rt.command("coaster create thunder", caller())
+                .unwrap()
+                .contains("/coaster edit thunder")
+        );
+        let edit = rt.command("coaster edit thunder", caller()).unwrap();
+        assert!(edit.starts_with("Loaded the 8 nodes of thunder"), "{edit}");
+        assert!(
+            rt.command("coaster create thunder", caller())
+                .unwrap()
+                .starts_with("Checking")
+        );
+        // `list` knows it; cars change through `set`.
+        assert!(
+            rt.command("coaster list", caller())
+                .unwrap()
+                .contains("thunder (")
+        );
+        assert!(
+            rt.command("coaster set thunder cars 9", caller())
+                .unwrap()
+                .contains("1 to 8")
+        );
+        assert!(
+            rt.command("coaster set thunder cars 2", caller())
+                .unwrap()
+                .starts_with("Giving thunder 2 cars")
+        );
+        rt.tick(&mut host);
+        assert_eq!(rt.rides[0].cars, 2);
+        assert_eq!(
+            save::load_ride(&dir.join("horizon-theme-park/rides/thunder.json"))
+                .unwrap()
+                .trains[0]
+                .cars,
+            2
+        );
+    }
+
+    #[test]
+    fn saved_rides_come_back_after_the_world_is_closed_and_opened_again() {
+        let (mut rt, mut host, dir) = world_with(
+            "reload",
+            &[("keep", DVec3::new(0.0, 70.0, 0.0))],
+            bystander(),
+        );
+        rt.tick(&mut host);
+        assert_eq!(rt.rides.len(), 1);
+        rt.command("coaster set keep cars 2", caller());
+        rt.tick(&mut host);
+        rt.world_closing(&mut host);
+        let mut again = Runtime::new();
+        again.tick(&mut host);
+        assert_eq!(again.rides.len(), 1);
+        assert_eq!(again.rides[0].cars, 2);
+        assert!(again.rides[0].train.is_held());
+        drop(dir);
+    }
+
+    #[test]
+    fn delete_needs_two_commands_and_keeps_the_file() {
+        let (mut rt, mut host, dir) = world_with(
+            "delete",
+            &[("old", DVec3::new(0.0, 70.0, 0.0))],
+            bystander(),
+        );
+        rt.tick(&mut host);
+        let first = rt.command("coaster delete old", caller()).unwrap();
+        assert!(first.contains("again within 10 seconds"));
+        assert!(dir.join("horizon-theme-park/rides/old.json").exists());
+        rt.command("coaster delete old", caller());
+        rt.tick(&mut host);
+        assert!(!dir.join("horizon-theme-park/rides/old.json").exists());
+        assert!(
+            dir.join("horizon-theme-park/rides/old.json.deleted")
+                .exists()
+        );
+        assert!(rt.rides.is_empty());
+        // Too slow a second command starts again.
+        let (mut rt, mut host, _) = world_with(
+            "delete2",
+            &[("old", DVec3::new(0.0, 70.0, 0.0))],
+            bystander(),
+        );
+        rt.tick(&mut host);
+        rt.command("coaster delete old", caller());
+        for _ in 0..DELETE_WINDOW + 5 {
+            rt.tick(&mut host);
+        }
+        assert!(
+            rt.command("coaster delete old", caller())
+                .unwrap()
+                .contains("again within")
+        );
+    }
+
+    #[test]
+    fn a_newer_or_broken_ride_file_is_reported_kept_and_never_overwritten() {
+        let (mut rt, mut host, dir) = world_with(
+            "locked",
+            &[("good", DVec3::new(0.0, 70.0, 0.0))],
+            bystander(),
+        );
+        let newer = r#"{"format":9,"id":"future"}"#;
+        fs::write(save::ride_path(&dir, "future"), newer).unwrap();
+        fs::write(save::ride_path(&dir, "bad"), "{{{").unwrap();
+        rt.tick(&mut host);
+        assert_eq!(rt.rides.len(), 1);
+        assert!(
+            host.broadcasts
+                .iter()
+                .any(|b| b.contains("future") && b.contains("newer version"))
+        );
+        assert!(
+            host.broadcasts
+                .iter()
+                .any(|b| b.contains("bad") && b.contains("damaged"))
+        );
+        // Their names are taken.
+        assert!(
+            rt.command("coaster edit future", caller())
+                .unwrap()
+                .contains("can't be edited")
+        );
+        rt.builder.click_block(1, [0, 0, 0], 0);
+        assert!(
+            rt.command("coaster create future", caller())
+                .unwrap()
+                .contains("already exists")
+        );
+        assert_eq!(
+            fs::read_to_string(save::ride_path(&dir, "future")).unwrap(),
+            newer
+        );
+        assert_eq!(
+            save::load_park(&dir).unwrap().rides,
+            vec!["bad", "future", "good"]
+        );
+    }
+
+    // Test 11.
+    #[test]
+    fn track_is_parked_past_96_blocks_and_drawn_again_within_80_at_most_50_pieces_a_tick() {
+        let (mut rt, mut host, _) = world_with(
+            "parking",
+            &[("a", DVec3::new(0.0, 70.0, 0.0))],
+            DVec3::new(10.0, 70.0, 10.0),
+        );
+        let mut drawn_per_tick = Vec::new();
+        for _ in 0..12 {
+            rt.tick(&mut host);
+            let pieces = host
+                .take_commands()
+                .iter()
+                .filter(|c| c.contains("htp:rail"))
+                .count();
+            drawn_per_tick.push(pieces);
+        }
+        assert!(
+            drawn_per_tick.iter().all(|&n| n <= DRAWS_PER_TICK),
+            "{drawn_per_tick:?}"
+        );
+        let all_drawn = rt.rides[0].groups.iter().all(|g| g.drawn);
+        assert!(all_drawn, "the whole small ride is near the player");
+        // The player walks away: every group is removed.
+        host.players[0].pos = DVec3::new(500.0, 70.0, 0.0);
+        rt.tick(&mut host);
+        let cmds = host.take_commands();
+        let kills = cmds
+            .iter()
+            .filter(|c| c.starts_with("kill @e[tag=htp_g_a_"))
+            .count();
+        assert_eq!(kills, rt.rides[0].groups.len() + 1, "groups and the train");
+        assert!(rt.rides[0].groups.iter().all(|g| !g.drawn) && !rt.rides[0].train_drawn);
+        // A player still far away: nothing is drawn.
+        host.players[0].pos = DVec3::new(10.0, 70.0, 10.0 + 150.0);
+        rt.tick(&mut host);
+        assert!(rt.rides[0].groups.iter().all(|g| !g.drawn));
+        // Back within 80: drawn again.
+        host.players[0].pos = DVec3::new(10.0, 70.0, 10.0);
+        for _ in 0..4 {
+            rt.tick(&mut host);
+        }
+        assert!(rt.rides[0].groups.iter().all(|g| g.drawn) && rt.rides[0].train_drawn);
+    }
+
+    #[test]
+    fn a_group_between_the_two_distances_keeps_its_state() {
+        let (mut rt, mut host, _) = world_with(
+            "hysteresis",
+            &[("a", DVec3::new(0.0, 70.0, 0.0))],
+            DVec3::new(10.0, 70.0, 10.0),
+        );
+        for _ in 0..12 {
+            rt.tick(&mut host);
+        }
+        // Move to a spot where the nearest group is 80 to 96 away: still drawn.
+        let g = &rt.rides[0].groups[0];
+        let away = g.center + DVec3::new(0.0, 0.0, g.radius + 88.0);
+        host.players[0].pos = away;
+        rt.tick(&mut host);
+        assert!(rt.rides[0].groups[0].drawn);
+    }
+
+    // Test 12.
+    #[test]
+    fn a_redraw_bumps_the_generation_and_old_generations_near_a_player_are_swept() {
+        let (mut rt, mut host, _) = world_with(
+            "generation",
+            &[("a", DVec3::new(0.0, 70.0, 0.0))],
+            DVec3::new(10.0, 70.0, 10.0),
+        );
+        for _ in 0..12 {
+            rt.tick(&mut host);
+        }
+        assert_eq!(rt.rides[0].groups[0].generation, 1);
+        host.players[0].pos = DVec3::new(900.0, 70.0, 0.0);
+        rt.tick(&mut host);
+        host.players[0].pos = DVec3::new(10.0, 70.0, 10.0);
+        for _ in 0..6 {
+            rt.tick(&mut host);
+        }
+        let g = &rt.rides[0].groups[0];
+        assert_eq!(g.generation, 2);
+        let cmds = host.take_commands();
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("htp_gen_2") && c.starts_with("summon"))
+        );
+        // On the next sweep, anything of this group that is not generation 2 is killed near the player.
+        while rt.now % SCRUB_EVERY != 0 {
+            rt.tick(&mut host);
+        }
+        let sweep = host.take_commands();
+        assert!(
+            sweep
+                .iter()
+                .any(|c| c.contains("kill @e[tag=htp_g_a_0,tag=!htp_gen_2,distance=..128]")),
+            "{sweep:?}"
+        );
+        assert!(
+            sweep
+                .iter()
+                .any(|c| c.contains("kill @e[tag=htp,tag=!htp_s1,distance=..128]"))
+        );
+    }
+
+    // Test 13.
+    #[test]
+    fn two_rides_and_two_players_far_apart_never_pass_the_display_budget() {
+        let (mut rt, mut host, _) = world_with(
+            "budget",
+            &[
+                ("one", DVec3::new(0.0, 70.0, 0.0)),
+                ("two", DVec3::new(3000.0, 70.0, 0.0)),
+            ],
+            DVec3::new(10.0, 70.0, 10.0),
+        );
+        host.players.push(player(2, DVec3::new(3010.0, 70.0, 10.0)));
+        let count_near = |rt: &Runtime, p: DVec3| -> usize {
+            rt.rides
+                .iter()
+                .map(|r| {
+                    r.groups
+                        .iter()
+                        .filter(|g| g.drawn && g.center.distance(p) - g.radius <= BUDGET_RADIUS)
+                        .map(|g| g.end - g.first)
+                        .sum::<usize>()
+                })
+                .sum()
+        };
+        for _ in 0..30 {
+            rt.tick(&mut host);
+            for p in &host.players {
+                assert!(count_near(&rt, p.pos) <= DISPLAY_BUDGET);
+            }
+        }
+        // Each player has their own ride drawn, and not the other one.
+        assert!(rt.rides[0].groups.iter().all(|g| g.drawn));
+        assert!(rt.rides[1].groups.iter().all(|g| g.drawn));
+        // With a tiny budget the draw stops and the player is warned once.
+        let (mut rt, mut host, _) = world_with(
+            "budget2",
+            &[("one", DVec3::new(0.0, 70.0, 0.0))],
+            DVec3::new(10.0, 70.0, 10.0),
+        );
+        rt.display_budget = 20;
+        for _ in 0..30 {
+            rt.tick(&mut host);
+        }
+        let drawn: usize = rt.rides[0]
+            .groups
+            .iter()
+            .filter(|g| g.drawn)
+            .map(|g| g.end - g.first)
+            .sum();
+        assert!(drawn <= 20, "{drawn}");
+        assert_eq!(
+            host.broadcasts
+                .iter()
+                .filter(|b| b.contains("too many rides"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_parked_ride_keeps_running_its_physics() {
+        let (mut rt, mut host, _) = world_with(
+            "parked-physics",
+            &[("a", DVec3::new(0.0, 70.0, 0.0))],
+            far_away(),
+        );
+        rt.tick(&mut host);
+        rt.rides[0].train.start_countdown(0.0);
+        for _ in 0..200 {
+            rt.tick(&mut host);
+        }
+        assert!(!rt.rides[0].train.is_held() || rt.rides[0].train.s > 0.0);
+        assert!(rt.rides[0].train.v > 0.0 || rt.rides[0].train.s > 0.0);
+        assert!(
+            host.take_commands()
+                .iter()
+                .all(|c| !c.starts_with("summon") && !c.starts_with("tp "))
+        );
+    }
+
+    #[test]
+    fn the_wand_command_gives_the_item_and_the_usages_cover_every_command() {
+        let (mut rt, mut host, _) = world_with("give", &[], bystander());
+        rt.tick(&mut host);
+        host.take_commands();
+        assert!(
+            rt.command("coaster wand", caller())
+                .unwrap()
+                .contains("track wand")
+        );
+        rt.tick(&mut host);
+        assert_eq!(host.take_commands()[0], "give Player1 htp:wand");
+        assert_eq!(COMMAND_USAGES.len(), 11);
+        assert!(COMMAND_USAGES.iter().all(|u| u.starts_with("coaster ")));
+    }
+}
+}
+pub mod save {
+// Saving (D20): one JSON file per ride, plus `park.json`, inside the world's own folder.
+//
+// ```text
+// <world>/horizon-theme-park/park.json          {"format":1, "session":3, "rides":["thunder", ...]}
+// <world>/horizon-theme-park/rides/<id>.json    {"format":1, "id":"thunder", "nodes":[{"pos":[x,y,z], ...}], ...}
+// ```
+//
+// The ride files are the ONE true copy of a ride (nothing in the world's blocks says anything
+// about it). So saving is careful:
+//   * we write `<file>.tmp` first, copy the old file to `<file>.bak`, and only then swap the new
+//     one in. A crash half way leaves the old file whole, never a half-written one;
+//   * a file whose `"format"` is newer than this mod knows is never loaded and never overwritten
+//     (it was written by a newer version of the mod, and we must not damage it);
+//   * one broken file loses only that one ride.
+//
+// This is the only file in park-core that touches the disk (rule 5). Positions are plain
+// `[f64; 3]` arrays because Horizon's `glam` has no serde support (rule 10), and angles are in
+// degrees (D11).
+
+use crate::game::htp_park::coaster::elements::{BRAKE_DECEL, BRAKE_TARGET, DWELL, LIFT_SPEED, STATION_PUSH};
+use crate::game::htp_park::coaster::physics::{CAR_SPACING, Physics};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+/// The file format this version of the mod writes and understands.
+pub const FORMAT: u32 = 1;
+/// The mod's folder inside the world folder.
+pub const FOLDER: &str = "horizon-theme-park";
+/// The sub-folder with one file per ride.
+pub const RIDES: &str = "rides";
+
+/// What the track does from a node to the next one (D63).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Track,
+    Lift,
+    Brake,
+    Station,
+}
+
+/// One point the track passes through.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct NodeFile {
+    /// Where the rail passes, in world blocks: `[x, y, z]`.
+    pub pos: [f64; 3],
+    /// Bank angle in degrees. Not used until M5, kept so old files stay valid.
+    #[serde(default)]
+    pub roll: f64,
+    /// What the track does from this node to the next.
+    pub kind: Kind,
+}
+
+/// The numbers that tune a ride (S5). Anything missing from a file takes the default.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct SettingsFile {
+    pub gravity_scale: f64,
+    pub friction: f64,
+    pub drag: f64,
+    pub lift_speed: f64,
+    pub brake_target: f64,
+    pub brake_decel: f64,
+    pub station_push: f64,
+    pub dwell: f64,
+}
+
+impl Default for SettingsFile {
+    fn default() -> Self {
+        let physics = Physics::default();
+        SettingsFile {
+            gravity_scale: physics.gravity_scale,
+            friction: physics.friction,
+            drag: physics.drag,
+            lift_speed: LIFT_SPEED,
+            brake_target: BRAKE_TARGET,
+            brake_decel: BRAKE_DECEL,
+            station_push: STATION_PUSH,
+            dwell: DWELL,
+        }
+    }
+}
+
+/// One train: how many cars, and how far apart their middles are.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TrainFile {
+    pub cars: u32,
+    pub spacing: f64,
+}
+
+/// Everything saved about one ride. Geometry and stats are rebuilt on load.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct RideFile {
+    pub format: u32,
+    pub id: String,
+    /// The last node joins the first (always true in M3, C4).
+    pub closed: bool,
+    pub settings: SettingsFile,
+    pub nodes: Vec<NodeFile>,
+    pub trains: Vec<TrainFile>,
+}
+
+impl RideFile {
+    /// A new ride with default settings and one 3-car train (D55).
+    pub fn new(id: &str, nodes: Vec<NodeFile>) -> RideFile {
+        RideFile {
+            format: FORMAT,
+            id: id.to_string(),
+            closed: true,
+            settings: SettingsFile::default(),
+            nodes,
+            trains: vec![TrainFile {
+                cars: 3,
+                spacing: CAR_SPACING,
+            }],
+        }
+    }
+}
+
+/// The park's own file: the session number (D66) and the list of rides.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ParkFile {
+    pub format: u32,
+    /// Bumped at every world open; it is the number in the session tag `htp_s<n>`.
+    pub session: u64,
+    pub rides: Vec<String>,
+}
+
+impl Default for ParkFile {
+    fn default() -> Self {
+        ParkFile {
+            format: FORMAT,
+            session: 0,
+            rides: Vec::new(),
+        }
+    }
+}
+
+/// Why a file could not be used.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LoadError {
+    /// Written by a newer version of the mod. Left untouched.
+    Newer { found: u64, known: u32 },
+    /// Not valid JSON, or the wrong shape.
+    Broken(String),
+    /// The disk said no.
+    Unreadable(String),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::Newer { found, known } => write!(
+                f,
+                "it was saved by a newer version of the mod (format {found}, this one knows {known}); it was left untouched"
+            ),
+            LoadError::Broken(why) => {
+                write!(f, "the file is damaged ({why}); it was left untouched")
+            }
+            LoadError::Unreadable(why) => write!(f, "the file could not be read ({why})"),
+        }
+    }
+}
+
+/// `<world>/horizon-theme-park/rides`
+pub fn rides_dir(world: &Path) -> PathBuf {
+    world.join(FOLDER).join(RIDES)
+}
+
+/// `<world>/horizon-theme-park/park.json`
+pub fn park_path(world: &Path) -> PathBuf {
+    world.join(FOLDER).join("park.json")
+}
+
+/// `<world>/horizon-theme-park/rides/<id>.json`
+pub fn ride_path(world: &Path, id: &str) -> PathBuf {
+    rides_dir(world).join(format!("{id}.json"))
+}
+
+/// The same path with `suffix` stuck on the end: `thunder.json` -> `thunder.json.tmp`.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Write `text` to `path` the safe way (D20): into `<path>.tmp` first, the old file copied to
+/// `<path>.bak`, and only then the new file renamed over the old one. The old file is never
+/// missing and never half written.
+pub fn write_safely(path: &Path, text: &str) -> io::Result<()> {
+    if let Some(folder) = path.parent() {
+        fs::create_dir_all(folder)?;
+    }
+    let tmp = with_suffix(path, ".tmp");
+    fs::write(&tmp, text)?;
+    if path.exists() {
+        fs::copy(path, with_suffix(path, ".bak"))?;
+    }
+    fs::rename(&tmp, path)
+}
+
+/// Read the `format` number out of JSON text, before anything else is looked at.
+fn read_format(text: &str) -> Result<(serde_json::Value, u64), LoadError> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| LoadError::Broken(e.to_string()))?;
+    let format = value
+        .get("format")
+        .and_then(|f| f.as_u64())
+        .ok_or_else(|| LoadError::Broken("there is no \"format\" number".to_string()))?;
+    if format > FORMAT as u64 {
+        return Err(LoadError::Newer {
+            found: format,
+            known: FORMAT,
+        });
+    }
+    Ok((value, format))
+}
+
+/// Turn the text of a ride file into a ride. A newer format is refused first; then the shape is checked.
+pub fn parse_ride(text: &str) -> Result<RideFile, LoadError> {
+    let (value, _) = read_format(text)?;
+    let ride: RideFile =
+        serde_json::from_value(value).map_err(|e| LoadError::Broken(e.to_string()))?;
+    if ride
+        .nodes
+        .iter()
+        .any(|n| n.pos.iter().any(|c| !c.is_finite()))
+    {
+        return Err(LoadError::Broken(
+            "a node has a position that is not a number".to_string(),
+        ));
+    }
+    Ok(ride)
+}
+
+/// Read one ride file.
+pub fn load_ride(path: &Path) -> Result<RideFile, LoadError> {
+    let text = fs::read_to_string(path).map_err(|e| LoadError::Unreadable(e.to_string()))?;
+    parse_ride(&text)
+}
+
+/// Save a ride. Refuses (and writes nothing) when the file on disk is from a newer version.
+pub fn save_ride(world: &Path, ride: &RideFile) -> Result<(), String> {
+    let path = ride_path(world, &ride.id);
+    if let Ok(old) = fs::read_to_string(&path)
+        && let Err(LoadError::Newer { found, known }) = read_format(&old)
+    {
+        return Err(format!(
+            "{}.json was saved by a newer version of the mod (format {found}, this one knows {known}); it was not overwritten",
+            ride.id
+        ));
+    }
+    let text = serde_json::to_string_pretty(ride).map_err(|e| e.to_string())?;
+    write_safely(&path, &text).map_err(|e| format!("could not save {}.json: {e}", ride.id))
+}
+
+/// Does a file for this ride already exist (good, newer, or broken)?
+pub fn ride_exists(world: &Path, id: &str) -> bool {
+    ride_path(world, id).exists()
+}
+
+/// Put a ride aside: `<id>.json` becomes `<id>.json.deleted` (S3 keeps it, nothing is lost).
+pub fn delete_ride(world: &Path, id: &str) -> Result<(), String> {
+    let path = ride_path(world, id);
+    fs::rename(&path, with_suffix(&path, ".deleted"))
+        .map_err(|e| format!("could not delete {id}.json: {e}"))
+}
+
+/// What loading every ride gave: the good ones, and a plain sentence for each one that failed.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Loaded {
+    pub rides: Vec<RideFile>,
+    pub problems: Vec<String>,
+    /// Ride ids whose files exist but could not be used. They are never overwritten.
+    pub locked: Vec<String>,
+}
+
+/// Load every `rides/*.json`, in name order. A leftover `.tmp`, a `.bak` and a `.deleted` file
+/// are not rides and are ignored. One bad file only loses its own ride.
+pub fn load_all(world: &Path) -> Loaded {
+    let mut out = Loaded::default();
+    let Ok(entries) = fs::read_dir(rides_dir(world)) else {
+        return out;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match load_ride(&path) {
+            Ok(ride) if ride.id == stem => out.rides.push(ride),
+            Ok(ride) => {
+                out.problems.push(format!(
+                    "ride {stem}: the file says its name is \"{}\"; it was skipped",
+                    ride.id
+                ));
+                out.locked.push(stem);
+            }
+            Err(error) => {
+                out.problems.push(format!("ride {stem}: {error}"));
+                out.locked.push(stem);
+            }
+        }
+    }
+    out
+}
+
+/// Read `park.json`. No file yet is fine (a fresh default); a newer or damaged file is an error.
+pub fn load_park(world: &Path) -> Result<ParkFile, LoadError> {
+    let text = match fs::read_to_string(park_path(world)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ParkFile::default()),
+        Err(e) => return Err(LoadError::Unreadable(e.to_string())),
+    };
+    let (value, _) = read_format(&text)?;
+    serde_json::from_value(value).map_err(|e| LoadError::Broken(e.to_string()))
+}
+
+/// Write `park.json` the safe way.
+pub fn save_park(world: &Path, park: &ParkFile) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(park).map_err(|e| e.to_string())?;
+    write_safely(&park_path(world), &text).map_err(|e| format!("could not save park.json: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An empty scratch folder just for one test (same name = same folder, cleared first).
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("htp-test-save-{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sample(id: &str) -> RideFile {
+        let kinds = [Kind::Station, Kind::Lift, Kind::Track, Kind::Brake];
+        let nodes = kinds
+            .iter()
+            .enumerate()
+            .map(|(i, &kind)| NodeFile {
+                pos: [i as f64 * 5.5 + 0.5, 70.25, -3.0 - i as f64],
+                roll: 0.0,
+                kind,
+            })
+            .collect();
+        let mut ride = RideFile::new(id, nodes);
+        ride.settings.friction = 0.02;
+        ride.trains[0].cars = 5;
+        ride
+    }
+
+    // Test 1.
+    #[test]
+    fn a_ride_saved_and_loaded_is_equal() {
+        let world = scratch("roundtrip");
+        let ride = sample("thunder");
+        save_ride(&world, &ride).unwrap();
+        let back = load_ride(&ride_path(&world, "thunder")).unwrap();
+        assert_eq!(back, ride);
+        // And through load_all.
+        let all = load_all(&world);
+        assert_eq!(all.rides, vec![ride]);
+        assert!(all.problems.is_empty());
+    }
+
+    #[test]
+    fn positions_are_written_as_plain_arrays_and_kinds_as_words() {
+        let text = serde_json::to_string(&sample("a")).unwrap();
+        assert!(text.contains("\"pos\":[0.5,70.25,-3.0]"), "{text}");
+        assert!(text.contains("\"kind\":\"station\""), "{text}");
+        assert!(text.contains("\"format\":1"), "{text}");
+    }
+
+    #[test]
+    fn missing_settings_take_their_defaults() {
+        let text = r#"{"format":1,"id":"x","closed":true,"settings":{"friction":0.5},"nodes":[],"trains":[]}"#;
+        let ride = parse_ride(text).unwrap();
+        assert_eq!(ride.settings.friction, 0.5);
+        assert_eq!(ride.settings.lift_speed, LIFT_SPEED);
+    }
+
+    // Test 2.
+    #[test]
+    fn a_newer_format_is_refused_and_left_untouched() {
+        let world = scratch("newer");
+        let path = ride_path(&world, "future");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let newer = r#"{"format":2,"id":"future","something":"new"}"#;
+        fs::write(&path, newer).unwrap();
+
+        assert_eq!(
+            load_ride(&path),
+            Err(LoadError::Newer {
+                found: 2,
+                known: FORMAT
+            })
+        );
+        let loaded = load_all(&world);
+        assert!(loaded.rides.is_empty());
+        assert_eq!(loaded.locked, vec!["future"]);
+        assert!(loaded.problems[0].contains("newer version"));
+
+        // Saving a ride of the same name must not overwrite it.
+        let error = save_ride(&world, &sample("future")).unwrap_err();
+        assert!(error.contains("not overwritten"), "{error}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), newer);
+        assert!(!with_suffix(&path, ".tmp").exists());
+    }
+
+    // Test 3.
+    #[test]
+    fn a_leftover_tmp_is_ignored_and_the_bak_survives_a_failed_write() {
+        let world = scratch("crash");
+        let ride = sample("loop");
+        save_ride(&world, &ride).unwrap();
+        let path = ride_path(&world, "loop");
+
+        // A crash left a half-written .tmp behind: it is not a ride, and it does not matter.
+        fs::write(with_suffix(&path, ".tmp"), "{\"format\":1,\"id\":\"lo").unwrap();
+        let loaded = load_all(&world);
+        assert_eq!(loaded.rides, vec![ride.clone()]);
+        assert!(loaded.problems.is_empty());
+
+        // A second save keeps the first version as .bak.
+        let mut v2 = ride.clone();
+        v2.trains[0].cars = 7;
+        save_ride(&world, &v2).unwrap();
+        assert_eq!(load_ride(&with_suffix(&path, ".bak")).unwrap(), ride);
+        assert_eq!(load_ride(&path).unwrap(), v2);
+
+        // A write that fails (the .tmp spot is blocked by a folder) touches neither file.
+        fs::create_dir(with_suffix(&path, ".tmp")).unwrap();
+        let mut v3 = ride.clone();
+        v3.trains[0].cars = 2;
+        assert!(save_ride(&world, &v3).is_err());
+        assert_eq!(load_ride(&path).unwrap(), v2);
+        assert_eq!(load_ride(&with_suffix(&path, ".bak")).unwrap(), ride);
+    }
+
+    // Test 4.
+    #[test]
+    fn a_broken_file_loses_only_its_own_ride() {
+        let world = scratch("broken");
+        save_ride(&world, &sample("a-good")).unwrap();
+        save_ride(&world, &sample("c-good")).unwrap();
+        fs::write(ride_path(&world, "b-bad"), "{ this is not json").unwrap();
+        fs::write(ride_path(&world, "d-nonumber"), r#"{"id":"d-nonumber"}"#).unwrap();
+
+        let loaded = load_all(&world);
+        let ids: Vec<&str> = loaded.rides.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["a-good", "c-good"]);
+        assert_eq!(loaded.problems.len(), 2);
+        assert!(loaded.problems[0].starts_with("ride b-bad: the file is damaged"));
+        assert_eq!(loaded.locked, vec!["b-bad", "d-nonumber"]);
+        // The broken file is still there, unchanged.
+        assert_eq!(
+            fs::read_to_string(ride_path(&world, "b-bad")).unwrap(),
+            "{ this is not json"
+        );
+    }
+
+    #[test]
+    fn deleting_keeps_the_file_as_deleted() {
+        let world = scratch("delete");
+        save_ride(&world, &sample("gone")).unwrap();
+        delete_ride(&world, "gone").unwrap();
+        assert!(!ride_exists(&world, "gone"));
+        assert!(with_suffix(&ride_path(&world, "gone"), ".deleted").exists());
+        assert!(load_all(&world).rides.is_empty());
+    }
+
+    #[test]
+    fn park_json_round_trips_and_a_missing_one_is_a_fresh_default() {
+        let world = scratch("park");
+        assert_eq!(load_park(&world), Ok(ParkFile::default()));
+        let park = ParkFile {
+            format: FORMAT,
+            session: 4,
+            rides: vec!["a".into(), "b".into()],
+        };
+        save_park(&world, &park).unwrap();
+        assert_eq!(load_park(&world), Ok(park));
+        fs::write(park_path(&world), r#"{"format":9}"#).unwrap();
+        assert!(matches!(load_park(&world), Err(LoadError::Newer { .. })));
     }
 }
 }

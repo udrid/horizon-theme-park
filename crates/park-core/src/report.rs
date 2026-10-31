@@ -149,7 +149,10 @@ pub fn analyse(course: &Course, cars: usize, spacing: f64, physics: &Physics) ->
     let mut steepest = (0.0_f64, 0.0_f64);
     let mut s = 0.0;
     while s < course.table.length() {
-        let fall = (-course.table.frame(s).forward.y).clamp(-1.0, 1.0).asin().to_degrees();
+        let fall = (-course.table.frame(s).forward.y)
+            .clamp(-1.0, 1.0)
+            .asin()
+            .to_degrees();
         if fall > 30.0 {
             if fall > steepest.0 {
                 steepest = (fall, s);
@@ -267,7 +270,12 @@ mod tests {
 
     fn report_for(shape: &Shape) -> (Course, Report) {
         let course = demo::course_for(shape, DVec3::new(100.0, 73.0, -40.0));
-        let report = analyse(&course, demo::CARS, crate::coaster::physics::CAR_SPACING, &Physics::default());
+        let report = analyse(
+            &course,
+            demo::CARS,
+            crate::coaster::physics::CAR_SPACING,
+            &Physics::default(),
+        );
         (course, report)
     }
 
@@ -281,7 +289,12 @@ mod tests {
         let lift = report.lift_height.unwrap();
         assert!((20.0..=30.0).contains(&lift), "{lift}");
         let lines = report.lines("demo");
-        assert!(lines.last().unwrap().contains("All within the realism limits"));
+        assert!(
+            lines
+                .last()
+                .unwrap()
+                .contains("All within the realism limits")
+        );
         assert!(lines.iter().all(|l| !l.contains('§')));
     }
 
@@ -295,7 +308,12 @@ mod tests {
         let (course, report) = report_for(&sharp);
         // The report's number is exactly what the simulation measures...
         let stop = course.station().unwrap().1;
-        let samples = sim::run_lap(&course, Train::held(demo::CARS, stop), &Physics::default(), 300.0);
+        let samples = sim::run_lap(
+            &course,
+            Train::held(demo::CARS, stop),
+            &Physics::default(),
+            300.0,
+        );
         let st = sim::stats(&samples);
         assert_eq!(report.max_lateral, st.max_lateral);
         assert!(st.max_lateral > 1.0, "{}", st.max_lateral);
@@ -305,10 +323,18 @@ mod tests {
             .iter()
             .find(|i| i.text.contains("sideways"))
             .expect("a lateral issue");
-        assert!(issue.text.contains(&format!("{:.1} g", st.max_lateral)), "{}", issue.text);
+        assert!(
+            issue.text.contains(&format!("{:.1} g", st.max_lateral)),
+            "{}",
+            issue.text
+        );
         assert!(issue.at.is_some());
         let lines = report.lines("sharp");
-        assert!(lines.iter().any(|l| l.starts_with("§c") && l.contains("sideways") && l.contains("near ")));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("§c") && l.contains("sideways") && l.contains("near "))
+        );
         assert!(lines.last().unwrap().contains("still opens"));
     }
 
@@ -316,8 +342,15 @@ mod tests {
     fn a_train_that_cannot_climb_is_reported_as_stalling() {
         // Without a lift, the flat demo-like loop has nothing to push the train round.
         let (mut course, _) = report_for(&Shape::demo());
-        course.placed.retain(|p| !matches!(p.element, Element::Lift { .. }));
-        let report = analyse(&course, 3, crate::coaster::physics::CAR_SPACING, &Physics::default());
+        course
+            .placed
+            .retain(|p| !matches!(p.element, Element::Lift { .. }));
+        let report = analyse(
+            &course,
+            3,
+            crate::coaster::physics::CAR_SPACING,
+            &Physics::default(),
+        );
         assert!(!report.completes);
         assert!(report.issues[0].text.contains("cannot finish a lap"));
         assert!(report.issues[0].at.is_some());

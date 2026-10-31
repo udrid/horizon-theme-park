@@ -57,11 +57,38 @@ pub fn tag_seat(ride: &str, index: usize) -> String {
     format!("htp_seat_{ride}_{index}")
 }
 
-/// `Tags:["htp","htp_demo","…"]` with one extra tag for the specific piece.
-fn tags(ride: &str, extra: Option<String>) -> String {
+/// The session tag (D66): `htp_s<n>`. Every entity of one world opening carries the same one,
+/// so leftovers of an earlier opening can be told apart and removed.
+pub fn tag_session(session: u64) -> String {
+    format!("htp_s{session}")
+}
+
+/// The tag of one group of rails, or of the train (`group` = "t"), e.g. `htp_g_thunder_3` (D30).
+/// The underscore can't appear in a ride name, so it never clashes with a ride's own tag.
+pub fn tag_group(ride: &str, group: &str) -> String {
+    format!("htp_g_{ride}_{group}")
+}
+
+/// The generation tag (D30): which drawing of a group an entity belongs to.
+pub fn tag_gen(generation: u32) -> String {
+    format!("htp_gen_{generation}")
+}
+
+/// The tags every piece of a ride carries: the session, the group and the generation.
+pub fn piece_tags(ride: &str, group: &str, generation: u32, session: u64) -> Vec<String> {
+    vec![
+        tag_session(session),
+        tag_group(ride, group),
+        tag_gen(generation),
+    ]
+}
+
+/// `Tags:["htp","htp_demo","…"]`: the mod's tag, the ride's tag, any `extra` tags, and one more
+/// for the specific piece.
+fn tags(ride: &str, extra: &[String], specific: Option<String>) -> String {
     let mut list = format!("\"{TAG_ALL}\",\"{}\"", tag_ride(ride));
-    if let Some(extra) = extra {
-        list.push_str(&format!(",\"{extra}\""));
+    for tag in extra.iter().chain(specific.iter()) {
+        list.push_str(&format!(",\"{tag}\""));
     }
     format!("Tags:[{list}]")
 }
@@ -82,20 +109,28 @@ fn transformation(rotation: DQuat, scale: DVec3) -> String {
 
 /// Put one piece of rail on the track. `rotation` turns the model so its long side follows the
 /// track, `scale` is (width, height, length) in blocks. Rails never move, so no `teleport_duration`.
-pub fn summon_rail(ride: &str, pos: DVec3, rotation: DQuat, scale: DVec3) -> String {
+pub fn summon_rail(
+    ride: &str,
+    extra: &[String],
+    pos: DVec3,
+    rotation: DQuat,
+    scale: DVec3,
+) -> String {
     format!(
         "summon minecraft:item_display {} {{{},item:{{id:\"{RAIL_ITEM}\",count:1}},{}}}",
         xyz(pos),
-        tags(ride, None),
+        tags(ride, extra, None),
         transformation(rotation, scale)
     )
 }
 
 /// Put a car on the track. `teleport_ticks` is how long the display glides to each new spot
 /// (it can't be changed later, D44); `scale` is the size of the car's shell model.
+#[allow(clippy::too_many_arguments)]
 pub fn summon_car(
     ride: &str,
     index: usize,
+    extra: &[String],
     pos: DVec3,
     yaw: f64,
     pitch: f64,
@@ -105,7 +140,7 @@ pub fn summon_car(
     format!(
         "summon minecraft:item_display {} {{{},Rotation:[{},{}],item:{{id:\"{CAR_ITEM}\",count:1}},teleport_duration:{teleport_ticks},{}}}",
         xyz(pos),
-        tags(ride, Some(tag_car(ride, index))),
+        tags(ride, extra, Some(tag_car(ride, index))),
         float(yaw),
         float(pitch),
         transformation(DQuat::IDENTITY, scale)
@@ -129,11 +164,11 @@ pub fn move_car(ride: &str, index: usize, pos: DVec3, yaw: f64, pitch: f64) -> S
 /// invisible pig (the fallback in D49) the list would be:
 /// `summon minecraft:pig … {…,equipment:{saddle:{id:"minecraft:saddle",count:1}}}` followed by
 /// `effect give @e[tag=<seat tag>] minecraft:invisibility infinite 0 true`.
-pub fn summon_seat(ride: &str, index: usize, pos: DVec3) -> Vec<String> {
+pub fn summon_seat(ride: &str, index: usize, extra: &[String], pos: DVec3) -> Vec<String> {
     vec![format!(
         "summon {SEAT_ENTITY} {} {{{}}}",
         xyz(pos),
-        tags(ride, Some(tag_seat(ride, index)))
+        tags(ride, extra, Some(tag_seat(ride, index)))
     )]
 }
 
@@ -180,6 +215,75 @@ pub fn kill_all() -> String {
     kill_tag(TAG_ALL)
 }
 
+/// The wand item and the node marker of the content mod (D62).
+pub const WAND_ITEM: &str = "htp:wand";
+pub const NODE_ITEM: &str = "htp:node";
+
+/// The tag of everything one player's wand shows, e.g. `htp_wand_1f3a` (their uuid in hex).
+pub fn tag_wand(uuid: u128) -> String {
+    format!("htp_wand_{uuid:x}")
+}
+
+/// The tag of one node marker.
+pub fn tag_node(uuid: u128, index: usize) -> String {
+    format!("htp_wn_{uuid:x}_{index}")
+}
+
+/// A small marker at a wand node (S2).
+pub fn summon_node(uuid: u128, index: usize, session: u64, pos: DVec3) -> String {
+    format!(
+        "summon minecraft:item_display {} {{Tags:[\"{TAG_ALL}\",\"{}\",\"{}\",\"{}\"],item:{{id:\"{NODE_ITEM}\",count:1}},{}}}",
+        xyz(pos),
+        tag_session(session),
+        tag_wand(uuid),
+        tag_node(uuid, index),
+        transformation(DQuat::IDENTITY, DVec3::splat(0.3))
+    )
+}
+
+/// Take away one node marker.
+pub fn kill_node(uuid: u128, index: usize) -> String {
+    kill_tag(&tag_node(uuid, index))
+}
+
+/// Take away every marker of one player's wand.
+pub fn kill_wand(uuid: u128) -> String {
+    kill_tag(&tag_wand(uuid))
+}
+
+/// One dot of the build preview, shown only to `player_name` (S2, F4).
+pub fn particle(player_name: &str, pos: DVec3) -> String {
+    format!(
+        "particle minecraft:end_rod {} 0 0 0 0 1 force {player_name}",
+        xyz(pos)
+    )
+}
+
+/// Give a player one of the mod's items.
+pub fn give(player_name: &str, item: &str) -> String {
+    format!("give {player_name} {item}")
+}
+
+/// Clear leftovers of earlier sessions near `pos` (D66, S4). The console stands at the world spawn,
+/// so the search is moved to the player's position first.
+pub fn scrub_session(pos: DVec3, session: u64) -> String {
+    format!(
+        "execute positioned {} run kill @e[tag={TAG_ALL},tag=!{},distance=..128]",
+        xyz(pos),
+        tag_session(session)
+    )
+}
+
+/// Clear entities of an older drawing of one group near `pos` (D30).
+pub fn scrub_generation(pos: DVec3, ride: &str, group: &str, generation: u32) -> String {
+    format!(
+        "execute positioned {} run kill @e[tag={},tag=!{},distance=..128]",
+        xyz(pos),
+        tag_group(ride, group),
+        tag_gen(generation)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +310,7 @@ mod tests {
         let q = DQuat::from_rotation_y(std::f64::consts::FRAC_PI_2);
         let text = summon_rail(
             DEMO,
+            &[],
             DVec3::new(1.5, 70.0, -2.25),
             q,
             DVec3::new(0.5, 0.15, 4.0),
@@ -221,6 +326,7 @@ mod tests {
         let text = summon_car(
             DEMO,
             0,
+            &[],
             DVec3::new(0.0, 64.0, 0.0),
             -90.0,
             12.5,
@@ -244,7 +350,7 @@ mod tests {
     #[test]
     fn seat_summon_and_move_text() {
         assert_eq!(
-            summon_seat(DEMO, 1, DVec3::new(5.0, 70.5, 6.0)),
+            summon_seat(DEMO, 1, &[], DVec3::new(5.0, 70.5, 6.0)),
             vec![
                 "summon minecraft:minecart 5.0000 70.5000 6.0000 {Tags:[\"htp\",\"htp_demo\",\"htp_seat_demo_1\"]}"
                     .to_string()
@@ -281,5 +387,42 @@ mod tests {
         assert_eq!(kill_all(), "kill @e[tag=htp]");
         assert_eq!(kill_ride(DEMO), "kill @e[tag=htp_demo]");
         assert_eq!(kill_tag("htp_seat_demo_0"), "kill @e[tag=htp_seat_demo_0]");
+    }
+
+    #[test]
+    fn extra_tags_come_before_the_specific_one() {
+        let extra = piece_tags("thunder", "3", 2, 7);
+        assert_eq!(extra, vec!["htp_s7", "htp_g_thunder_3", "htp_gen_2"]);
+        let text = summon_seat("thunder", 1, &extra, DVec3::ZERO);
+        assert_eq!(
+            text,
+            vec![
+                "summon minecraft:minecart 0.0000 0.0000 0.0000 {Tags:[\"htp\",\"htp_thunder\",\"htp_s7\",\"htp_g_thunder_3\",\"htp_gen_2\",\"htp_seat_thunder_1\"]}"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn wand_marker_particle_give_and_scrub_texts() {
+        assert_eq!(
+            summon_node(0xAB, 2, 5, DVec3::new(1.5, 66.5, 2.5)),
+            "summon minecraft:item_display 1.5000 66.5000 2.5000 {Tags:[\"htp\",\"htp_s5\",\"htp_wand_ab\",\"htp_wn_ab_2\"],item:{id:\"htp:node\",count:1},transformation:{left_rotation:[0.0000f,0.0000f,0.0000f,1.0000f],right_rotation:[0.0000f,0.0000f,0.0000f,1.0000f],translation:[0.0000f,0.0000f,0.0000f],scale:[0.3000f,0.3000f,0.3000f]}}"
+        );
+        assert_eq!(kill_node(0xAB, 2), "kill @e[tag=htp_wn_ab_2]");
+        assert_eq!(kill_wand(0xAB), "kill @e[tag=htp_wand_ab]");
+        assert_eq!(
+            particle("Alex", DVec3::new(1.0, 2.0, 3.0)),
+            "particle minecraft:end_rod 1.0000 2.0000 3.0000 0 0 0 0 1 force Alex"
+        );
+        assert_eq!(give("Alex", WAND_ITEM), "give Alex htp:wand");
+        assert_eq!(
+            scrub_session(DVec3::new(1.0, 2.0, 3.0), 4),
+            "execute positioned 1.0000 2.0000 3.0000 run kill @e[tag=htp,tag=!htp_s4,distance=..128]"
+        );
+        assert_eq!(
+            scrub_generation(DVec3::ZERO, "a", "t", 3),
+            "execute positioned 0.0000 0.0000 0.0000 run kill @e[tag=htp_g_a_t,tag=!htp_gen_3,distance=..128]"
+        );
     }
 }

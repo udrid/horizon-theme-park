@@ -5,8 +5,8 @@
 //! game in `host`, the exact command texts in `commands`, what to draw in `render`
 //! and the per-tick loop in `runtime`.
 
-pub mod coaster;
 pub mod builder;
+pub mod coaster;
 pub mod commands;
 pub mod host;
 pub mod render;
