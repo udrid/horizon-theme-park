@@ -1,0 +1,93 @@
+//! The "Horizon Theme Park loaded" greeting.
+//!
+//! The game glue only reports facts ("a new world opened", "is someone in the
+//! world?"). Deciding *when to speak*, exactly once per world, happens here, so
+//! `cargo test` can check it in seconds without starting the game.
+
+/// The exact text shown in chat and written to the log.
+pub const LOADED_MESSAGE: &str = "Horizon Theme Park loaded";
+
+/// Remembers whether the greeting has been said in the current world.
+#[derive(Clone, Debug, Default)]
+pub struct Welcome {
+    /// True once the message has been handed out for this world.
+    said: bool,
+}
+
+impl Welcome {
+    /// A fresh `Welcome` that has not said anything yet.
+    ///
+    /// It is `const` so the glue can keep one in a `static` for the whole game.
+    pub const fn new() -> Self {
+        Self { said: false }
+    }
+
+    /// A new world opened: forget that we spoke, so the next world gets its own greeting.
+    pub fn world_opened(&mut self) {
+        self.said = false;
+    }
+
+    /// True while the greeting is still waiting to be said.
+    ///
+    /// The glue uses this to skip reading the player list once it has been said.
+    pub fn waiting(&self) -> bool {
+        !self.said
+    }
+
+    /// Called once per server tick. `someone_here` says whether a player is in the world.
+    ///
+    /// Returns `Some(message)` exactly once per world (on the first tick with a
+    /// player), and `None` every other time.
+    pub fn tick(&mut self, someone_here: bool) -> Option<&'static str> {
+        if self.said || !someone_here {
+            return None;
+        }
+        self.said = true;
+        Some(LOADED_MESSAGE)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn silent_while_nobody_is_here() {
+        let mut welcome = Welcome::new();
+        for _ in 0..100 {
+            assert_eq!(welcome.tick(false), None);
+        }
+        // Still waiting: nobody has arrived yet.
+        assert!(welcome.waiting());
+    }
+
+    #[test]
+    fn says_it_exactly_once_when_someone_arrives() {
+        let mut welcome = Welcome::new();
+        assert_eq!(welcome.tick(false), None);
+        // The first tick with a player in the world speaks...
+        assert_eq!(welcome.tick(true), Some(LOADED_MESSAGE));
+        assert!(!welcome.waiting());
+        // ...and every tick after that stays quiet.
+        assert_eq!(welcome.tick(true), None);
+        assert_eq!(welcome.tick(false), None);
+        assert_eq!(welcome.tick(true), None);
+    }
+
+    #[test]
+    fn says_it_once_more_after_a_new_world_opens() {
+        let mut welcome = Welcome::new();
+        assert_eq!(welcome.tick(true), Some(LOADED_MESSAGE));
+        assert_eq!(welcome.tick(true), None);
+
+        welcome.world_opened();
+        assert!(welcome.waiting());
+        assert_eq!(welcome.tick(true), Some(LOADED_MESSAGE));
+        assert_eq!(welcome.tick(true), None);
+    }
+
+    #[test]
+    fn the_text_is_exactly_what_the_owner_expects() {
+        assert_eq!(LOADED_MESSAGE, "Horizon Theme Park loaded");
+    }
+}

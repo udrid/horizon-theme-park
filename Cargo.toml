@@ -9,6 +9,7 @@ members = [
 ]
 
 [workspace.package]
-edition = "2021"
+# Same Rust "edition" (rule book) as Horizon, because the game compiles our glued code under its rules (D39).
+edition = "2024"
 license = "MIT"
 version = "0.1.0"
