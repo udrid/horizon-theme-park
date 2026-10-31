@@ -6,7 +6,8 @@ building one, an Opus session writes `docs/milestones/Mx.md` (tasks, tests, open
 owner approves its design choices ([WORKING_WITH_ME.md](WORKING_WITH_ME.md)). Architecture:
 [ARCHITECTURE.md](ARCHITECTURE.md). Decisions: [DECISIONS.md](DECISIONS.md).
 
-Prompt 03 (the engine spike) runs **between M0 and M1** and must report on risks R1–R9 first.
+The engine spike (prompt 03) is **done** (2026-10-30). Results are in [SPIKE_RESULTS.md](SPIKE_RESULTS.md) and
+D23–D32. M1's plan builds on them.
 
 ---
 
@@ -14,7 +15,7 @@ Prompt 03 (the engine spike) runs **between M0 and M1** and must report on risks
 
 - **Scope:** repo, CI (fmt, clippy, test), `park-core` and `park-sim` skeletons *(done 2026-10-30)*;
   `tools/park-bundle` with `--check` in CI; native mod skeleton (`horizon-mixin.toml`, `glue.rs`,
-  glued `park.rs`) on hook API 21 that broadcasts "Horizon Theme Park loaded" when a world opens.
+  glued `park.rs`) on hook API 21 that broadcasts "Horizon Theme Park loaded" when the first player is placed in a world [D35].
 - **Out of scope:** any coaster code, displays, content mod.
 - **Tests:** `park-bundle --check` passes; a unit test that the glued file contains no `include!`,
   `#[path]` or leftover `crate::coaster` paths; CI green.

@@ -51,14 +51,16 @@ $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:APPDATA\horizon-launcher\rust\1.99
 cargo test --workspace          # all tests, seconds, no game needed
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
-cargo run -p park-bundle -- --check   # once the glue tool exists (M0)
+cargo run -p park-bundle              # re-glue park.rs after changing park-core
+cargo run -p park-bundle -- --check   # is park.rs up to date? (exit code 1 = stale)
 ```
 
-Game build: **only the owner runs it**, after saying yes (first build about 8 minutes, more if Rust
+Game build: **only the owner runs it**, after saying yes (the first build took 520 s on 2026-10-31 and downloaded Horizon's source once; more if Rust
 needs downloading):
 
 ```powershell
-horizon-launcher native-build mods\native\mixins\horizon-theme-park --trust-native-code
+# The launcher is not on PATH. It sits one folder above the repo, so run this from the repo folder:
+..\horizon-launcher.exe native-build mods\native\mixins\horizon-theme-park --trust-native-code
 ```
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on every push. It's the free backup check.
