@@ -168,10 +168,15 @@ pub fn rider_point(seat: DVec3) -> DVec3 {
 /// tightest curve at `speed` (blocks per second). A straight chord of length L on a curve of
 /// radius R sags about L² / (8R).
 pub fn teleport_ticks(table: &Table, speed: f64) -> u32 {
-    let curvature = table.max_curvature();
+    teleport_ticks_for(speed * speed * table.max_curvature())
+}
+
+/// The same choice from the lap's worst `speed² × bend` (S3): a chord of `v · 0.05 · k` blocks on a
+/// bend of curvature `c` sags about `chord² · c / 8`.
+pub fn teleport_ticks_for(worst_speed_sq_curvature: f64) -> u32 {
     for k in (1..=MAX_TELEPORT_TICKS).rev() {
-        let chord = speed * TICK_SECONDS * k as f64;
-        if chord * chord * curvature / 8.0 <= MAX_GLIDE_SAG {
+        let kt = TICK_SECONDS * k as f64;
+        if kt * kt * worst_speed_sq_curvature / 8.0 <= MAX_GLIDE_SAG {
             return k;
         }
     }
@@ -181,7 +186,7 @@ pub fn teleport_ticks(table: &Table, speed: f64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coaster::demo::{self, demo_nodes};
+    use crate::coaster::oval::{self, demo_nodes};
     use crate::coaster::spline::Track;
 
     fn oval() -> Table {
@@ -275,7 +280,7 @@ mod tests {
         // A very slow train can use the longest gap, a very fast one must update every tick.
         assert_eq!(teleport_ticks(&oval(), 1.0), 5);
         assert_eq!(teleport_ticks(&oval(), 200.0), 1);
-        let _ = demo::SPEED;
+        let _ = oval::SPEED;
     }
 
     #[test]

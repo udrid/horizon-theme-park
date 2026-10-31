@@ -10,10 +10,816 @@
 // and the per-tick loop in `runtime`.
 
 pub mod coaster {
-// Coaster maths: the track curve, its arc-length table, frames and the demo oval.
+// Coaster maths: the track curve, its arc-length table, frames, forces, physics, elements and the demo layout.
 
 pub mod demo {
-// The demo oval for `/coaster demo` (D47): two straights joined by two half circles.
+// The demo coaster for `/coaster demo` (D54, D58): a station, a chain lift, a first drop, two
+// airtime hills, a turnaround, and brakes, shaped so it rides like a real coaster.
+//
+// How the layout is described (so you can change it): the track's shape seen from ABOVE is a
+// "stadium" (two straights joined by two half circles), fixed by `radius` and `straight`. The
+// HEIGHT along that path is described by a list of grades: "from here on, climb or fall at this
+// angle", and every change of angle is smoothly rounded over a stretch (so there are no sharp
+// corners, D58). The last grade is worked out by the code so the track closes up exactly.
+//
+// Hands-on idea: change a grade in `Shape::demo()` (say the lift's 20 to 25), run
+// `cargo run -p park-sim -- demo`, and watch the top speed and the g-forces change.
+
+use crate::game::htp_park::coaster::elements::{Course, Element, Placed};
+use crate::game::htp_park::coaster::spline::Track;
+use crate::game::htp_park::coaster::table::Table;
+use glam::DVec3;
+
+/// Cars in the demo train (D55).
+pub const CARS: usize = 3;
+/// Length of the station, in blocks.
+pub const STATION_LENGTH: f64 = 12.5;
+/// Where the front car stops in the station, blocks from its start.
+const STATION_STOP: f64 = 10.0;
+/// Distance between nodes along the path seen from above, in blocks.
+const NODE_GAP: f64 = 0.6;
+
+/// One change of grade: from about `at` blocks along (seen from above) the track climbs
+/// (`degrees` > 0) or falls (< 0) at that angle. The change is rounded over `blend` blocks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Grade {
+    pub at: f64,
+    pub degrees: f64,
+    pub blend: f64,
+}
+
+const fn grade(at: f64, degrees: f64, blend: f64) -> Grade {
+    Grade { at, degrees, blend }
+}
+
+/// Everything that decides the demo's shape. `Shape::demo()` is the layout players get;
+/// `park-sim` can try other shapes without rebuilding the game.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shape {
+    /// Radius of both half circles seen from above, in blocks.
+    pub radius: f64,
+    /// Length of both straights seen from above, in blocks.
+    pub straight: f64,
+    /// The stadium path is walked starting this far along it, so the lap's start (the station)
+    /// is at the end of the second straight.
+    pub phase: f64,
+    /// The height profile. The very last entry's angle is replaced by the code so the lap closes.
+    pub grades: Vec<Grade>,
+    /// The chain lift: from and to, blocks along the path seen from above.
+    pub lift: (f64, f64),
+    /// Length of the brake run before the station, in blocks.
+    pub brake_len: f64,
+}
+
+impl Shape {
+    /// The demo layout, worked out on paper with a small model and then tuned with `park-sim`
+    /// until it met D58's limits (see docs/milestones/M2.md).
+    pub fn demo() -> Shape {
+        Shape {
+            radius: 15.0,
+            straight: 105.401,
+            phase: 245.426,
+            grades: vec![
+                grade(0.00, 0.0, 1.0),
+                grade(18.50, 20.0, 10.0), // the lift starts climbing at 20 degrees
+                grade(80.93, -52.0, 18.0), // top of the lift (about 21 blocks up), then the first drop
+                grade(107.93, 33.82, 44.0), // the valley at the bottom, up into hill 1
+                grade(139.43, -5.4, 10.0), // crest of hill 1 (airtime), into the turnaround
+                grade(148.96, 0.0, 11.05), // level through the turnaround
+                grade(210.52, -56.0, 12.0), // second drop
+                grade(227.52, 24.4, 34.0), // valley, up into hill 2
+                grade(257.49, -18.0, 14.0), // crest of hill 2 (airtime)
+                grade(280.42, 0.0, 18.0),  // level run into the brakes
+                grade(293.42, 0.0, 8.0),   // closing grade (worked out by the code)
+            ],
+            lift: (14.0, 74.932),
+            brake_len: 16.0,
+        }
+    }
+
+    /// Length of the whole path seen from above.
+    pub fn path_length(&self) -> f64 {
+        2.0 * self.straight + 2.0 * std::f64::consts::PI * self.radius
+    }
+
+    /// The path seen from above at `u` blocks along: (x, z). The first straight heads +x; the
+    /// stadium bends to the right (towards +z).
+    fn plan(&self, u: f64) -> (f64, f64) {
+        let (r, s) = (self.radius, self.straight);
+        let arc = std::f64::consts::PI * r;
+        let u = (u + self.phase).rem_euclid(self.path_length());
+        if u < s {
+            (u, 0.0)
+        } else if u < s + arc {
+            let a = (u - s) / r;
+            (s + r * a.sin(), r - r * a.cos())
+        } else if u < 2.0 * s + arc {
+            (s - (u - s - arc), 2.0 * r)
+        } else {
+            let a = (u - 2.0 * s - arc) / r;
+            (-r * a.sin(), r + r * a.cos())
+        }
+    }
+
+    /// The slope (rise per block) at `u`. The ANGLE is eased between grades, so the track's bend
+    /// (and with it the g-force) rises and falls smoothly. `last_degrees` replaces the final entry.
+    fn slope(&self, last_degrees: f64, u: f64) -> f64 {
+        let mut angle = 0.0;
+        let mut previous = 0.0;
+        for (i, g) in self.grades.iter().enumerate() {
+            let degrees = if i + 1 == self.grades.len() {
+                last_degrees
+            } else {
+                g.degrees
+            };
+            angle += (degrees - previous) * ease((u - g.at) / g.blend + 0.5);
+            previous = degrees;
+        }
+        angle.to_radians().tan()
+    }
+
+    /// Heights at every `0.05` blocks along the path, by adding up the slope.
+    fn heights(&self, last_degrees: f64) -> Vec<f64> {
+        const DU: f64 = 0.05;
+        let n = (self.path_length() / DU).ceil() as usize + 1;
+        let mut y = Vec::with_capacity(n);
+        let mut h = 0.0;
+        y.push(h);
+        for i in 1..n {
+            let u = (i as f64 - 0.5) * DU;
+            h += self.slope(last_degrees, u) * DU;
+            y.push(h);
+        }
+        y
+    }
+
+    /// The nodes the track passes through, with the path distance `u` of each, relative to the
+    /// station's start (the first node, at height 0).
+    pub fn nodes(&self) -> (Vec<DVec3>, Vec<f64>) {
+        // Close the loop: the last angle is chosen so the track ends as high as it started.
+        // (Bisection: try a middle angle, keep the half that still contains the answer.)
+        let (mut lo, mut hi) = (-30.0, 30.0);
+        for _ in 0..50 {
+            let mid = 0.5 * (lo + hi);
+            // A steeper last angle ends higher.
+            if self.heights(mid).last().copied().unwrap_or(0.0) > 0.0 {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        let y = self.heights(0.5 * (lo + hi));
+        let length = self.path_length();
+        let count = (length / NODE_GAP).round() as usize;
+        let (x0, z0) = self.plan(0.0);
+        let mut nodes = Vec::with_capacity(count);
+        let mut us = Vec::with_capacity(count);
+        for i in 0..count {
+            let u = i as f64 * length / count as f64;
+            let (x, z) = self.plan(u);
+            let f = u / 0.05;
+            let (a, b) = (f.floor() as usize, f.floor() as usize + 1);
+            let h = y[a] + (y[b.min(y.len() - 1)] - y[a]) * (f - a as f64);
+            nodes.push(DVec3::new(x - x0, h, z - z0));
+            us.push(u);
+        }
+        (nodes, us)
+    }
+}
+
+/// Smooth 0-to-1 step (cosine ease) over x in 0..1.
+fn ease(x: f64) -> f64 {
+    let x = x.clamp(0.0, 1.0);
+    0.5 - 0.5 * (std::f64::consts::PI * x).cos()
+}
+
+/// The demo course with its station's start at `origin`, ready to ride.
+pub fn demo_course(origin: DVec3) -> Course {
+    course_for(&Shape::demo(), origin)
+}
+
+/// The course for any shape.
+pub fn course_for(shape: &Shape, origin: DVec3) -> Course {
+    let (nodes, us) = shape.nodes();
+    let nodes: Vec<DVec3> = nodes.into_iter().map(|p| p + origin).collect();
+    let table = Table::new_level(&Track::closed(&nodes));
+    let length = shape.path_length();
+    // Turn "u" (blocks seen from above) into "s" (blocks along the real track): between nodes we
+    // measure along the table, so slopes are accounted for.
+    let to_s = |u: f64| -> f64 { u_to_s(&table, &nodes, &us, length, u) };
+    let placed = vec![
+        Placed {
+            s0: to_s(length - shape.brake_len),
+            s1: table.length(),
+            element: Element::brake(),
+        },
+        Placed {
+            s0: to_s(0.0),
+            s1: to_s(STATION_LENGTH),
+            element: Element::station(to_s(STATION_STOP)),
+        },
+        Placed {
+            s0: to_s(shape.lift.0),
+            s1: to_s(shape.lift.1),
+            element: Element::lift(),
+        },
+    ];
+    Course { table, placed }
+}
+
+/// The distance along the table of the point at `u` blocks along the path seen from above.
+/// Each node's own `s` is found by walking the table to the node's position.
+fn u_to_s(table: &Table, nodes: &[DVec3], us: &[f64], length: f64, u: f64) -> f64 {
+    let n = nodes.len();
+    let u = u.clamp(0.0, length);
+    let i = us.partition_point(|&x| x <= u).saturating_sub(1).min(n - 1);
+    let j = (i + 1) % n;
+    let polyline = |upto: usize| -> f64 {
+        (0..upto)
+            .map(|w| nodes[w].distance(nodes[(w + 1) % n]))
+            .sum()
+    };
+    let s_of = |k: usize| -> f64 {
+        // Rough guess from the straight-line distances, then refine against the table.
+        let guess = polyline(k) * table.length() / polyline(n);
+        let mut best = (f64::MAX, guess);
+        let mut s = guess - 3.0;
+        while s <= guess + 3.0 {
+            let d = table.position(s).distance(nodes[k]);
+            if d < best.0 {
+                best = (d, s);
+            }
+            s += 0.02;
+        }
+        best.1
+    };
+    let (s0, s1) = (s_of(i), if j == 0 { table.length() } else { s_of(j) });
+    let u1 = if j == 0 { length } else { us[j] };
+    s0 + (s1 - s0) * (u - us[i]) / (u1 - us[i])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::htp_park::coaster::physics::{Physics, Train};
+    use crate::game::htp_park::coaster::sim;
+
+    fn course() -> Course {
+        demo_course(DVec3::new(100.0, 73.0, -40.0))
+    }
+
+    fn lap(course: &Course) -> Vec<sim::Sample> {
+        let stop = course.station().map_or(0.0, |(_, stop, _)| stop);
+        sim::run_lap(course, Train::held(CARS, stop), &Physics::default(), 300.0)
+    }
+
+    #[test]
+    fn the_lap_closes_and_is_about_three_hundred_blocks_long() {
+        let c = course();
+        assert!(
+            c.table.length() > 280.0 && c.table.length() < 340.0,
+            "{}",
+            c.table.length()
+        );
+        // The first and last nodes meet without a jump: the track is one smooth loop.
+        let end = c.table.position(c.table.length() - 0.05);
+        assert!(end.distance(c.table.position(0.0)) < 0.2);
+    }
+
+    // Test 11: one simulated lap.
+    #[test]
+    fn the_train_never_stalls_and_finishes_the_lap_in_the_station() {
+        let c = course();
+        let samples = lap(&c);
+        let last = samples.last().unwrap();
+        assert!(last.t < 120.0, "the lap took {} s", last.t);
+        // It ended held at the stop point (run_lap stops when the train is held again).
+        let stop = c.station().unwrap().1;
+        assert!(
+            (last.s - stop).abs() < 0.3,
+            "ended at {} not {stop}",
+            last.s
+        );
+        let st = sim::stats(&samples);
+        assert!(st.slowest_speed > 0.9, "slowest {}", st.slowest_speed);
+    }
+
+    // Test 12: D58's realism limits.
+    #[test]
+    fn the_layout_stays_within_the_realism_limits() {
+        let c = course();
+        let st = sim::stats(&lap(&c));
+
+        // Valleys push at most 4 g; airtime goes out of the seat by at most half a g.
+        assert!(st.max_vertical <= 4.0, "valley {} g", st.max_vertical);
+        assert!(st.min_vertical >= -0.5, "airtime {} g", st.min_vertical);
+        // Flat turns push sideways at most 1 g (no banking until M5).
+        assert!(st.max_lateral <= 1.0, "sideways {} g", st.max_lateral);
+        // Vertical g changes by at most 3 g in any second.
+        assert!(
+            st.max_vertical_rate <= 3.0,
+            "g changes {} g/s",
+            st.max_vertical_rate
+        );
+        assert!(st.top_speed <= 30.0, "top speed {}", st.top_speed);
+
+        // Drops: every stretch steeper than 30 degrees falls at between 50 and 65 degrees at its
+        // steepest, and there are at least two of them.
+        let mut drops: Vec<f64> = Vec::new();
+        let mut steepest = 0.0_f64;
+        let mut s = 0.0;
+        while s < c.table.length() {
+            let fall = (-c.table.frame(s).forward.y).asin().to_degrees();
+            if fall > 30.0 {
+                steepest = steepest.max(fall);
+            } else if steepest > 0.0 {
+                drops.push(steepest);
+                steepest = 0.0;
+            }
+            s += 0.1;
+        }
+        assert!(drops.len() >= 2, "drops {drops:?}");
+        for d in &drops {
+            assert!(
+                (50.0..=65.0).contains(d),
+                "a drop of {d} degrees in {drops:?}"
+            );
+        }
+
+        // The lift is 20 to 30 blocks tall.
+        let lift = c
+            .placed
+            .iter()
+            .find(|p| matches!(p.element, Element::Lift { .. }))
+            .unwrap();
+        let top = (0..)
+            .map(|k| lift.s0 + k as f64 * 0.5)
+            .take_while(|&s| s < c.table.length())
+            .map(|s| c.table.position(s).y)
+            .fold(f64::MIN, f64::max);
+        let height = top - c.table.position(lift.s0).y;
+        assert!((20.0..=30.0).contains(&height), "lift height {height}");
+    }
+
+    #[test]
+    fn two_airtime_hills_lift_the_rider_a_little_out_of_the_seat() {
+        let c = course();
+        let samples = lap(&c);
+        // Count separate stretches where the front rider's g dips below zero (but not below -0.5).
+        let mut hills = 0;
+        let mut inside = false;
+        for s in &samples {
+            let g = s.felt[0].vertical;
+            if g < 0.0 && !inside {
+                hills += 1;
+                inside = true;
+            } else if g > 0.3 {
+                inside = false;
+            }
+        }
+        assert!(hills >= 2, "only {hills} airtime hills");
+    }
+
+    #[test]
+    fn the_track_never_dips_more_than_half_a_block_below_the_players_feet() {
+        // The origin is 3 above the feet (D47), so the lowest rail must stay above feet - 0.5.
+        let c = demo_course(DVec3::new(0.0, 3.0, 0.0));
+        let mut s = 0.0;
+        while s < c.table.length() {
+            assert!(c.table.position(s).y > -0.5, "low at s = {s}");
+            s += 0.25;
+        }
+    }
+
+    #[test]
+    fn the_elements_are_where_they_should_be() {
+        let c = course();
+        let len = c.table.length();
+        let lift = c
+            .placed
+            .iter()
+            .find(|p| matches!(p.element, Element::Lift { .. }))
+            .unwrap();
+        let brake = c
+            .placed
+            .iter()
+            .find(|p| matches!(p.element, Element::Brake { .. }))
+            .unwrap();
+        let (station, stop, _) = c.station().unwrap();
+        // Order along the lap: station, then the lift; the brake ends where the lap ends.
+        assert!(station.s0 < stop && stop < station.s1 && station.s1 <= lift.s0);
+        assert!((brake.s1 - len).abs() < 1e-9 && brake.s1 - brake.s0 > 14.0);
+        // The whole train fits inside the station when stopped.
+        assert!(stop - 2.0 * crate::game::htp_park::coaster::physics::CAR_SPACING > station.s0);
+    }
+}
+}
+pub mod elements {
+// Track elements (D13, D57): the parts of the track that act on the train.
+//
+// * A **lift** is a chain: it drags the train up at a steady speed and never lets it roll back.
+// * A **brake** slows the train down to a target speed.
+// * A **station** is where the train stops, waits for riders, and is pushed out again.
+//
+// An element covers a stretch of track `s0..s1` (blocks along the lap). "On an element" means
+// that ANY car of the train is on that stretch (D13).
+
+use crate::game::htp_park::coaster::table::Table;
+
+/// Lift chain speed, blocks per second (D57).
+pub const LIFT_SPEED: f64 = 5.0;
+/// How hard a brake slows the train, blocks per second squared (D57).
+pub const BRAKE_DECEL: f64 = 6.0;
+/// The speed a brake slows the train down to, blocks per second (D57).
+pub const BRAKE_TARGET: f64 = 3.0;
+/// The speed the station pushes the train out at, blocks per second (D57).
+pub const STATION_PUSH: f64 = 2.0;
+/// How long the train waits in the station after someone sits, seconds (D56, D57).
+pub const DWELL: f64 = 5.0;
+
+/// What an element does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Element {
+    /// A chain at `speed` blocks/s.
+    Lift { speed: f64 },
+    /// Slows the train to `target_v` at `decel` blocks/s².
+    Brake { target_v: f64, decel: f64 },
+    /// The train stops with its front car at `stop` (a distance along the lap, inside the
+    /// station's stretch), waits, and is pushed out at `push` blocks/s.
+    Station { stop: f64, push: f64 },
+}
+
+impl Element {
+    /// A lift with the default chain speed.
+    pub fn lift() -> Element {
+        Element::Lift { speed: LIFT_SPEED }
+    }
+    /// A brake with the default numbers.
+    pub fn brake() -> Element {
+        Element::Brake {
+            target_v: BRAKE_TARGET,
+            decel: BRAKE_DECEL,
+        }
+    }
+    /// A station whose stop point is `stop` blocks along the lap.
+    pub fn station(stop: f64) -> Element {
+        Element::Station {
+            stop,
+            push: STATION_PUSH,
+        }
+    }
+}
+
+/// One element placed on a stretch of track.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Placed {
+    pub s0: f64,
+    pub s1: f64,
+    pub element: Element,
+}
+
+/// A track together with everything on it: the thing a train rides on.
+#[derive(Clone, Debug)]
+pub struct Course {
+    pub table: Table,
+    pub placed: Vec<Placed>,
+}
+
+impl Course {
+    /// A course with no elements (a plain loop of track).
+    pub fn bare(table: Table) -> Course {
+        Course {
+            table,
+            placed: Vec::new(),
+        }
+    }
+
+    /// Is the point `s` (any distance, wrapped to one lap) inside the stretch `p`?
+    pub fn covers(&self, p: &Placed, s: f64) -> bool {
+        let s = self.table.wrap(s);
+        s >= p.s0 && s < p.s1
+    }
+
+    /// The first placed element for which `pick` says yes and that any of `car_s` stands on.
+    pub fn on<'a, T>(
+        &'a self,
+        car_s: &[f64],
+        pick: impl Fn(&Element) -> Option<T>,
+    ) -> Option<(&'a Placed, T)> {
+        self.placed.iter().find_map(|p| {
+            let value = pick(&p.element)?;
+            car_s
+                .iter()
+                .any(|&s| self.covers(p, s))
+                .then_some((p, value))
+        })
+    }
+
+    /// The station, if the course has one.
+    pub fn station(&self) -> Option<(&Placed, f64, f64)> {
+        self.placed.iter().find_map(|p| match p.element {
+            Element::Station { stop, push } => Some((p, stop, push)),
+            _ => None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::htp_park::coaster::spline::Track;
+    use glam::DVec3;
+
+    fn loop_course() -> Course {
+        // A flat square loop 100 blocks around.
+        let nodes = [
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(25.0, 0.0, 0.0),
+            DVec3::new(25.0, 0.0, 25.0),
+            DVec3::new(0.0, 0.0, 25.0),
+        ];
+        Course::bare(Table::new(&Track::closed(&nodes)))
+    }
+
+    #[test]
+    fn the_default_numbers_are_the_approved_ones() {
+        assert_eq!(LIFT_SPEED, 5.0);
+        assert_eq!(BRAKE_DECEL, 6.0);
+        assert_eq!(BRAKE_TARGET, 3.0);
+        assert_eq!(STATION_PUSH, 2.0);
+        assert_eq!(DWELL, 5.0);
+    }
+
+    #[test]
+    fn any_car_on_an_element_counts() {
+        let mut course = loop_course();
+        course.placed.push(Placed {
+            s0: 10.0,
+            s1: 20.0,
+            element: Element::lift(),
+        });
+        let pick = |e: &Element| matches!(e, Element::Lift { .. }).then_some(());
+        assert!(course.on(&[5.0, 8.0, 12.0], pick).is_some());
+        assert!(course.on(&[5.0, 8.0, 9.9], pick).is_none());
+        // Distances past the end of the lap wrap around.
+        let lap = course.table.length();
+        assert!(course.on(&[lap + 15.0], pick).is_some());
+    }
+}
+}
+pub mod forces {
+// G-forces (D15): what a rider feels, worked out from the shape of the track.
+//
+// Plain words: your body is pushed by the seat. On flat ground standing still, the seat pushes
+// up with exactly your weight: that is "1 g". Going over a hilltop fast, the track curves away
+// under you, the seat pushes less, and you feel light (less than 1 g, or even a negative g:
+// "airtime"). Going through a valley the seat pushes harder and you feel heavy.
+//
+// The maths (D15): the rider's acceleration is `a · forward + v² · K` (speeding up along the
+// track, plus the sideways change from turning), where `K` is how fast the direction of the track
+// changes per block. The seat's push is that acceleration minus gravity.
+
+use crate::game::htp_park::coaster::frame::Frame;
+use crate::game::htp_park::coaster::table::Table;
+use glam::DVec3;
+
+/// Real gravity, blocks per second squared (D11).
+pub const G: f64 = 9.81;
+/// Half of the distance over which the direction change is measured: ±0.25 block (D15).
+pub const H: f64 = 0.25;
+
+/// What a rider feels, in real g, along the three directions of their car (D15).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Felt {
+    /// Up from the seat: +1 at rest on flat track, 0 floating, negative = lifted out of the seat.
+    pub vertical: f64,
+    /// Towards the rider's right: positive when the track turns right.
+    pub lateral: f64,
+    /// Forwards: positive when the seat pushes you forward (speeding up).
+    pub longitudinal: f64,
+}
+
+/// How fast the direction of the track turns at `s`: a vector pointing to the inside of the bend,
+/// as large as `1 / radius` (D15: direction change over ±0.25 block).
+pub fn curvature(table: &Table, s: f64) -> DVec3 {
+    let ahead = table.frame(s + H).forward;
+    let behind = table.frame(s - H).forward;
+    (ahead - behind) / (2.0 * H)
+}
+
+/// The seat's push on a rider at `s`, in blocks per second squared, plus the frame it is
+/// measured in. `v` is the train's speed and `a` its speed-up along the track.
+/// `gravity` is the (scaled) gravity in blocks per second squared.
+pub fn push(table: &Table, s: f64, v: f64, a: f64, gravity: f64) -> (Frame, DVec3) {
+    let frame = table.frame(s);
+    let rider = frame.forward * a + curvature(table, s) * (v * v);
+    // The seat must cancel gravity (which pulls down) as well: push = acceleration - (0, -G, 0).
+    (frame, rider + DVec3::new(0.0, gravity, 0.0))
+}
+
+/// The "normal push" (D14): the part of the seat's push that is square to the track, in blocks
+/// per second squared. Friction is proportional to it.
+pub fn normal_push(frame: &Frame, push: DVec3) -> f64 {
+    let along = frame.forward * push.dot(frame.forward);
+    (push - along).length()
+}
+
+/// What a rider at `s` feels, in real g (D15), for a train going `v` and speeding up by `a`.
+pub fn felt(table: &Table, s: f64, v: f64, a: f64, gravity_scale: f64) -> Felt {
+    let (frame, f) = push(table, s, v, a, G * gravity_scale);
+    Felt {
+        vertical: f.dot(frame.up) / G,
+        lateral: f.dot(frame.right) / G,
+        longitudinal: f.dot(frame.forward) / G,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::htp_park::coaster::spline::Track;
+
+    fn circle(radius: f64) -> Table {
+        let nodes: Vec<DVec3> = (0..72)
+            .map(|i| {
+                let a = i as f64 / 72.0 * std::f64::consts::TAU;
+                DVec3::new(radius * a.cos(), 0.0, radius * a.sin())
+            })
+            .collect();
+        Table::new(&Track::closed(&nodes))
+    }
+
+    // Test 4 (ARCHITECTURE §4): a flat unbanked circle, radius 10, at 10 blocks/s.
+    #[test]
+    fn a_flat_circle_of_radius_10_at_10_blocks_a_second_gives_1_02_lateral_and_1_vertical() {
+        let t = circle(10.0);
+        for k in 0..8 {
+            let s = k as f64 * 7.3;
+            let g = felt(&t, s, 10.0, 0.0, 1.0);
+            // The circle is traced clockwise seen from above or not: the push is sideways either way.
+            assert!((g.lateral.abs() - 1.0194).abs() < 0.0102, "{g:?}");
+            assert!((g.vertical - 1.0).abs() < 0.01, "{g:?}");
+            assert!(g.longitudinal.abs() < 1e-3, "{g:?}");
+        }
+    }
+
+    #[test]
+    fn at_rest_on_flat_track_the_rider_feels_one_g_up_scaled_by_gravity_scale() {
+        let t = circle(10.0);
+        assert!((felt(&t, 3.0, 0.0, 0.0, 1.0).vertical - 1.0).abs() < 1e-9);
+        assert!((felt(&t, 3.0, 0.0, 0.0, 0.5).vertical - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_normal_push_of_a_flat_straight_is_gravity() {
+        let t = circle(1000.0);
+        let (frame, f) = push(&t, 5.0, 0.0, 0.0, G);
+        assert!((normal_push(&frame, f) - G).abs() < 1e-6);
+    }
+}
+}
+pub mod frame {
+// Frames: at every point of the track, three arrows that say which way is forward, up and
+// right. A car's rotation comes from them.
+//
+// The trick is "rotation-minimising" frames: walk along the track and turn the up arrow only as
+// much as the track itself turns, never twisting it for no reason (like carrying a flag
+// along a path without spinning it). On a closed loop the arrow may come back slightly
+// twisted, so we measure that leftover twist and spread it evenly over the whole lap.
+
+use glam::{DQuat, DVec3};
+
+/// Position and orientation at one point of the track. `right` is the rider's right hand:
+/// `forward × up`. Facing +Z (south) with +Y up, that is -X (west); facing +X it is +Z.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Frame {
+    pub pos: DVec3,
+    pub forward: DVec3,
+    pub up: DVec3,
+    pub right: DVec3,
+}
+
+impl Default for Frame {
+    fn default() -> Self {
+        Frame {
+            pos: DVec3::ZERO,
+            forward: DVec3::Z,
+            up: DVec3::Y,
+            right: DVec3::NEG_X,
+        }
+    }
+}
+
+/// Take `v` and remove the part that points along `t`, so it is square to `t`.
+fn square_to(v: DVec3, t: DVec3) -> DVec3 {
+    (v - t * v.dot(t)).normalize_or_zero()
+}
+
+/// The up arrow for every direction in `tangents` (a closed loop of unit directions).
+pub fn compute_ups(tangents: &[DVec3]) -> Vec<DVec3> {
+    let n = tangents.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Start: world up, with any part along the track removed. (A vertical start would need
+    // another choice; tracks start flat in M1.)
+    let mut first = square_to(DVec3::Y, tangents[0]);
+    if first == DVec3::ZERO {
+        first = square_to(DVec3::X, tangents[0]);
+    }
+    let mut ups = Vec::with_capacity(n);
+    ups.push(first);
+    for k in 1..n {
+        ups.push(carry(ups[k - 1], tangents[k - 1], tangents[k]));
+    }
+    // Close the loop: carry the last arrow back to the start and see how far it is twisted.
+    let back = carry(ups[n - 1], tangents[n - 1], tangents[0]);
+    let twist = tangents[0].dot(first.cross(back)).atan2(first.dot(back));
+    // Spread the twist: the arrow k steps along is turned back by its share of it.
+    for (k, up) in ups.iter_mut().enumerate() {
+        let share = -twist * k as f64 / n as f64;
+        *up = DQuat::from_axis_angle(tangents[k], share) * *up;
+    }
+    ups
+}
+
+/// Carry the up arrow from a place where the track points along `from` to one where it points
+/// along `to`, turning it by the smallest possible rotation.
+pub fn carry(up: DVec3, from: DVec3, to: DVec3) -> DVec3 {
+    let turned = DQuat::from_rotation_arc(from, to) * up;
+    square_to(turned, to)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::htp_park::coaster::spline::Track;
+    use crate::game::htp_park::coaster::table::Table;
+
+    fn angle_deg(a: DVec3, b: DVec3) -> f64 {
+        a.dot(b).clamp(-1.0, 1.0).acos().to_degrees()
+    }
+
+    /// A closed loop with S-bends, hills and a sideways wobble.
+    fn s_bend_loop() -> Table {
+        let nodes: Vec<DVec3> = (0..24)
+            .map(|i| {
+                let a = i as f64 / 24.0 * std::f64::consts::TAU;
+                DVec3::new(
+                    30.0 * a.cos(),
+                    6.0 * (3.0 * a).sin(),
+                    10.0 * a.sin() + 6.0 * (2.0 * a).sin(),
+                )
+            })
+            .collect();
+        Table::new(&Track::closed(&nodes))
+    }
+
+    #[test]
+    fn right_is_the_riders_right_hand() {
+        use crate::game::htp_park::coaster::oval::demo_nodes;
+        // Facing +Z (yaw 0): right is -X. Facing +X (yaw -90): right is +Z.
+        for (yaw, forward, right) in [(0.0, DVec3::Z, -DVec3::X), (-90.0, DVec3::X, DVec3::Z)] {
+            let t = Table::new(&Track::closed(&demo_nodes(DVec3::ZERO, yaw)));
+            let f = t.frame(0.0);
+            assert!(f.forward.dot(forward) > 0.99);
+            assert!(f.right.dot(right) > 0.99, "yaw {yaw}: right {:?}", f.right);
+            assert!(f.right.dot(f.up).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn no_flip_through_an_s_bend() {
+        let t = s_bend_loop();
+        let mut prev = t.frame(0.0);
+        let mut s = 0.1;
+        while s < t.length() {
+            let f = t.frame(s);
+            // Up never turns upside down and never jumps between neighbouring points. (On a wild 3D
+            // loop it may lean gradually: that is the carried-along twist, spread over the lap.)
+            // NOTE: `up·Y > 0` is right for M1's tracks only. Loops turn riders upside down, so the
+            // M5 plan replaces it with the continuity check (the jump test below) alone.
+            assert!(f.up.dot(DVec3::Y) > 0.0, "up flipped at s = {s}");
+            assert!(angle_deg(prev.up, f.up) < 1.5, "up jumped at s = {s}");
+            assert!(f.up.dot(f.forward).abs() < 1e-9);
+            prev = f;
+            s += 0.1;
+        }
+    }
+
+    #[test]
+    fn on_a_closed_loop_up_comes_back_to_where_it_started() {
+        let t = s_bend_loop();
+        // Carry the last arrow back over the closing step: it must meet the first one.
+        let last = t.frame(t.length() - 0.05);
+        let start = t.frame(0.0);
+        let back = carry(last.up, last.forward, start.forward);
+        assert!(angle_deg(back, start.up) < 0.1, "leftover twist too big");
+    }
+}
+}
+pub mod oval {
+// The M1 oval (D47), kept as a flat test track now that `/coaster demo` builds the hills (D54): two straights joined by two half circles.
 //
 // Hands-on idea: change `RADIUS` below, run `cargo test -p park-core`, and watch the test
 // that checks the oval's length fail, then fix the number it compares with.
@@ -134,144 +940,819 @@ mod tests {
     }
 }
 }
-pub mod frame {
-// Frames: at every point of the track, three arrows that say which way is forward, up and
-// right. A car's rotation comes from them.
+pub mod physics {
+// The physics of one train (D11-D15, ARCHITECTURE §4).
 //
-// The trick is "rotation-minimising" frames: walk along the track and turn the up arrow only as
-// much as the track itself turns, never twisting it for no reason (like carrying a flag
-// along a path without spinning it). On a closed loop the arrow may come back slightly
-// twisted, so we measure that leftover twist and spread it evenly over the whole lap.
+// The whole train is ONE rigid body: one position `s` (its front car) and one speed `v` (D13).
+// Car `i` rides `i * spacing` blocks behind the front car. Each server tick we run
+// 10 tiny steps ("substeps", 0.005 s each, D12). Each step:
+//
+// 1. gravity pulls every car along its own slope, and we average over the cars (D13);
+// 2. rolling friction and air drag push against the motion (D14);
+// 3. elements (lift, brake, station) act on the train when any car is on them;
+// 4. speed changes first, then the position moves with the NEW speed. That order is called
+//    "semi-implicit Euler" and, unlike the plain order, it does not invent or lose energy on a
+//    loop (D12). It is like how you would walk a rolling ball down a hill in tiny steps.
 
-use glam::{DQuat, DVec3};
+use crate::game::htp_park::coaster::elements::{Course, Element};
+use crate::game::htp_park::coaster::forces::{self, G};
 
-/// Position and orientation at one point of the track. `right` is the rider's right hand:
-/// `forward × up`. Facing +Z (south) with +Y up, that is -X (west); facing +X it is +Z.
+/// Substeps per server tick (D12).
+pub const SUBSTEPS: u32 = 10;
+/// Length of one substep in seconds: a tick is 0.05 s.
+pub const SUBSTEP_DT: f64 = 0.005;
+/// The most cars one train can have.
+pub const MAX_CARS: usize = 8;
+/// Distance between neighbouring cars' middles: a 3-block car plus a 0.2 gap.
+pub const CAR_SPACING: f64 = 3.2;
+/// Below this speed a train on a gentle slope is considered stopped (so it does not jitter).
+const SNAP_SPEED: f64 = 0.05;
+/// The station slows the train to a stop along a curve with this much slowing-down (blocks/s²)...
+const STATION_COMFORT_DECEL: f64 = 1.0;
+/// ...but never creeps slower than this, so a train always reaches the stop point.
+const STATION_CREEP: f64 = 0.3;
+/// A train this close to the stop point counts as arrived.
+const STATION_ARRIVE: f64 = 0.02;
+
+/// The numbers the physics needs (D11, D14). Defaults are the approved ones.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Frame {
-    pub pos: DVec3,
-    pub forward: DVec3,
-    pub up: DVec3,
-    pub right: DVec3,
+pub struct Physics {
+    /// 1.0 = real gravity (9.81 blocks/s²).
+    pub gravity_scale: f64,
+    /// Rolling friction: a fraction of the normal push (D14).
+    pub friction: f64,
+    /// Air drag per block (D14).
+    pub drag: f64,
 }
 
-impl Default for Frame {
+impl Default for Physics {
     fn default() -> Self {
-        Frame {
-            pos: DVec3::ZERO,
-            forward: DVec3::Z,
-            up: DVec3::Y,
-            right: DVec3::NEG_X,
+        Physics {
+            gravity_scale: 1.0,
+            friction: 0.015,
+            drag: 0.0015,
         }
     }
 }
 
-/// Take `v` and remove the part that points along `t`, so it is square to `t`.
-fn square_to(v: DVec3, t: DVec3) -> DVec3 {
-    (v - t * v.dot(t)).normalize_or_zero()
+impl Physics {
+    /// No friction and no drag: for tests of pure gravity.
+    pub fn frictionless() -> Physics {
+        Physics {
+            gravity_scale: 1.0,
+            friction: 0.0,
+            drag: 0.0,
+        }
+    }
 }
 
-/// The up arrow for every direction in `tangents` (a closed loop of unit directions).
-pub fn compute_ups(tangents: &[DVec3]) -> Vec<DVec3> {
-    let n = tangents.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    // Start: world up, with any part along the track removed. (A vertical start would need
-    // another choice; tracks start flat in M1.)
-    let mut first = square_to(DVec3::Y, tangents[0]);
-    if first == DVec3::ZERO {
-        first = square_to(DVec3::X, tangents[0]);
-    }
-    let mut ups = Vec::with_capacity(n);
-    ups.push(first);
-    for k in 1..n {
-        ups.push(carry(ups[k - 1], tangents[k - 1], tangents[k]));
-    }
-    // Close the loop: carry the last arrow back to the start and see how far it is twisted.
-    let back = carry(ups[n - 1], tangents[n - 1], tangents[0]);
-    let twist = tangents[0].dot(first.cross(back)).atan2(first.dot(back));
-    // Spread the twist: the arrow k steps along is turned back by its share of it.
-    for (k, up) in ups.iter_mut().enumerate() {
-        let share = -twist * k as f64 / n as f64;
-        *up = DQuat::from_axis_angle(tangents[k], share) * *up;
-    }
-    ups
+/// Is the train held in the station?
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Hold {
+    /// Moving (or waiting for nothing).
+    Free,
+    /// Standing at the station's stop point. `countdown` is the seconds left until it leaves,
+    /// or `None` while it waits for someone to sit (D56).
+    Held { countdown: Option<f64> },
 }
 
-/// Carry the up arrow from a place where the track points along `from` to one where it points
-/// along `to`, turning it by the smallest possible rotation.
-pub fn carry(up: DVec3, from: DVec3, to: DVec3) -> DVec3 {
-    let turned = DQuat::from_rotation_arc(from, to) * up;
-    square_to(turned, to)
+/// One train: a rigid body on the track.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Train {
+    /// Distance of the FRONT car's middle along the lap, in blocks.
+    pub s: f64,
+    /// Speed along the track, blocks per second (negative = rolling backwards).
+    pub v: f64,
+    /// The last substep's speed-up, blocks per second squared (used for the g-forces).
+    pub a: f64,
+    pub cars: usize,
+    pub spacing: f64,
+    pub hold: Hold,
+}
+
+fn sign(x: f64) -> f64 {
+    if x > 0.0 {
+        1.0
+    } else if x < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
+impl Train {
+    /// A moving train at `s` with speed `v`.
+    pub fn free(cars: usize, s: f64, v: f64) -> Train {
+        Train {
+            s,
+            v,
+            a: 0.0,
+            cars: cars.clamp(1, MAX_CARS),
+            spacing: CAR_SPACING,
+            hold: Hold::Free,
+        }
+    }
+
+    /// A train standing in the station with its front car at `s`, waiting for riders.
+    pub fn held(cars: usize, s: f64) -> Train {
+        Train {
+            hold: Hold::Held { countdown: None },
+            ..Train::free(cars, s, 0.0)
+        }
+    }
+
+    /// The middle of every car, front first. Only the first `self.cars` entries are used.
+    pub fn car_positions(&self) -> [f64; MAX_CARS] {
+        let mut out = [0.0; MAX_CARS];
+        for (i, slot) in out.iter_mut().enumerate().take(self.cars) {
+            *slot = self.s - i as f64 * self.spacing;
+        }
+        out
+    }
+
+    /// True while the train stands in the station.
+    pub fn is_held(&self) -> bool {
+        matches!(self.hold, Hold::Held { .. })
+    }
+
+    /// Seconds left of the station countdown, if one is running.
+    pub fn countdown(&self) -> Option<f64> {
+        match self.hold {
+            Hold::Held { countdown } => countdown,
+            Hold::Free => None,
+        }
+    }
+
+    /// Start the station countdown (D56) if the train is waiting and none is running.
+    pub fn start_countdown(&mut self, seconds: f64) {
+        if let Hold::Held { countdown } = &mut self.hold
+            && countdown.is_none()
+        {
+            *countdown = Some(seconds);
+        }
+    }
+
+    /// Stop the countdown (everyone got off): the train waits again.
+    pub fn cancel_countdown(&mut self) {
+        if let Hold::Held { countdown } = &mut self.hold {
+            *countdown = None;
+        }
+    }
+
+    /// One server tick: ten substeps.
+    pub fn step(&mut self, course: &Course, physics: &Physics) {
+        for _ in 0..SUBSTEPS {
+            self.substep(course, physics);
+        }
+    }
+
+    /// One substep of 0.005 s.
+    fn substep(&mut self, course: &Course, physics: &Physics) {
+        let dt = SUBSTEP_DT;
+        let table = &course.table;
+        if table.is_empty() {
+            return;
+        }
+
+        // Standing in the station: nothing moves until the countdown runs out.
+        if let Hold::Held { countdown } = &mut self.hold {
+            self.v = 0.0;
+            self.a = 0.0;
+            match countdown {
+                Some(t) if *t > dt => {
+                    *t -= dt;
+                    return;
+                }
+                Some(_) => self.hold = Hold::Free,
+                None => return,
+            }
+        }
+
+        let n = self.cars;
+        let positions = self.car_positions();
+        let cars = &positions[..n];
+        let g = G * physics.gravity_scale;
+
+        // 1-2. Gravity, friction and drag (D13, D14).
+        let mut slope = 0.0; // sum of the cars' `forward.y`
+        let mut normal = 0.0; // sum of the cars' normal push
+        for &c in cars {
+            let (frame, push) = forces::push(table, c, self.v, self.a, g);
+            slope += frame.forward.y;
+            normal += forces::normal_push(&frame, push);
+        }
+        let a_gravity = -g * slope / n as f64;
+        let friction_limit = physics.friction * normal / n as f64;
+        let a_friction = -sign(self.v) * friction_limit;
+        let a_drag = -sign(self.v) * physics.drag * self.v * self.v;
+        let mut a = a_gravity + a_friction + a_drag;
+
+        // 3. Elements. Which ones is any car on?
+        let lift = course.on(cars, |e| match e {
+            Element::Lift { speed } => Some(*speed),
+            _ => None,
+        });
+        let brake = course.on(cars, |e| match e {
+            Element::Brake { target_v, decel } => Some((*target_v, *decel)),
+            _ => None,
+        });
+        // The station: only the front car decides if we are arriving or leaving.
+        let front = table.wrap(self.s);
+        let station = course
+            .station()
+            .filter(|(p, _, _)| cars.iter().any(|&c| course.covers(p, c)));
+        let arriving = station.filter(|(p, stop, _)| front >= p.s0 && front < *stop);
+        let leaving = station.filter(|(_, stop, _)| front >= *stop);
+
+        if let Some((_, (target, decel))) = brake
+            && self.v > target
+        {
+            a -= decel;
+        }
+        // Arriving: follow a gentle slowing-down curve that ends exactly at the stop point.
+        let mut station_speed = None;
+        if let Some((_, stop, push)) = arriving {
+            let d = (stop - front).max(0.0);
+            let wanted = (2.0 * STATION_COMFORT_DECEL * d).sqrt().clamp(
+                STATION_CREEP,
+                crate::game::htp_park::coaster::elements::BRAKE_TARGET.max(push),
+            );
+            station_speed = Some(wanted);
+            if self.v > wanted {
+                a -= crate::game::htp_park::coaster::elements::BRAKE_DECEL;
+            }
+        }
+
+        // 4. Speed first...
+        let v_before = self.v;
+        self.v += a * dt;
+
+        // ...then the limits of the elements.
+        if let Some((_, (target, _))) = brake
+            && v_before > target
+            && self.v < target
+        {
+            self.v = target; // the brake never takes more than it must
+        }
+        if let Some(wanted) = station_speed
+            && self.v < wanted
+        {
+            // Never slower than the curve: the station's wheels pull a slow train along.
+            self.v = wanted;
+        }
+        if let Some((_, _, push)) = leaving
+            && self.v < push
+        {
+            self.v = push; // pushed out of the station
+        }
+        if let Some((_, speed)) = lift
+            && self.v < speed
+        {
+            self.v = speed; // the chain grabs; no rolling back
+        }
+        // A train on a gentle slope that is nearly stopped stays stopped (no jitter).
+        if lift.is_none()
+            && station.is_none()
+            && self.v.abs() < SNAP_SPEED
+            && a_gravity.abs() <= friction_limit
+        {
+            self.v = 0.0;
+        }
+
+        self.a = (self.v - v_before) / dt;
+
+        // ...then the position, with the NEW speed (D12).
+        self.s = table.wrap(self.s + self.v * dt);
+
+        // Arrived at the stop point? Stop exactly there and wait.
+        if let Some((p, stop, _)) = arriving {
+            let now = table.wrap(self.s);
+            if now >= stop - STATION_ARRIVE && now < stop + 1.0 && now >= p.s0 {
+                self.s = stop;
+                self.v = 0.0;
+                self.a = 0.0;
+                self.hold = Hold::Held { countdown: None };
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::htp_park::coaster::elements::Placed;
     use crate::game::htp_park::coaster::spline::Track;
     use crate::game::htp_park::coaster::table::Table;
+    use glam::DVec3;
 
-    fn angle_deg(a: DVec3, b: DVec3) -> f64 {
-        a.dot(b).clamp(-1.0, 1.0).acos().to_degrees()
+    /// A stadium: two straights `len` long, joined by half circles of radius `r`, in the flat
+    /// plane at height `y`. Starts at the beginning of the first straight, heading +x.
+    fn stadium_nodes(len: f64, r: f64, y: f64) -> Vec<DVec3> {
+        let mut n = Vec::new();
+        let mut x = 0.0;
+        while x < len - 1e-9 {
+            n.push(DVec3::new(x, y, 0.0));
+            x += 2.0;
+        }
+        for i in 0..=18 {
+            let a = (i as f64 * 10.0).to_radians();
+            n.push(DVec3::new(len + r * a.sin(), y, r - r * a.cos()));
+        }
+        let mut x = len - 2.0;
+        while x > 1e-9 {
+            n.push(DVec3::new(x, y, 2.0 * r));
+            x -= 2.0;
+        }
+        for i in 0..=18 {
+            let a = (i as f64 * 10.0).to_radians();
+            n.push(DVec3::new(-r * a.sin(), y, r + r * a.cos()));
+        }
+        // The last node duplicates the first one: drop it.
+        n.pop();
+        n
     }
 
-    /// A closed loop with S-bends, hills and a sideways wobble.
-    fn s_bend_loop() -> Table {
-        let nodes: Vec<DVec3> = (0..24)
+    fn flat_course() -> Course {
+        Course::bare(Table::new(&Track::closed(&stadium_nodes(
+            120.0, 15.0, 10.0,
+        ))))
+    }
+
+    /// A bumpy loop: a smooth hill 40 blocks tall on a long oval.
+    fn tall_hill_course() -> Course {
+        let nodes: Vec<DVec3> = (0..96)
             .map(|i| {
-                let a = i as f64 / 24.0 * std::f64::consts::TAU;
-                DVec3::new(
-                    30.0 * a.cos(),
-                    6.0 * (3.0 * a).sin(),
-                    10.0 * a.sin() + 6.0 * (2.0 * a).sin(),
-                )
+                let a = i as f64 / 96.0 * std::f64::consts::TAU;
+                DVec3::new(90.0 * a.cos(), 20.0 * a.cos() + 20.0, 25.0 * a.sin())
             })
             .collect();
-        Table::new(&Track::closed(&nodes))
+        Course::bare(Table::new(&Track::closed(&nodes)))
     }
 
+    // Test 1: no friction, many laps: no speed invented or lost.
     #[test]
-    fn right_is_the_riders_right_hand() {
-        use crate::game::htp_park::coaster::demo::demo_nodes;
-        // Facing +Z (yaw 0): right is -X. Facing +X (yaw -90): right is +Z.
-        for (yaw, forward, right) in [(0.0, DVec3::Z, -DVec3::X), (-90.0, DVec3::X, DVec3::Z)] {
-            let t = Table::new(&Track::closed(&demo_nodes(DVec3::ZERO, yaw)));
-            let f = t.frame(0.0);
-            assert!(f.forward.dot(forward) > 0.99);
-            assert!(f.right.dot(right) > 0.99, "yaw {yaw}: right {:?}", f.right);
-            assert!(f.right.dot(f.up).abs() < 1e-9);
+    fn a_frictionless_loop_keeps_its_speed_within_one_percent_after_100_laps() {
+        let course = Course::bare(Table::new(&Track::closed(&{
+            // A loop that goes up and down.
+            (0..48)
+                .map(|i| {
+                    let a = i as f64 / 48.0 * std::f64::consts::TAU;
+                    DVec3::new(40.0 * a.cos(), 6.0 * (2.0 * a).sin(), 20.0 * a.sin())
+                })
+                .collect::<Vec<_>>()
+        })));
+        let mut train = Train::free(1, 0.0, 12.0);
+        let h = |s: f64| course.table.position(s).y;
+        let e0 = 0.5 * 12.0 * 12.0 + G * h(0.0);
+        let mut ticks = 0u32;
+        let mut laps_done = 0.0;
+        let mut last = train.s;
+        while laps_done < 100.0 {
+            train.step(&course, &Physics::frictionless());
+            if train.s < last {
+                laps_done += 1.0;
+            }
+            last = train.s;
+            ticks += 1;
+            assert!(ticks < 2_000_000, "never finished 100 laps");
+        }
+        // Same energy means same speed at the same place: compare via energy at the current spot.
+        let v_expected = (2.0 * (e0 - G * h(train.s))).sqrt();
+        assert!(
+            (train.v - v_expected).abs() / v_expected < 0.01,
+            "speed {} vs {}",
+            train.v,
+            v_expected
+        );
+    }
+
+    // Test 2: the same ride twice gives the same numbers.
+    #[test]
+    fn the_same_ride_twice_is_identical_at_every_tick() {
+        let course = tall_hill_course();
+        let mut a = Train::free(3, 1.0, 4.0);
+        let mut b = Train::free(3, 1.0, 4.0);
+        for _ in 0..600 {
+            a.step(&course, &Physics::default());
+            b.step(&course, &Physics::default());
+            assert_eq!(a, b);
         }
     }
 
+    // Test 3: a frictionless drop: v = sqrt(2 g h).
     #[test]
-    fn no_flip_through_an_s_bend() {
-        let t = s_bend_loop();
-        let mut prev = t.frame(0.0);
-        let mut s = 0.1;
-        while s < t.length() {
-            let f = t.frame(s);
-            // Up never turns upside down and never jumps between neighbouring points. (On a wild 3D
-            // loop it may lean gradually: that is the carried-along twist, spread over the lap.)
-            // NOTE: `up·Y > 0` is right for M1's tracks only. Loops turn riders upside down, so the
-            // M5 plan replaces it with the continuity check (the jump test below) alone.
-            assert!(f.up.dot(DVec3::Y) > 0.0, "up flipped at s = {s}");
-            assert!(angle_deg(prev.up, f.up) < 1.5, "up jumped at s = {s}");
-            assert!(f.up.dot(f.forward).abs() < 1e-9);
-            prev = f;
-            s += 0.1;
+    fn a_frictionless_40_block_drop_from_rest_ends_at_28_01_blocks_a_second() {
+        let course = tall_hill_course();
+        // Find the top of the hill and start a hair past it.
+        let table = &course.table;
+        let mut s_top = 0.0;
+        let mut y_top = f64::MIN;
+        let mut s = 0.0;
+        while s < table.length() {
+            let y = table.position(s).y;
+            if y > y_top {
+                y_top = y;
+                s_top = s;
+            }
+            s += 0.05;
         }
+        let mut train = Train::free(1, s_top + 0.3, 0.0);
+        let y_start = table.position(train.s).y;
+        let mut best: f64 = 0.0;
+        let mut y_bottom = f64::MAX;
+        for _ in 0..4000 {
+            train.step(&course, &Physics::frictionless());
+            if train.v > best {
+                best = train.v;
+                y_bottom = table.position(train.s).y;
+            }
+            if train.v < best - 1.0 {
+                break;
+            }
+        }
+        let expected = (2.0 * G * (y_start - y_bottom)).sqrt();
+        assert!(y_start - y_bottom > 39.5, "drop was {}", y_start - y_bottom);
+        assert!(
+            (best - expected).abs() / expected < 0.005,
+            "bottom speed {best}, expected {expected}"
+        );
+        assert!((expected - 28.01).abs() < 0.3, "expected {expected}");
     }
 
+    // Test 5: friction and drag on a flat straight.
     #[test]
-    fn on_a_closed_loop_up_comes_back_to_where_it_started() {
-        let t = s_bend_loop();
-        // Carry the last arrow back over the closing step: it must meet the first one.
-        let last = t.frame(t.length() - 0.05);
-        let start = t.frame(0.0);
-        let back = carry(last.up, last.forward, start.forward);
-        assert!(angle_deg(back, start.up) < 0.1, "leftover twist too big");
+    fn a_flat_straight_at_20_blocks_a_second_loses_speed_as_worked_out_by_hand() {
+        let course = flat_course();
+        let mut train = Train::free(1, 10.0, 20.0);
+        let start = train.s;
+        while train.s - start < 100.0 {
+            train.step(&course, &Physics::default());
+        }
+        // We may overshoot 100 blocks by up to one tick (1 block): use the exact hand formula
+        // at the distance reached. ds = -v dv / (mu G + k v^2).
+        let (mu_g, k) = (0.015 * G, 0.0015);
+        let d = train.s - start;
+        let v_hand = (((mu_g + k * 400.0) * (-2.0 * k * d).exp() - mu_g) / k).sqrt();
+        assert!((train.v - v_hand).abs() < 0.02, "{} vs {}", train.v, v_hand);
+        // And at exactly 100 blocks the hand formula gives 16.46.
+        let at_100 = (((mu_g + k * 400.0) * (-2.0 * k * 100.0_f64).exp() - mu_g) / k).sqrt();
+        assert!((at_100 - 16.46).abs() < 0.1, "{at_100}");
     }
+
+    // Test 6: a long train over an uneven hill: gentle up, steep down.
+    #[test]
+    fn the_back_car_is_faster_at_the_top_than_the_front_car_was() {
+        // A hill: slope +15 degrees up, then -45 degrees down, rounded at the top.
+        let mut nodes = Vec::new();
+        let (up, down) = (15f64.to_radians().tan(), -(45f64.to_radians().tan()));
+        let mut y = 0.0_f64;
+        let mut x = 0.0_f64;
+        while x < 60.0 {
+            // 5 block rounded crest around x = 30.
+            let w = ((x - 27.5) / 5.0).clamp(0.0, 1.0);
+            let m = up + (down - up) * (w * w * (3.0 - 2.0 * w));
+            nodes.push(DVec3::new(x, y, 0.0));
+            y += m * 1.5;
+            x += 1.5;
+        }
+        // Run-out and return: a loop closing back to the start at a lower level.
+        let end_y = y;
+        for i in 0..24 {
+            let a = (i as f64 / 24.0) * std::f64::consts::PI;
+            nodes.push(DVec3::new(
+                60.0 + 20.0 * a.sin(),
+                end_y,
+                20.0 - 20.0 * a.cos(),
+            ));
+        }
+        // Flat return straight at the lower level, then lift back to the start height.
+        for i in 0..40 {
+            let x = 60.0 - i as f64 * 1.5;
+            let t = i as f64 / 40.0;
+            nodes.push(DVec3::new(x, end_y * (1.0 - t), 40.0));
+        }
+        let _ = nodes.len();
+        let course = Course::bare(Table::new(&Track::closed(&nodes)));
+        let mut train = Train::free(6, 5.0 * CAR_SPACING + 1.0, 14.0);
+
+        // Crest = the highest point of the track.
+        let table = &course.table;
+        let (mut s_top, mut y_top, mut s) = (0.0, f64::MIN, 0.0);
+        while s < table.length() {
+            let y = table.position(s).y;
+            if y > y_top {
+                y_top = y;
+                s_top = s;
+            }
+            s += 0.05;
+        }
+        let mut v_front = None;
+        let mut v_back = None;
+        let back_offset = 5.0 * CAR_SPACING;
+        for _ in 0..2000 {
+            let before = train;
+            train.step(&course, &Physics::default());
+            if v_front.is_none() && before.s < s_top && train.s >= s_top {
+                v_front = Some(train.v);
+            }
+            if v_back.is_none() && before.s - back_offset < s_top && train.s - back_offset >= s_top
+            {
+                v_back = Some(train.v);
+            }
+        }
+        let (front, back) = (v_front.unwrap(), v_back.unwrap());
+        assert!(back > front, "front {front}, back {back}");
+    }
+
+    fn course_with(element: Element, s0: f64, s1: f64) -> Course {
+        let mut course = flat_course();
+        course.placed.push(Placed { s0, s1, element });
+        course
+    }
+
+    // Test 8: the lift.
+    #[test]
+    fn on_the_lift_the_train_never_rolls_back_and_leaves_at_the_chain_speed() {
+        // A track that climbs 30 degrees up the lift, then flat.
+        let mut nodes = Vec::new();
+        for i in 0..60 {
+            let x = i as f64 * 2.0;
+            let climb = (x - 20.0).clamp(0.0, 60.0);
+            nodes.push(DVec3::new(x, climb * 0.5, 0.0));
+        }
+        let top = nodes.last().unwrap().y;
+        for i in 0..24 {
+            let a = (i as f64 / 24.0) * std::f64::consts::PI;
+            nodes.push(DVec3::new(
+                118.0 + 10.0 * a.sin(),
+                top,
+                10.0 - 10.0 * a.cos(),
+            ));
+        }
+        for i in 0..59 {
+            nodes.push(DVec3::new(
+                116.0 - i as f64 * 2.0,
+                top * (1.0 - i as f64 / 59.0),
+                20.0,
+            ));
+        }
+        let table = Table::new(&Track::closed(&nodes));
+        let mut course = Course::bare(table);
+        course.placed.push(Placed {
+            s0: 25.0,
+            s1: 110.0,
+            element: Element::lift(),
+        });
+        // A train stopped at the foot of the lift: the chain takes it.
+        let mut train = Train::free(3, 24.0, 0.0);
+        let mut min_v = f64::MAX;
+        let mut left_at = None;
+        for tick in 0..2000 {
+            train.step(&course, &Physics::default());
+            if train.s > 26.0 && train.s - 2.0 * CAR_SPACING < 110.0 {
+                min_v = min_v.min(train.v);
+            }
+            if train.s - 2.0 * CAR_SPACING >= 111.0 {
+                left_at = Some((tick, train.v));
+                break;
+            }
+        }
+        assert!(min_v >= 5.0 - 1e-9, "min speed on the lift {min_v}");
+        assert!(left_at.is_some(), "never left the lift");
+    }
+
+    // Test 9: the brake.
+    #[test]
+    fn the_train_leaves_the_brake_run_at_the_target_speed() {
+        // A brake run 20 blocks long: enough to slow from 15 to 3 (it needs about 18). Friction
+        // is switched off so the test measures the brake alone: a brake only ever takes speed
+        // away, so on real track the train would keep slowing a little after reaching the target.
+        let course = course_with(Element::brake(), 20.0, 40.0);
+        let mut train = Train::free(1, 5.0, 15.0);
+        let mut guard = 0;
+        while train.s < 40.5 {
+            train.step(&course, &Physics::frictionless());
+            guard += 1;
+            assert!(guard < 2000);
+        }
+        assert!((train.v - 3.0).abs() < 0.1, "left at {}", train.v);
+    }
+
+    // Test 10: the station.
+    #[test]
+    fn the_train_stops_at_the_stop_point_and_holds_for_the_dwell_time() {
+        let mut course = course_with(Element::station(40.0), 28.0, 44.0);
+        // A brake run before it, as in the demo.
+        course.placed.push(Placed {
+            s0: 10.0,
+            s1: 28.0,
+            element: Element::brake(),
+        });
+        let mut train = Train::free(3, 15.0, 9.0);
+        let mut guard = 0;
+        while !train.is_held() {
+            train.step(&course, &Physics::default());
+            guard += 1;
+            assert!(guard < 2000, "never stopped");
+        }
+        assert!((train.s - 40.0).abs() < 0.2, "stopped at {}", train.s);
+        assert_eq!(train.v, 0.0);
+        // It waits for riders...
+        for _ in 0..200 {
+            train.step(&course, &Physics::default());
+        }
+        assert!(train.is_held() && train.s == 40.0);
+        // ...then holds for the whole dwell after the countdown starts.
+        train.start_countdown(5.0);
+        for _ in 0..99 {
+            train.step(&course, &Physics::default());
+            assert!(train.is_held(), "left early");
+        }
+        for _ in 0..3 {
+            train.step(&course, &Physics::default());
+        }
+        assert!(!train.is_held(), "still held after the dwell");
+        // ...and is pushed out at the push speed.
+        for _ in 0..4 {
+            train.step(&course, &Physics::default());
+        }
+        assert!(train.v >= 2.0 - 1e-9 && train.s > 40.0);
+    }
+}
+}
+pub mod sim {
+// Run a whole ride on paper: step a train round a course and write down what happens each tick.
+//
+// The same code is used by tests (does the layout stay within the realism limits?), by
+// `park-sim` (prints the table as CSV) and by the runtime (to see where a car will be a few
+// ticks from now).
+
+use crate::game::htp_park::coaster::elements::Course;
+use crate::game::htp_park::coaster::forces::{self, Felt};
+use crate::game::htp_park::coaster::physics::{MAX_CARS, Physics, Train};
+use crate::game::htp_park::coaster::table::Table;
+
+/// One tick of a simulated ride.
+#[derive(Clone, Copy, Debug)]
+pub struct Sample {
+    /// Seconds since the start.
+    pub t: f64,
+    /// Front car's distance along the lap.
+    pub s: f64,
+    /// Speed, blocks per second.
+    pub v: f64,
+    /// What each car's rider feels (only the first `cars` entries are real).
+    pub felt: [Felt; MAX_CARS],
+    /// How many cars the train has.
+    pub cars: usize,
+}
+
+/// What each car's rider feels right now.
+pub fn felt_all(course: &Course, train: &Train, physics: &Physics) -> [Felt; MAX_CARS] {
+    let mut out = [Felt::default(); MAX_CARS];
+    let positions = train.car_positions();
+    for i in 0..train.cars {
+        out[i] = forces::felt(
+            &course.table,
+            positions[i],
+            train.v,
+            train.a,
+            physics.gravity_scale,
+        );
+    }
+    out
+}
+
+/// Let the train leave the station and go round once, until it is held in the station again
+/// (or `max_seconds` pass). Returns one sample per tick, first sample at t = 0.
+pub fn run_lap(
+    course: &Course,
+    mut train: Train,
+    physics: &Physics,
+    max_seconds: f64,
+) -> Vec<Sample> {
+    let mut out = Vec::new();
+    train.start_countdown(0.0);
+    let mut t = 0.0;
+    let mut left = false;
+    while t < max_seconds {
+        out.push(Sample {
+            t,
+            s: train.s,
+            v: train.v,
+            felt: felt_all(course, &train, physics),
+            cars: train.cars,
+        });
+        train.step(course, physics);
+        t += 0.05;
+        if !train.is_held() {
+            left = true;
+        } else if left {
+            break;
+        }
+    }
+    out
+}
+
+/// The numbers that decide whether a ride feels real (D58), taken over every car of the train.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stats {
+    pub top_speed: f64,
+    /// Slowest speed once the train has left the station.
+    pub slowest_speed: f64,
+    /// Largest vertical g (the valleys).
+    pub max_vertical: f64,
+    /// Smallest vertical g (the airtime hills; negative = out of the seat).
+    pub min_vertical: f64,
+    /// Largest sideways g, ignoring the sign.
+    pub max_lateral: f64,
+    /// Biggest change of vertical g over any one second (D58: at most 3 g per second).
+    pub max_vertical_rate: f64,
+    /// The same measured over a quarter second, scaled to g per second: stricter, for information.
+    pub max_vertical_rate_quarter: f64,
+    /// How long the lap took, seconds.
+    pub seconds: f64,
+}
+
+/// Measure a simulated ride.
+pub fn stats(samples: &[Sample]) -> Stats {
+    let mut st = Stats {
+        slowest_speed: f64::MAX,
+        min_vertical: f64::MAX,
+        max_vertical: f64::MIN,
+        ..Stats::default()
+    };
+    // A second is 20 ticks, a quarter second 5.
+    const WINDOW: usize = 20;
+    const QUARTER: usize = 5;
+    for (k, sample) in samples.iter().enumerate() {
+        st.top_speed = st.top_speed.max(sample.v);
+        if k > 20 && k + 20 < samples.len() {
+            st.slowest_speed = st.slowest_speed.min(sample.v);
+        }
+        for i in 0..sample.cars {
+            let f = sample.felt[i];
+            st.max_vertical = st.max_vertical.max(f.vertical);
+            st.min_vertical = st.min_vertical.min(f.vertical);
+            st.max_lateral = st.max_lateral.max(f.lateral.abs());
+            if k >= WINDOW {
+                let before = samples[k - WINDOW].felt[i].vertical;
+                st.max_vertical_rate = st
+                    .max_vertical_rate
+                    .max((f.vertical - before).abs() / (WINDOW as f64 * 0.05));
+            }
+            if k >= QUARTER {
+                let before = samples[k - QUARTER].felt[i].vertical;
+                st.max_vertical_rate_quarter = st
+                    .max_vertical_rate_quarter
+                    .max((f.vertical - before).abs() / (QUARTER as f64 * 0.05));
+            }
+        }
+    }
+    st.seconds = samples.last().map_or(0.0, |s| s.t);
+    st
+}
+
+/// The sharpest "speed squared times bend" any car meets on one lap (S3, D44): it decides how
+/// often a car display may be moved. Found by one dry lap at build time.
+pub fn worst_speed_sq_curvature(course: &Course, train: &Train, physics: &Physics) -> f64 {
+    let samples = run_lap(course, *train, physics, 300.0);
+    // Re-walk the lap to see where each car was (samples keep only the front car's distance).
+    let mut worst: f64 = 0.0;
+    for sample in &samples {
+        for i in 0..train.cars {
+            let s = sample.s - i as f64 * train.spacing;
+            worst = worst.max(sample.v * sample.v * bend(&course.table, s));
+        }
+    }
+    worst
+}
+
+fn bend(table: &Table, s: f64) -> f64 {
+    forces::curvature(table, s).length()
+}
+
+/// Every airtime dip of the ride: the lowest vertical g (over all cars) in each stretch where it
+/// falls below zero. Dips shallower than -0.02 g are not counted.
+pub fn airtime_dips(samples: &[Sample]) -> Vec<f64> {
+    let mut dips = Vec::new();
+    let mut lowest: Option<f64> = None;
+    for sample in samples {
+        let g = (0..sample.cars)
+            .map(|i| sample.felt[i].vertical)
+            .fold(f64::MAX, f64::min);
+        if g < 0.0 {
+            lowest = Some(lowest.map_or(g, |l| l.min(g)));
+        } else if g > 0.3
+            && let Some(l) = lowest.take()
+            && l < -0.02
+        {
+            dips.push(l);
+        } else if g > 0.3 {
+            lowest = None;
+        }
+    }
+    dips
 }
 }
 pub mod spline {
@@ -425,6 +1906,18 @@ impl Table {
     /// Measure `track` and store a point every `STEP` blocks. The loop is closed: the last
     /// stored point is followed by the first. Returns an empty table for an empty track.
     pub fn new(track: &Track) -> Table {
+        Table::build(track, false)
+    }
+
+    /// Like `new`, but the track is NOT banked: "up" is always as close to the sky as the
+    /// track's direction allows, so a climbing turn does not roll the car sideways. This is
+    /// what M2's track needs (no banking until M5, D24). Only for tracks that never go
+    /// straight up or upside down.
+    pub fn new_level(track: &Track) -> Table {
+        Table::build(track, true)
+    }
+
+    fn build(track: &Track, level: bool) -> Table {
         // 1. Cut every segment into many tiny straight pieces and add up their lengths.
         //    Each entry is (distance so far, point).
         let mut dense: Vec<(f64, DVec3)> = Vec::new();
@@ -481,7 +1974,17 @@ impl Table {
                 (b - a).normalize_or_zero()
             })
             .collect();
-        let ups = compute_ups(&tangents);
+        let ups = if level {
+            tangents
+                .iter()
+                .map(|t| {
+                    let up = (DVec3::Y - *t * t.y).normalize_or_zero();
+                    if up == DVec3::ZERO { DVec3::X } else { up }
+                })
+                .collect()
+        } else {
+            compute_ups(&tangents)
+        };
         Table {
             length: total,
             step,
@@ -609,6 +2112,26 @@ mod tests {
         let t = Table::new(&wobbly_loop());
         let d = t.position(5.0).distance(t.position(5.1));
         assert!((d - 0.1).abs() < 0.01, "got {d}");
+    }
+
+    #[test]
+    fn a_level_table_keeps_up_in_the_vertical_plane_through_a_climbing_turn() {
+        // A spiral that climbs while it turns: a carried-along "up" would roll sideways here.
+        let nodes: Vec<DVec3> = (0..48)
+            .map(|i| {
+                let a = i as f64 / 48.0 * std::f64::consts::TAU;
+                DVec3::new(15.0 * a.cos(), 3.0 * (a * 2.0).sin(), 15.0 * a.sin())
+            })
+            .collect();
+        let t = Table::new_level(&Track::closed(&nodes));
+        let mut s = 0.0;
+        while s < t.length() {
+            let f = t.frame(s);
+            // "right" is flat (no sideways roll) and up leans only forwards or backwards.
+            assert!(f.right.y.abs() < 1e-3, "rolled at s = {s}");
+            assert!(f.up.y > 0.9);
+            s += 0.7;
+        }
     }
 
     #[test]
@@ -772,6 +2295,12 @@ pub fn move_seat(ride: &str, index: usize, pos: DVec3, yaw: f64, pitch: f64) -> 
     )
 }
 
+/// Show `text` on one player's action bar (the line above the hotbar). Used when the game door
+/// has no direct way to do it. `text` must be plain text without quotes or backslashes.
+pub fn action_bar(player_name: &str, text: &str) -> String {
+    format!("title {player_name} actionbar {{\"text\":\"{text}\"}}")
+}
+
 /// Remove everything that carries `tag`.
 pub fn kill_tag(tag: &str) -> String {
     format!("kill @e[tag={tag}]")
@@ -864,6 +2393,14 @@ mod tests {
     }
 
     #[test]
+    fn action_bar_text() {
+        assert_eq!(
+            action_bar("Alex", "Speed: 54 km/h"),
+            "title Alex actionbar {\"text\":\"Speed: 54 km/h\"}"
+        );
+    }
+
+    #[test]
     fn kill_texts() {
         assert_eq!(kill_all(), "kill @e[tag=htp]");
         assert_eq!(kill_ride(DEMO), "kill @e[tag=htp_demo]");
@@ -904,6 +2441,12 @@ pub trait Host {
     fn tell(&mut self, player: u128, text: &str);
     /// A line for the game's log only (nobody sees it in chat). Optional: the default drops it.
     fn log(&mut self, _text: &str) {}
+    /// Show a line on one player's action bar (above the hotbar). Optional: the default says "not
+    /// available" (`false`) and park-core then falls back to the `title ... actionbar` command.
+    /// The glue can later answer this with Horizon's API 21 helper (D43's "extra method" rule).
+    fn action_bar(&mut self, _player: u128, _text: &str) -> bool {
+        false
+    }
 }
 
 /// A pretend game for tests: it records every call, in order.
@@ -921,6 +2464,8 @@ pub struct FakeHost {
     pub tells: Vec<(u128, String)>,
     /// Every log line.
     pub logs: Vec<String>,
+    /// Every action-bar line, as (player, text).
+    pub action_bars: Vec<(u128, String)>,
 }
 
 impl FakeHost {
@@ -958,6 +2503,11 @@ impl Host for FakeHost {
 
     fn log(&mut self, text: &str) {
         self.logs.push(text.to_string());
+    }
+
+    fn action_bar(&mut self, player: u128, text: &str) -> bool {
+        self.action_bars.push((player, text.to_string()));
+        true
     }
 }
 
@@ -1166,10 +2716,15 @@ pub fn rider_point(seat: DVec3) -> DVec3 {
 /// tightest curve at `speed` (blocks per second). A straight chord of length L on a curve of
 /// radius R sags about L² / (8R).
 pub fn teleport_ticks(table: &Table, speed: f64) -> u32 {
-    let curvature = table.max_curvature();
+    teleport_ticks_for(speed * speed * table.max_curvature())
+}
+
+/// The same choice from the lap's worst `speed² × bend` (S3): a chord of `v · 0.05 · k` blocks on a
+/// bend of curvature `c` sags about `chord² · c / 8`.
+pub fn teleport_ticks_for(worst_speed_sq_curvature: f64) -> u32 {
     for k in (1..=MAX_TELEPORT_TICKS).rev() {
-        let chord = speed * TICK_SECONDS * k as f64;
-        if chord * chord * curvature / 8.0 <= MAX_GLIDE_SAG {
+        let kt = TICK_SECONDS * k as f64;
+        if kt * kt * worst_speed_sq_curvature / 8.0 <= MAX_GLIDE_SAG {
             return k;
         }
     }
@@ -1179,7 +2734,7 @@ pub fn teleport_ticks(table: &Table, speed: f64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::htp_park::coaster::demo::{self, demo_nodes};
+    use crate::game::htp_park::coaster::oval::{self, demo_nodes};
     use crate::game::htp_park::coaster::spline::Track;
 
     fn oval() -> Table {
@@ -1273,7 +2828,7 @@ mod tests {
         // A very slow train can use the longest gap, a very fast one must update every tick.
         assert_eq!(teleport_ticks(&oval(), 1.0), 5);
         assert_eq!(teleport_ticks(&oval(), 200.0), 1);
-        let _ = demo::SPEED;
+        let _ = oval::SPEED;
     }
 
     #[test]
@@ -1289,18 +2844,19 @@ pub mod runtime {
 // The game calls `Runtime::tick` once per server tick. A tick does, in order:
 //   1. say hello (once per world) and clean up leftovers from an earlier session;
 //   2. carry out orders typed by players (`/coaster demo`, `/coaster remove`);
-//   3. send the next batch of "build" commands (rails, car, seats);
-//   4. see who sits in which seat, then move the train;
-//   5. move the car (every few ticks) and the seats (every tick).
+//   3. send the next batch of "build" commands (rails, cars, seats);
+//   4. see who sits in which seat, run the station countdown, and let the physics move the train;
+//   5. move the cars (every few ticks), the seats (every tick) and show riders their speed.
 //
 // It never touches the game directly: it asks a `Host` (see `host.rs`) to run command text
 // from `commands.rs`. So all of this is checked by `cargo test` with a `FakeHost`.
 
-use crate::game::htp_park::coaster::demo::{self, demo_nodes};
-use crate::game::htp_park::coaster::spline::Track;
-use crate::game::htp_park::coaster::table::Table;
+use crate::game::htp_park::coaster::demo;
+use crate::game::htp_park::coaster::elements::{Course, DWELL};
+use crate::game::htp_park::coaster::physics::{Physics, Train};
+use crate::game::htp_park::coaster::sim;
 use crate::game::htp_park::commands;
-use crate::game::htp_park::host::Host;
+use crate::game::htp_park::host::{Host, PlayerInfo};
 use crate::game::htp_park::render;
 use crate::game::htp_park::welcome::Welcome;
 use glam::DVec3;
@@ -1319,14 +2875,20 @@ pub const RIDER_ON_DISTANCE: f64 = 1.0;
 /// A rider is "off" when nobody is within this distance of the rider point (D49, spike R7).
 pub const RIDER_OFF_DISTANCE: f64 = 2.0;
 
-/// The demo oval's middle is this far east of the player (3 blocks of space + half its length).
-const DEMO_EAST: f64 = 3.0 + demo::STRAIGHT / 2.0 + demo::RADIUS;
-/// The oval's long side runs east-west: Minecraft's yaw -90 looks towards +X (D52).
-const DEMO_YAW: f64 = -90.0;
+/// The station's nearest end is 3 blocks east of the player (D52). The demo's first point is the
+/// station's EAST end (the train runs west through it), so it is placed one station length
+/// further east.
+const DEMO_EAST: f64 = 3.0 + demo::STATION_LENGTH;
 /// The rails float this high above the player's feet (D47).
 const DEMO_HEIGHT: f64 = 3.0;
 /// Seats per car in the demo (D49).
-const SEATS: usize = 2;
+const SEATS_PER_CAR: usize = 2;
+/// Cars in the demo train (D55).
+const CARS: usize = demo::CARS;
+/// Seats in the whole train.
+const SEATS: usize = CARS * SEATS_PER_CAR;
+/// Riders see their speed (or the station countdown) every this many ticks (D57).
+const ACTION_BAR_EVERY: u32 = 5;
 
 /// Who typed a command, and where they stand and look.
 #[derive(Clone, Debug, PartialEq)]
@@ -1345,17 +2907,20 @@ enum Order {
 /// The one demo ride that exists in the world.
 #[derive(Clone, Debug)]
 struct Demo {
-    table: Table,
-    /// Ticks between car moves (D44).
-    k: u32,
-    /// Distance of the car's middle along the track.
-    s: f64,
-    /// True while the train is going round.
-    moving: bool,
-    /// Ticks since the train last started or the car was last sent.
+    course: Course,
+    physics: Physics,
+    train: Train,
+    /// Ticks between moves of each car (D44), worked out once from a dry lap (S3).
+    k: [u32; CARS],
+    /// Ticks since the train last left the station (a car is sent when this divides by its `k`).
     phase: u32,
-    /// Is somebody sitting in each seat?
+    /// Was the train standing in the station at the end of the last tick?
+    was_held: bool,
+    /// Counts ticks for the action bar.
+    bar_clock: u32,
+    /// Is somebody sitting in each seat, and who?
     occupied: [bool; SEATS],
+    rider: [Option<u128>; SEATS],
     /// Where each seat was sent last (so we can tell who sits there).
     seat_pos: [DVec3; SEATS],
 }
@@ -1376,6 +2941,13 @@ impl Default for Runtime {
     fn default() -> Self {
         Runtime::new()
     }
+}
+
+/// The pose of seat `index` (0 .. SEATS) when the train's front car is at `front`.
+fn seat_pose_at(course: &Course, train: &Train, front: f64, index: usize) -> render::Pose {
+    let car = index / SEATS_PER_CAR;
+    let car_s = front - car as f64 * train.spacing;
+    render::seat_pose(&course.table, car_s, index % SEATS_PER_CAR)
 }
 
 impl Runtime {
@@ -1457,8 +3029,9 @@ impl Runtime {
             }
         }
 
-        // Build commands first, keeping room for this tick's moves.
-        let room = MAX_COMMANDS_PER_TICK - (SEATS + 1);
+        // Build commands first, keeping room for this tick's moves (every seat and every car)
+        // and the action-bar fallbacks (at most one per seat).
+        let room = MAX_COMMANDS_PER_TICK - (SEATS + CARS + SEATS);
         for _ in 0..room.min(self.build_queue.len()) {
             if let Some(command) = self.build_queue.pop_front() {
                 host.run(&command);
@@ -1474,13 +3047,19 @@ impl Runtime {
         self.build_queue.clear();
 
         // East of the player (+X), so the mod never has to read which way they look (D52).
-        let center = caller.pos + DVec3::new(DEMO_EAST, DEMO_HEIGHT, 0.0);
-        let table = Table::new(&Track::closed(&demo_nodes(center, DEMO_YAW)));
-        let k = render::teleport_ticks(&table, demo::SPEED);
+        let origin = caller.pos + DVec3::new(DEMO_EAST, DEMO_HEIGHT, 0.0);
+        let course = demo::demo_course(origin);
+        let physics = Physics::default();
+        let stop = course.station().map_or(0.0, |(_, stop, _)| stop);
+        let train = Train::held(CARS, stop);
 
-        // Rails, then the car, then the seats.
-        for piece in render::rail_pieces(&table) {
-            let pose = render::rail_pose(&table, piece);
+        // S3: how often a car may be moved comes from one dry lap (the sharpest speed² × bend).
+        let worst = sim::worst_speed_sq_curvature(&course, &train, &physics);
+        let k = render::teleport_ticks_for(worst);
+
+        // Rails, then the cars, then the seats.
+        for piece in render::rail_pieces(&course.table) {
+            let pose = render::rail_pose(&course.table, piece);
             self.build_queue.push_back(commands::summon_rail(
                 commands::DEMO,
                 pose.pos,
@@ -1488,42 +3067,46 @@ impl Runtime {
                 pose.scale,
             ));
         }
-        let car = render::car_pose(&table, 0.0);
-        self.build_queue.push_back(commands::summon_car(
-            commands::DEMO,
-            0,
-            car.pos,
-            car.yaw,
-            car.pitch,
-            k,
-            render::CAR_SCALE,
-        ));
+        for car in 0..CARS {
+            let pose = render::car_pose(&course.table, stop - car as f64 * train.spacing);
+            self.build_queue.push_back(commands::summon_car(
+                commands::DEMO,
+                car,
+                pose.pos,
+                pose.yaw,
+                pose.pitch,
+                k,
+                render::CAR_SCALE,
+            ));
+        }
         let mut seat_pos = [DVec3::ZERO; SEATS];
         for (i, slot) in seat_pos.iter_mut().enumerate() {
-            let pose = render::seat_pose(&table, 0.0, i);
+            let pose = seat_pose_at(&course, &train, stop, i);
             *slot = pose.pos;
             self.build_queue
                 .extend(commands::summon_seat(commands::DEMO, i, pose.pos));
         }
 
         self.demo = Some(Demo {
-            table,
-            k,
-            s: 0.0,
-            moving: false,
+            course,
+            physics,
+            train,
+            k: [k; CARS],
             phase: 0,
+            was_held: true,
+            bar_clock: 0,
             occupied: [false; SEATS],
+            rider: [None; SEATS],
             seat_pos,
         });
     }
 
-    /// Steps 4 and 5 of the tick: who sits where, the train, the car and the seats.
-    fn move_train<H: Host>(&mut self, host: &mut H, players: &[crate::game::htp_park::host::PlayerInfo]) {
+    /// Steps 4 and 5 of the tick: who sits where, the station, the physics, the cars and seats.
+    fn move_train<H: Host>(&mut self, host: &mut H, players: &[PlayerInfo]) {
         let Some(demo) = self.demo.as_mut() else {
             return;
         };
-        let length = demo.table.length();
-        if length <= 0.0 {
+        if demo.course.table.is_empty() {
             return;
         }
 
@@ -1532,16 +3115,13 @@ impl Runtime {
             let point = render::rider_point(demo.seat_pos[i]);
             let nearest = players
                 .iter()
-                .map(|p| p.pos.distance(point))
-                .fold(f64::INFINITY, f64::min);
-            if nearest <= RIDER_ON_DISTANCE {
-                if !demo.occupied[i] {
-                    // Once per boarding: write down where the rider really is, so the heights can
-                    // be checked in the log (D49: the cart's fall may move them).
-                    if let Some(p) = players
-                        .iter()
-                        .min_by(|a, b| a.pos.distance(point).total_cmp(&b.pos.distance(point)))
-                    {
+                .min_by(|a, b| a.pos.distance(point).total_cmp(&b.pos.distance(point)));
+            let distance = nearest.map_or(f64::INFINITY, |p| p.pos.distance(point));
+            if distance <= RIDER_ON_DISTANCE {
+                if let Some(p) = nearest {
+                    if !demo.occupied[i] {
+                        // Once per boarding: write down where the rider really is, so the heights
+                        // can be checked in the log (D49: the cart's fall may move them).
                         let d = p.pos - demo.seat_pos[i];
                         host.log(&format!(
                             "Horizon Theme Park: seat {i} boarded, rider minus seat = {} {} {}",
@@ -1550,60 +3130,66 @@ impl Runtime {
                             commands::num(d.z)
                         ));
                     }
+                    demo.rider[i] = Some(p.uuid);
                 }
                 demo.occupied[i] = true;
-            } else if nearest > RIDER_OFF_DISTANCE {
+            } else if distance > RIDER_OFF_DISTANCE {
                 demo.occupied[i] = false;
+                demo.rider[i] = None;
             }
         }
         let anyone = demo.occupied.iter().any(|&o| o);
 
-        // The train waits at the start while empty, runs while anyone rides, and when the last
-        // rider is off it finishes the lap and stops at the start (D49).
-        let step = demo::SPEED * render::TICK_SECONDS;
-        let mut stopped_now = false;
-        if anyone && !demo.moving {
-            demo.moving = true;
-            demo.phase = 0;
-        }
-        if demo.moving {
-            demo.s += step;
-            if demo.s >= length && !anyone {
-                demo.s = 0.0;
-                demo.moving = false;
-                stopped_now = true;
-            } else if demo.s >= length {
-                demo.s -= length;
+        // The station (D56): the countdown starts when someone sits, and stops if everyone leaves.
+        // With nobody aboard the train waits.
+        if demo.train.is_held() {
+            if anyone {
+                demo.train.start_countdown(DWELL);
+            } else {
+                demo.train.cancel_countdown();
             }
         }
 
-        // The car glides for `k` ticks to where it will be `k` ticks later, so it is sent every
-        // `k` ticks. When the train is about to stop it is aimed at the start, not past it.
-        let car_due = (demo.moving && demo.phase % demo.k == 0) || stopped_now;
-        if car_due {
-            let aim = if stopped_now {
-                length
-            } else if anyone {
-                demo.s + step * demo.k as f64
-            } else {
-                (demo.s + step * demo.k as f64).min(length)
-            };
-            let pose = render::car_pose(&demo.table, aim);
+        // The physics: one tick (ten substeps).
+        demo.train.step(&demo.course, &demo.physics);
+        let held = demo.train.is_held();
+        if demo.was_held && !held {
+            demo.phase = 0; // just left the station
+        }
+        let arrived = !demo.was_held && held;
+
+        // Each car glides for `k` ticks to where it WILL be `k` ticks later (D32, D44), so it is
+        // sent every `k` ticks. Physics is exactly repeatable (D12), so "where it will be" comes
+        // from running a copy of the train `k` ticks forward. On arrival it is sent where it stands.
+        for car in 0..CARS {
+            let due = (!held && demo.phase % demo.k[car] == 0) || arrived;
+            if !due {
+                continue;
+            }
+            let mut ahead = demo.train;
+            if !arrived {
+                for _ in 0..demo.k[car] {
+                    ahead.step(&demo.course, &demo.physics);
+                }
+            }
+            let car_s = ahead.s - car as f64 * ahead.spacing;
+            let pose = render::car_pose(&demo.course.table, car_s);
             host.run(&commands::move_car(
                 commands::DEMO,
-                0,
+                car,
                 pose.pos,
                 pose.yaw,
                 pose.pitch,
             ));
         }
-        if demo.moving {
+        if !held {
             demo.phase += 1;
         }
+        demo.was_held = held;
 
         // Seats are moved every tick, ridden or not, so an empty minecart never falls or drifts.
         for i in 0..SEATS {
-            let pose = render::seat_pose(&demo.table, demo.s, i);
+            let pose = seat_pose_at(&demo.course, &demo.train, demo.train.s, i);
             demo.seat_pos[i] = pose.pos;
             host.run(&commands::move_seat(
                 commands::DEMO,
@@ -1613,6 +3199,28 @@ impl Runtime {
                 pose.pitch,
             ));
         }
+
+        // Riders (and only riders) see the speed, or the station countdown, four times a second.
+        demo.bar_clock += 1;
+        if demo.bar_clock % ACTION_BAR_EVERY == 0 {
+            let text = match demo.train.countdown() {
+                Some(left) => format!("Leaving in {} s", left.ceil() as i64),
+                None if held => "Waiting for riders".to_string(),
+                None => format!("Speed: {} km/h", (demo.train.v * 3.6).round() as i64),
+            };
+            let mut shown: Vec<u128> = Vec::new();
+            for uuid in demo.rider.iter().flatten() {
+                if shown.contains(uuid) {
+                    continue;
+                }
+                shown.push(*uuid);
+                if !host.action_bar(*uuid, &text)
+                    && let Some(p) = players.iter().find(|p| p.uuid == *uuid)
+                {
+                    host.run(&commands::action_bar(&p.name, &text));
+                }
+            }
+        }
     }
 }
 
@@ -1621,13 +3229,17 @@ mod tests {
     use super::*;
     use crate::game::htp_park::host::{FakeHost, PlayerInfo};
 
-    fn player(pos: DVec3) -> PlayerInfo {
+    fn player(uuid: u128, pos: DVec3) -> PlayerInfo {
         PlayerInfo {
-            uuid: 1,
-            name: "Alex".to_string(),
+            uuid,
+            name: format!("Player{uuid}"),
             pos,
             dimension: "minecraft:overworld".to_string(),
         }
+    }
+
+    fn far_away() -> DVec3 {
+        DVec3::new(500.0, 70.0, 500.0)
     }
 
     fn caller() -> Caller {
@@ -1637,16 +3249,22 @@ mod tests {
         }
     }
 
-    /// A runtime with a built demo, one player far away, and the build commands already sent.
+    /// A runtime with a built demo, one player far away, and all build commands already sent.
     fn built() -> (Runtime, FakeHost) {
         let mut rt = Runtime::new();
         let mut host = FakeHost::new();
-        host.players.push(player(DVec3::new(500.0, 70.0, 500.0)));
+        host.players.push(player(1, far_away()));
         rt.tick(&mut host); // greeting + cleanup
         rt.command("coaster demo", caller());
-        rt.tick(&mut host);
+        while rt.demo.is_none() || !rt.build_queue.is_empty() {
+            rt.tick(&mut host);
+        }
         host.take_commands();
         (rt, host)
+    }
+
+    fn demo(rt: &Runtime) -> &Demo {
+        rt.demo.as_ref().unwrap()
     }
 
     fn seat_move_count(commands: &[String]) -> usize {
@@ -1656,10 +3274,22 @@ mod tests {
             .count()
     }
 
-    /// Put the player exactly where seat 0's rider sits.
+    fn car_moves(commands: &[String]) -> Vec<&String> {
+        commands
+            .iter()
+            .filter(|c| c.starts_with("tp @e[tag=htp_car_demo_"))
+            .collect()
+    }
+
+    /// Put player 0 exactly where seat 0's rider sits.
     fn sit_in_seat_zero(rt: &Runtime, host: &mut FakeHost) {
-        let point = render::rider_point(rt.demo.as_ref().unwrap().seat_pos[0]);
-        host.players[0].pos = point;
+        host.players[0].pos = render::rider_point(demo(rt).seat_pos[0]);
+    }
+
+    /// Tick with the player riding along in seat 0.
+    fn ride_tick(rt: &mut Runtime, host: &mut FakeHost) {
+        rt.tick(host);
+        sit_in_seat_zero(rt, host);
     }
 
     #[test]
@@ -1668,7 +3298,7 @@ mod tests {
         let mut host = FakeHost::new();
         rt.tick(&mut host); // nobody here: silence
         assert!(host.broadcasts.is_empty() && host.commands.is_empty());
-        host.players.push(player(DVec3::ZERO));
+        host.players.push(player(1, DVec3::ZERO));
         rt.tick(&mut host);
         rt.tick(&mut host);
         assert_eq!(host.broadcasts, vec!["Horizon Theme Park loaded"]);
@@ -1685,11 +3315,12 @@ mod tests {
         assert_eq!(host.commands, vec!["kill @e[tag=htp]"]);
     }
 
+    // Test 16: several cars.
     #[test]
-    fn demo_builds_rails_then_the_car_then_the_seats() {
+    fn demo_builds_rails_then_three_cars_then_six_seats() {
         let mut rt = Runtime::new();
         let mut host = FakeHost::new();
-        host.players.push(player(DVec3::new(500.0, 70.0, 500.0)));
+        host.players.push(player(1, far_away()));
         rt.tick(&mut host);
         host.take_commands();
 
@@ -1702,43 +3333,58 @@ mod tests {
             host.commands.is_empty(),
             "nothing runs inside the command hook"
         );
-        rt.tick(&mut host);
+        let mut per_tick = Vec::new();
+        for _ in 0..8 {
+            rt.tick(&mut host);
+            per_tick.push(host.take_commands());
+        }
+        assert!(per_tick.iter().all(|t| t.len() <= MAX_COMMANDS_PER_TICK));
+        let all: Vec<&String> = per_tick.iter().flatten().collect();
 
-        let cmds = &host.commands;
-        assert!(cmds.len() <= MAX_COMMANDS_PER_TICK);
-        assert_eq!(cmds[0], "kill @e[tag=htp_demo]");
-        let rails = cmds.iter().take_while(|c| !c.contains("htp:car")).count() - 1;
-        assert!(rails >= 15, "only {rails} rail pieces");
-        assert!(cmds[1..=rails].iter().all(|c| c.contains("htp:rail")));
-        assert!(
-            cmds[rails + 1].contains("\"htp_car_demo_0\"")
-                && cmds[rails + 1].contains("teleport_duration:")
-        );
-        assert!(
-            cmds[rails + 2].starts_with("summon minecraft:minecart")
-                && cmds[rails + 2].contains("htp_seat_demo_0")
-        );
-        assert!(
-            cmds[rails + 3].starts_with("summon minecraft:minecart")
-                && cmds[rails + 3].contains("htp_seat_demo_1")
-        );
-        // Then this tick's two seat moves (the train waits, so no car move).
-        assert_eq!(cmds.len(), rails + 4 + 2);
-        assert_eq!(seat_move_count(&cmds[rails + 4..]), 2);
+        assert_eq!(all[0], "kill @e[tag=htp_demo]");
+        let summons: Vec<&&String> = all.iter().filter(|c| c.starts_with("summon")).collect();
+        let rails = summons.iter().filter(|c| c.contains("htp:rail")).count();
+        assert!(rails >= 100, "only {rails} rail pieces");
+        // Rails first, then one car per car, then one minecart per seat.
+        assert!(summons[..rails].iter().all(|c| c.contains("htp:rail")));
+        for car in 0..CARS {
+            assert!(
+                summons[rails + car].contains(&format!("\"htp_car_demo_{car}\""))
+                    && summons[rails + car].contains("teleport_duration:")
+            );
+        }
+        for seat in 0..SEATS {
+            let c = summons[rails + CARS + seat];
+            assert!(
+                c.starts_with("summon minecraft:minecart")
+                    && c.contains(&format!("htp_seat_demo_{seat}"))
+            );
+        }
+        assert_eq!(summons.len(), rails + CARS + SEATS);
     }
 
     #[test]
-    fn the_rails_are_placed_to_the_east_of_the_player_and_above_their_feet() {
+    fn the_station_is_three_blocks_east_of_the_player_and_the_rails_float_above_their_feet() {
         let (rt, _) = built();
-        let table = &rt.demo.as_ref().unwrap().table;
-        // The player stands at (0, 70, 0). The oval spans x from 3 to 26 (3 blocks of space, then
-        // 23 blocks long), is 12 wide in z, and floats 3 blocks up.
+        let table = &demo(&rt).course.table;
+        // The player stands at (0, 70, 0). The station's near end is 3 blocks east.
+        let (station, stop, _) = demo(&rt).course.station().unwrap();
+        let near = table
+            .position(station.s1)
+            .x
+            .min(table.position(station.s0).x);
+        assert!((near - 3.0).abs() < 0.3, "station near end at x {near}");
+        let at_stop = table.position(stop);
+        assert!(
+            (at_stop.y - 73.0).abs() < 0.01,
+            "the station is 3 up: {}",
+            at_stop.y
+        );
+        assert!(at_stop.z.abs() < 0.01);
+        // Nothing dips into the ground (valley bottoms stay at least 0.5 block above the player's feet).
         let mut s = 0.0;
         while s < table.length() {
-            let p = table.position(s);
-            assert!((p.y - 73.0).abs() < 1e-9);
-            assert!(p.x > 2.9 && p.x < 26.1, "x {}", p.x);
-            assert!(p.z.abs() < 6.1, "z {}", p.z);
+            assert!(table.position(s).y > 70.5, "low at s = {s}");
             s += 0.5;
         }
     }
@@ -1747,7 +3393,7 @@ mod tests {
     fn never_more_than_400_commands_a_tick() {
         let mut rt = Runtime::new();
         let mut host = FakeHost::new();
-        host.players.push(player(DVec3::new(500.0, 70.0, 500.0)));
+        host.players.push(player(1, far_away()));
         rt.tick(&mut host);
         host.take_commands();
         for i in 0..1000 {
@@ -1764,94 +3410,203 @@ mod tests {
         assert!(rt.build_queue.is_empty());
     }
 
+    // Test 15: station flow.
     #[test]
-    fn with_a_rider_every_tick_moves_both_seats_and_car_ticks_send_the_car_first() {
+    fn the_train_waits_while_empty_and_nobody_gets_a_countdown() {
         let (mut rt, mut host) = built();
-        let k = rt.demo.as_ref().unwrap().k;
-        assert!((1..=render::MAX_TELEPORT_TICKS).contains(&k));
-        sit_in_seat_zero(&rt, &mut host);
-
-        for tick in 0..7u32 {
+        for _ in 0..200 {
             rt.tick(&mut host);
             let cmds = host.take_commands();
-            assert_eq!(seat_move_count(&cmds), 2, "tick {tick}");
-            if tick % k == 0 {
-                assert!(
-                    cmds[0].starts_with("tp @e[tag=htp_car_demo_0,limit=1]"),
-                    "tick {tick}"
-                );
-                assert_eq!(cmds.len(), 3);
-            } else {
-                assert_eq!(cmds.len(), 2, "tick {tick}");
-            }
-            sit_in_seat_zero(&rt, &mut host); // the rider goes along with the seat
+            assert_eq!(cmds.len(), SEATS, "only the seat moves");
         }
+        let d = demo(&rt);
+        assert!(d.train.is_held() && d.train.countdown().is_none());
+        assert!(host.action_bars.is_empty());
     }
 
     #[test]
-    fn the_car_is_aimed_k_ticks_ahead_of_the_train() {
+    fn the_countdown_starts_when_someone_sits_and_the_train_leaves_after_five_seconds() {
         let (mut rt, mut host) = built();
         sit_in_seat_zero(&rt, &mut host);
         rt.tick(&mut host);
-        let cmds = host.take_commands();
-        // After the first step the train is one step along; the car glides to where it will be
-        // k ticks later.
-        let table = rt.demo.as_ref().unwrap().table.clone();
-        let k = rt.demo.as_ref().unwrap().k as f64;
-        let step = demo::SPEED * render::TICK_SECONDS;
-        let want = render::car_pose(&table, step + step * k);
-        assert_eq!(
-            cmds[0],
-            commands::move_car(commands::DEMO, 0, want.pos, want.yaw, want.pitch)
+        assert!(demo(&rt).train.countdown().is_some());
+        let mut ticks = 1;
+        while demo(&rt).train.is_held() {
+            ride_tick(&mut rt, &mut host);
+            ticks += 1;
+            assert!(ticks < 300, "never left");
+        }
+        // 5 s is 100 ticks (the countdown starts in the first tick).
+        assert!((99..=102).contains(&ticks), "left after {ticks} ticks");
+    }
+
+    #[test]
+    fn leaving_the_seat_during_the_countdown_cancels_it() {
+        let (mut rt, mut host) = built();
+        sit_in_seat_zero(&rt, &mut host);
+        for _ in 0..30 {
+            ride_tick(&mut rt, &mut host);
+        }
+        assert!(demo(&rt).train.countdown().is_some());
+        host.players[0].pos = far_away();
+        rt.tick(&mut host);
+        assert!(demo(&rt).train.is_held());
+        assert!(demo(&rt).train.countdown().is_none());
+    }
+
+    // Test 13: cars aimed k ticks ahead by running the physics forward.
+    #[test]
+    fn a_cars_move_goes_to_where_the_physics_puts_it_k_ticks_later() {
+        let (mut rt, mut host) = built();
+        sit_in_seat_zero(&rt, &mut host);
+        for _ in 0..140 {
+            ride_tick(&mut rt, &mut host);
+            host.take_commands();
+        }
+        // Moving now. Find the next tick on which car 0 is sent.
+        for _ in 0..20 {
+            ride_tick(&mut rt, &mut host);
+            let cmds = host.take_commands();
+            let sent = car_moves(&cmds);
+            if let Some(first) = sent.first().filter(|c| c.contains("htp_car_demo_0,")) {
+                let d = demo(&rt);
+                let mut ahead = d.train;
+                for _ in 0..d.k[0] {
+                    ahead.step(&d.course, &d.physics);
+                }
+                let want = render::car_pose(&d.course.table, ahead.s);
+                assert_eq!(
+                    **first,
+                    commands::move_car(commands::DEMO, 0, want.pos, want.yaw, want.pitch)
+                );
+                assert!(
+                    d.k.iter()
+                        .all(|k| (1..=render::MAX_TELEPORT_TICKS).contains(k))
+                );
+                return;
+            }
+        }
+        panic!("car 0 was never sent");
+    }
+
+    #[test]
+    fn every_seat_moves_every_tick_and_the_commands_stay_under_the_limit() {
+        let (mut rt, mut host) = built();
+        sit_in_seat_zero(&rt, &mut host);
+        for tick in 0..260 {
+            ride_tick(&mut rt, &mut host);
+            let cmds = host.take_commands();
+            assert_eq!(seat_move_count(&cmds), SEATS, "tick {tick}");
+            assert!(cmds.len() <= MAX_COMMANDS_PER_TICK);
+        }
+        assert!(!demo(&rt).train.is_held(), "it should be on its way by now");
+    }
+
+    // Test 14: the action bar.
+    #[test]
+    fn riders_and_only_riders_see_the_countdown_and_then_their_speed() {
+        let (mut rt, mut host) = built();
+        host.players.push(player(2, far_away())); // a bystander
+        sit_in_seat_zero(&rt, &mut host);
+        for _ in 0..400 {
+            ride_tick(&mut rt, &mut host);
+        }
+        assert!(!host.action_bars.is_empty());
+        assert!(
+            host.action_bars.iter().all(|(who, _)| *who == 1),
+            "only the rider gets lines: {:?}",
+            host.action_bars
+        );
+        assert!(
+            host.action_bars
+                .iter()
+                .any(|(_, t)| t.starts_with("Leaving in "))
+        );
+        let speeds: Vec<&String> = host
+            .action_bars
+            .iter()
+            .map(|(_, t)| t)
+            .filter(|t| t.starts_with("Speed: "))
+            .collect();
+        assert!(!speeds.is_empty());
+        assert!(speeds.iter().all(|t| t.ends_with(" km/h")));
+        // Every 5 ticks: 400 ticks give about 80 lines.
+        assert!(
+            (78..=81).contains(&host.action_bars.len()),
+            "{}",
+            host.action_bars.len()
         );
     }
 
     #[test]
-    fn the_train_waits_while_empty() {
-        let (mut rt, mut host) = built();
-        for _ in 0..40 {
-            rt.tick(&mut host);
-            let cmds = host.take_commands();
-            assert_eq!(cmds.len(), 2, "only the two seat moves");
+    fn without_a_host_action_bar_the_title_command_is_used() {
+        // A host that does not know action bars (the real glue, for now) gets the command text.
+        struct Plain(FakeHost);
+        impl Host for Plain {
+            fn players(&self) -> Vec<PlayerInfo> {
+                self.0.players()
+            }
+            fn run(&mut self, command: &str) -> bool {
+                self.0.run(command)
+            }
+            fn broadcast(&mut self, text: &str) {
+                self.0.broadcast(text)
+            }
+            fn tell(&mut self, player: u128, text: &str) {
+                self.0.tell(player, text)
+            }
         }
-        let demo = rt.demo.as_ref().unwrap();
-        assert_eq!(demo.s, 0.0);
-        assert!(!demo.moving);
+        let (mut rt, host) = built();
+        let mut plain = Plain(host);
+        plain.0.players[0].pos = render::rider_point(demo(&rt).seat_pos[0]);
+        for _ in 0..10 {
+            rt.tick(&mut plain);
+            plain.0.players[0].pos = render::rider_point(demo(&rt).seat_pos[0]);
+        }
+        assert!(
+            plain
+                .0
+                .commands
+                .iter()
+                .any(|c| c.starts_with("title Player1 actionbar {\"text\":\"Leaving in"))
+        );
     }
 
     #[test]
-    fn a_player_between_the_two_distances_changes_nothing() {
+    fn a_rider_who_stays_aboard_goes_a_whole_lap_and_the_train_stops_in_the_station_again() {
         let (mut rt, mut host) = built();
-        // Standing 1.5 blocks from the rider point: not close enough to count as sitting.
-        host.players[0].pos =
-            render::rider_point(rt.demo.as_ref().unwrap().seat_pos[0]) + DVec3::X * 1.5;
-        rt.tick(&mut host);
-        assert!(!rt.demo.as_ref().unwrap().occupied[0]);
-        // Sitting, then stepping 1 block away: still counts as sitting.
         sit_in_seat_zero(&rt, &mut host);
-        rt.tick(&mut host);
-        assert!(rt.demo.as_ref().unwrap().occupied[0]);
-        host.players[0].pos += DVec3::X * 1.0;
-        rt.tick(&mut host);
-        assert!(rt.demo.as_ref().unwrap().occupied[0]);
-        // Walking right away (more than 2 blocks): off.
-        host.players[0].pos = DVec3::new(500.0, 70.0, 500.0);
-        rt.tick(&mut host);
-        assert!(!rt.demo.as_ref().unwrap().occupied[0]);
+        let mut left = false;
+        for tick in 0..1500 {
+            ride_tick(&mut rt, &mut host);
+            let held = demo(&rt).train.is_held();
+            if !held {
+                left = true;
+            }
+            if left && held {
+                // Back in the station at the stop point.
+                let d = demo(&rt);
+                let stop = d.course.station().unwrap().1;
+                assert!((d.train.s - stop).abs() < 0.2);
+                assert!(tick > 400, "lap took only {tick} ticks");
+                return;
+            }
+        }
+        panic!("the lap never ended");
     }
 
     #[test]
     fn boarding_is_logged_once_with_the_measured_offset_and_a_loose_fit_still_counts() {
         let (mut rt, mut host) = built();
         // A rider hanging 0.9 block off the expected spot still counts as sitting.
-        let seat = rt.demo.as_ref().unwrap().seat_pos[0];
+        let seat = demo(&rt).seat_pos[0];
         host.players[0].pos = render::rider_point(seat) + DVec3::new(0.0, -0.9, 0.0);
         for _ in 0..5 {
             rt.tick(&mut host);
-            host.players[0].pos = render::rider_point(rt.demo.as_ref().unwrap().seat_pos[0])
-                + DVec3::new(0.0, -0.9, 0.0);
+            host.players[0].pos =
+                render::rider_point(demo(&rt).seat_pos[0]) + DVec3::new(0.0, -0.9, 0.0);
         }
-        assert!(rt.demo.as_ref().unwrap().moving);
+        assert!(demo(&rt).occupied[0]);
         assert_eq!(host.logs.len(), 1, "{:?}", host.logs);
         assert_eq!(
             host.logs[0],
@@ -1860,47 +3615,23 @@ mod tests {
     }
 
     #[test]
-    fn when_the_rider_gets_off_the_train_finishes_the_lap_and_stops_at_the_start() {
+    fn a_player_between_the_two_distances_changes_nothing() {
         let (mut rt, mut host) = built();
-        sit_in_seat_zero(&rt, &mut host);
-        for _ in 0..10 {
-            rt.tick(&mut host);
-            sit_in_seat_zero(&rt, &mut host);
-        }
-        assert!(rt.demo.as_ref().unwrap().moving);
-        host.take_commands();
-
-        // The rider leaves.
-        host.players[0].pos = DVec3::new(500.0, 70.0, 500.0);
-        let mut ticks = 0;
-        while rt.demo.as_ref().unwrap().moving {
-            rt.tick(&mut host);
-            ticks += 1;
-            assert!(ticks < 400, "the train never stopped");
-        }
-        // The lap is about 59.7 blocks, one step per tick: about length / step ticks in all.
-        let lap = (rt.demo.as_ref().unwrap().table.length() / (demo::SPEED * render::TICK_SECONDS))
-            as i32;
-        assert!((ticks - lap).abs() < 12, "ticks {ticks}, lap {lap}");
-        assert_eq!(rt.demo.as_ref().unwrap().s, 0.0);
-
-        // The final car move sent it to the start, and afterwards only seat moves remain.
-        let table = rt.demo.as_ref().unwrap().table.clone();
-        let start = render::car_pose(&table, table.length());
-        let last_car = host
-            .commands
-            .iter()
-            .rev()
-            .find(|c| c.starts_with("tp @e[tag=htp_car_demo_0"))
-            .unwrap()
-            .clone();
-        assert_eq!(
-            last_car,
-            commands::move_car(commands::DEMO, 0, start.pos, start.yaw, start.pitch)
-        );
-        host.take_commands();
+        // Standing 1.5 blocks from the rider point: not close enough to count as sitting.
+        host.players[0].pos = render::rider_point(demo(&rt).seat_pos[0]) + DVec3::X * 1.5;
         rt.tick(&mut host);
-        assert_eq!(host.take_commands().len(), 2);
+        assert!(!demo(&rt).occupied[0]);
+        // Sitting, then stepping 1 block away: still counts as sitting.
+        sit_in_seat_zero(&rt, &mut host);
+        rt.tick(&mut host);
+        assert!(demo(&rt).occupied[0]);
+        host.players[0].pos += DVec3::X * 1.0;
+        rt.tick(&mut host);
+        assert!(demo(&rt).occupied[0]);
+        // Walking right away (more than 2 blocks): off.
+        host.players[0].pos = far_away();
+        rt.tick(&mut host);
+        assert!(!demo(&rt).occupied[0]);
     }
 
     #[test]
@@ -1919,7 +3650,7 @@ mod tests {
             Some("Right-click a seat in the car to ride.")
         );
         rt.tick(&mut host2);
-        assert_eq!(host2.take_commands().len(), 2, "only the seat moves");
+        assert_eq!(host2.take_commands().len(), SEATS, "only the seat moves");
         // And a runtime with no demo sends nothing at all.
         empty.tick(&mut host);
         assert!(host.commands.is_empty());
@@ -1962,7 +3693,7 @@ mod tests {
         rt.command("coaster demo", caller());
         rt.tick(&mut host);
         assert_eq!(host.commands[0], "kill @e[tag=htp_demo]");
-        assert!(host.commands.iter().any(|c| c.contains("htp:car")));
+        assert!(host.commands.iter().any(|c| c.contains("htp:rail")));
     }
 }
 }

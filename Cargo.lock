@@ -26,5 +26,6 @@ dependencies = [
 name = "park-sim"
 version = "0.1.0"
 dependencies = [
+ "glam",
  "park-core",
 ]

@@ -148,6 +148,12 @@ pub fn move_seat(ride: &str, index: usize, pos: DVec3, yaw: f64, pitch: f64) -> 
     )
 }
 
+/// Show `text` on one player's action bar (the line above the hotbar). Used when the game door
+/// has no direct way to do it. `text` must be plain text without quotes or backslashes.
+pub fn action_bar(player_name: &str, text: &str) -> String {
+    format!("title {player_name} actionbar {{\"text\":\"{text}\"}}")
+}
+
 /// Remove everything that carries `tag`.
 pub fn kill_tag(tag: &str) -> String {
     format!("kill @e[tag={tag}]")
@@ -236,6 +242,14 @@ mod tests {
         assert_eq!(
             move_seat(DEMO, 1, DVec3::new(5.0, 70.5, 6.0), -90.0, 0.0),
             "tp @e[tag=htp_seat_demo_1,limit=1] 5.0000 70.5000 6.0000 -90.0000 0.0000"
+        );
+    }
+
+    #[test]
+    fn action_bar_text() {
+        assert_eq!(
+            action_bar("Alex", "Speed: 54 km/h"),
+            "title Alex actionbar {\"text\":\"Speed: 54 km/h\"}"
         );
     }
 

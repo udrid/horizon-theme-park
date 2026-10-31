@@ -7,3 +7,4 @@ license.workspace = true
 
 [dependencies]
 park-core = { path = "../park-core" }
+glam = "=0.30.10"

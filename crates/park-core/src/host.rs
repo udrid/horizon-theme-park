@@ -30,6 +30,12 @@ pub trait Host {
     fn tell(&mut self, player: u128, text: &str);
     /// A line for the game's log only (nobody sees it in chat). Optional: the default drops it.
     fn log(&mut self, _text: &str) {}
+    /// Show a line on one player's action bar (above the hotbar). Optional: the default says "not
+    /// available" (`false`) and park-core then falls back to the `title ... actionbar` command.
+    /// The glue can later answer this with Horizon's API 21 helper (D43's "extra method" rule).
+    fn action_bar(&mut self, _player: u128, _text: &str) -> bool {
+        false
+    }
 }
 
 /// A pretend game for tests: it records every call, in order.
@@ -47,6 +53,8 @@ pub struct FakeHost {
     pub tells: Vec<(u128, String)>,
     /// Every log line.
     pub logs: Vec<String>,
+    /// Every action-bar line, as (player, text).
+    pub action_bars: Vec<(u128, String)>,
 }
 
 impl FakeHost {
@@ -84,6 +92,11 @@ impl Host for FakeHost {
 
     fn log(&mut self, text: &str) {
         self.logs.push(text.to_string());
+    }
+
+    fn action_bar(&mut self, player: u128, text: &str) -> bool {
+        self.action_bars.push((player, text.to_string()));
+        true
     }
 }
 

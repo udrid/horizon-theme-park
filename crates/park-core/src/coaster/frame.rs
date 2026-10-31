@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn right_is_the_riders_right_hand() {
-        use crate::coaster::demo::demo_nodes;
+        use crate::coaster::oval::demo_nodes;
         // Facing +Z (yaw 0): right is -X. Facing +X (yaw -90): right is +Z.
         for (yaw, forward, right) in [(0.0, DVec3::Z, -DVec3::X), (-90.0, DVec3::X, DVec3::Z)] {
             let t = Table::new(&Track::closed(&demo_nodes(DVec3::ZERO, yaw)));

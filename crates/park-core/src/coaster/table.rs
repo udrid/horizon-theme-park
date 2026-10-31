@@ -30,6 +30,18 @@ impl Table {
     /// Measure `track` and store a point every `STEP` blocks. The loop is closed: the last
     /// stored point is followed by the first. Returns an empty table for an empty track.
     pub fn new(track: &Track) -> Table {
+        Table::build(track, false)
+    }
+
+    /// Like `new`, but the track is NOT banked: "up" is always as close to the sky as the
+    /// track's direction allows, so a climbing turn does not roll the car sideways. This is
+    /// what M2's track needs (no banking until M5, D24). Only for tracks that never go
+    /// straight up or upside down.
+    pub fn new_level(track: &Track) -> Table {
+        Table::build(track, true)
+    }
+
+    fn build(track: &Track, level: bool) -> Table {
         // 1. Cut every segment into many tiny straight pieces and add up their lengths.
         //    Each entry is (distance so far, point).
         let mut dense: Vec<(f64, DVec3)> = Vec::new();
@@ -86,7 +98,17 @@ impl Table {
                 (b - a).normalize_or_zero()
             })
             .collect();
-        let ups = compute_ups(&tangents);
+        let ups = if level {
+            tangents
+                .iter()
+                .map(|t| {
+                    let up = (DVec3::Y - *t * t.y).normalize_or_zero();
+                    if up == DVec3::ZERO { DVec3::X } else { up }
+                })
+                .collect()
+        } else {
+            compute_ups(&tangents)
+        };
         Table {
             length: total,
             step,
@@ -214,6 +236,26 @@ mod tests {
         let t = Table::new(&wobbly_loop());
         let d = t.position(5.0).distance(t.position(5.1));
         assert!((d - 0.1).abs() < 0.01, "got {d}");
+    }
+
+    #[test]
+    fn a_level_table_keeps_up_in_the_vertical_plane_through_a_climbing_turn() {
+        // A spiral that climbs while it turns: a carried-along "up" would roll sideways here.
+        let nodes: Vec<DVec3> = (0..48)
+            .map(|i| {
+                let a = i as f64 / 48.0 * std::f64::consts::TAU;
+                DVec3::new(15.0 * a.cos(), 3.0 * (a * 2.0).sin(), 15.0 * a.sin())
+            })
+            .collect();
+        let t = Table::new_level(&Track::closed(&nodes));
+        let mut s = 0.0;
+        while s < t.length() {
+            let f = t.frame(s);
+            // "right" is flat (no sideways roll) and up leans only forwards or backwards.
+            assert!(f.right.y.abs() < 1e-3, "rolled at s = {s}");
+            assert!(f.up.y > 0.9);
+            s += 0.7;
+        }
     }
 
     #[test]
