@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "park-bundle"
+version = "0.1.0"
+
+[[package]]
 name = "park-core"
 version = "0.1.0"
 

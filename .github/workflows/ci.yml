@@ -21,3 +21,5 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # 3. Do all the tests pass?
       - run: cargo test --workspace
+      # 4. Is the glued game file park.rs up to date with park-core? (fails if someone forgot to re-glue)
+      - run: cargo run -p park-bundle -- --check

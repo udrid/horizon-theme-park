@@ -5,6 +5,7 @@ resolver = "2"
 members = [
     "crates/park-core",
     "crates/park-sim",
+    "tools/park-bundle",
     # "crates/park-web" is left out on purpose until the browser previewer starts.
 ]
 

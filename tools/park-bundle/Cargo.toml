@@ -1,0 +1,9 @@
+[package]
+name = "park-bundle"
+description = "Glues park-core into the single park.rs file that the native mod needs. Standard library only (D34)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No dependencies on purpose (D34): nothing to download, and the whole tool is short enough to read.
+[dependencies]

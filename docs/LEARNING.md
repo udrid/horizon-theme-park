@@ -280,3 +280,27 @@ A diary the game writes while it runs: every message, warning and error, with th
 
 ## Static (and Mutex)
 A `static` is one value that lives for the whole time the game runs, like a whiteboard on the wall that everybody can read. A `Mutex` is a lock on it, like a talking stick: only the one holding it may write. Our glue keeps one `Welcome` this way.
+
+## Option (`Some` and `None`)
+A Rust box that is either holding something (`Some(x)`) or empty (`None`). Our `Welcome::tick` hands back an `Option`: `Some("Horizon Theme Park loaded")` the one time it should speak, and `None` the rest of the time. Like a mail slot that is either empty or has a letter in it.
+
+## `const fn`
+A function the compiler can run while it builds the program, so its answer is already there when the game starts. `Welcome::new()` is one, which lets the glue keep a ready-made `Welcome` in a `static` without any setup code.
+
+## `#[derive(...)]`
+A one-line request: "write the boring standard code for me". `#[derive(Default)]` makes a `Welcome::default()` for free. Like ticking "standard options" on an order form instead of listing every option by hand.
+
+## Standard library (`std`)
+The toolbox that ships with Rust itself: files, text, paths and more. `park-bundle` uses only this, no downloaded libraries (D34), so there is nothing extra to fetch or trust.
+
+## Result and error types
+A `Result` is like `Option`, but the "nothing" case explains itself: it is either `Ok(answer)` or `Err(what went wrong)`. `park-bundle`'s `BundleError` is the "what went wrong" part. It names the file and line, so the message tells you where to look.
+
+## Box
+A way to keep a value in one big shared storage area and carry only a small pointer to it, like carrying a luggage ticket instead of the suitcase. We used it so `BundleError` stays small, because clippy (the linter) complained that it was too big to hand around.
+
+## `include!`
+A built-in instruction that pastes another file's text into this spot while compiling. Our compile test uses it to drop `park.rs` into a pretend game module. It is on the *forbidden* list for park-core itself, because the game's mixin tool needs a single self-contained file.
+
+## Dead code (and `#[allow(dead_code)]`)
+Code that is written but never used. Rust warns about it, and our checks treat warnings as errors. In the compile test the pretend game doesn't use all of park-core yet, so we switch that one warning off with `#[allow(dead_code)]`. Like telling a smoke alarm "I know about the toast, thanks".

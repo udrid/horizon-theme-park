@@ -1,0 +1,3 @@
+# park.rs is written by tools/park-bundle with Linux line endings. Keep it that way on every computer,
+# so the "is it stale?" check never fails just because Windows Git changed the line endings (M0 S5).
+mods/native/mixins/horizon-theme-park/park.rs text eol=lf
