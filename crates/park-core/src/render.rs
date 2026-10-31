@@ -205,7 +205,13 @@ mod tests {
     fn straights_use_four_block_pieces_and_curves_shorter_ones() {
         let t = oval();
         let pieces = rail_pieces(&t);
-        assert!(pieces.iter().filter(|p| (p.s1 - p.s0 - 4.0).abs() < 1e-9).count() >= 2);
+        assert!(
+            pieces
+                .iter()
+                .filter(|p| (p.s1 - p.s0 - 4.0).abs() < 1e-9)
+                .count()
+                >= 2
+        );
         for p in &pieces {
             let mid = t.position((p.s0 + p.s1) / 2.0);
             // Well inside a half circle (the curves are at |z| > 5.5): one-block pieces only.
@@ -232,7 +238,8 @@ mod tests {
 
     #[test]
     fn yaw_and_pitch_follow_minecrafts_convention() {
-        let close = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9;
+        let close =
+            |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9;
         assert!(close(yaw_pitch(DVec3::Z), (0.0, 0.0)));
         assert!(close(yaw_pitch(DVec3::X), (-90.0, 0.0)));
         assert!(close(yaw_pitch(-DVec3::X), (90.0, 0.0)));

@@ -5,9 +5,1882 @@
 // park-core: the game-free brain of Horizon Theme Park.
 //
 // This crate must never depend on Horizon or Minecraft, so it can be
-// tested in seconds anywhere. For now it only holds the greeting logic;
-// coaster maths, ride logic and park logic will be added as modules later.
+// tested in seconds anywhere. Coaster maths lives in `coaster`, the "door" to the
+// game in `host`, the exact command texts in `commands`, what to draw in `render`
+// and the per-tick loop in `runtime`.
 
+pub mod coaster {
+// Coaster maths: the track curve, its arc-length table, frames and the demo oval.
+
+pub mod demo {
+// The demo oval for `/coaster demo` (D47): two straights joined by two half circles.
+//
+// Hands-on idea: change `RADIUS` below, run `cargo test -p park-core`, and watch the test
+// that checks the oval's length fail, then fix the number it compares with.
+
+use glam::DVec3;
+
+/// Length of each straight, in blocks.
+pub const STRAIGHT: f64 = 11.0;
+/// Radius of each half circle, in blocks.
+pub const RADIUS: f64 = 6.0;
+/// The oval's exact length in blocks: both straights plus a full circle.
+pub const EXACT_LENGTH: f64 = 2.0 * STRAIGHT + std::f64::consts::TAU * RADIUS;
+/// Constant speed of the demo train, in blocks per second (about 29 km/h).
+pub const SPEED: f64 = 8.0;
+
+/// Spacing of nodes along the straights, in blocks.
+const STRAIGHT_NODE_GAP: f64 = 2.2;
+/// Angle between nodes along the curves, in degrees.
+const CURVE_NODE_DEGREES: f64 = 10.0;
+
+/// The oval's nodes in its own flat coordinates `(x, z)`, going round once, starting on a
+/// straight.
+fn local_nodes() -> Vec<(f64, f64)> {
+    let half = STRAIGHT / 2.0;
+    let mut nodes = Vec::new();
+    // First straight (x = +radius), going towards +z. Its two end nodes belong to the curves.
+    let mut z = -half + STRAIGHT_NODE_GAP;
+    while z < half - 1e-9 {
+        nodes.push((RADIUS, z));
+        z += STRAIGHT_NODE_GAP;
+    }
+    // The half circle at +z, from angle 0 to 180.
+    let steps = (180.0 / CURVE_NODE_DEGREES) as usize;
+    for i in 0..=steps {
+        let a = (i as f64 * CURVE_NODE_DEGREES).to_radians();
+        nodes.push((RADIUS * a.cos(), half + RADIUS * a.sin()));
+    }
+    // Second straight (x = -radius), going towards -z.
+    let mut z = half - STRAIGHT_NODE_GAP;
+    while z > -half + 1e-9 {
+        nodes.push((-RADIUS, z));
+        z -= STRAIGHT_NODE_GAP;
+    }
+    // The half circle at -z, from angle 180 to 360.
+    for i in 0..=steps {
+        let a = (180.0 + i as f64 * CURVE_NODE_DEGREES).to_radians();
+        nodes.push((RADIUS * a.cos(), -half + RADIUS * a.sin()));
+    }
+    nodes
+}
+
+/// The oval's nodes in the world: centred on `center`, flat, with its long side along the
+/// direction a player facing `yaw_degrees` looks (Minecraft's yaw: 0 looks towards +Z).
+pub fn demo_nodes(center: DVec3, yaw_degrees: f64) -> Vec<DVec3> {
+    let yaw = yaw_degrees.to_radians();
+    let forward = DVec3::new(-yaw.sin(), 0.0, yaw.cos());
+    let side = DVec3::new(yaw.cos(), 0.0, yaw.sin());
+    local_nodes()
+        .into_iter()
+        .map(|(x, z)| center + side * x + forward * z)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::htp_park::coaster::spline::Track;
+    use crate::game::htp_park::coaster::table::Table;
+
+    fn table(yaw: f64) -> Table {
+        Table::new(&Track::closed(&demo_nodes(
+            DVec3::new(100.0, 70.0, -40.0),
+            yaw,
+        )))
+    }
+
+    #[test]
+    fn the_exact_length_is_59_7_blocks() {
+        assert!((EXACT_LENGTH - 59.70).abs() < 0.01);
+    }
+
+    #[test]
+    fn the_ovals_table_length_is_within_a_tenth_of_a_percent() {
+        for yaw in [0.0, 37.0, -90.0, 180.0] {
+            let t = table(yaw);
+            let off = (t.length() - EXACT_LENGTH).abs() / EXACT_LENGTH;
+            assert!(off < 0.001, "yaw {yaw}: length {} off by {off}", t.length());
+        }
+    }
+
+    #[test]
+    fn the_oval_is_flat_and_its_up_arrow_points_up() {
+        let t = table(0.0);
+        let mut s = 0.0;
+        while s < t.length() {
+            let f = t.frame(s);
+            assert!((f.pos.y - 70.0).abs() < 1e-9);
+            assert!(f.up.dot(DVec3::Y) > 0.9999);
+            s += 0.37;
+        }
+    }
+
+    #[test]
+    fn the_tightest_bend_is_a_little_tighter_than_the_six_block_curve() {
+        // Where a straight meets a curve the spline tightens slightly (about 5.3 blocks).
+        let t = table(0.0);
+        let radius = 1.0 / t.max_curvature();
+        assert!(radius > 4.8 && radius < RADIUS + 0.3, "radius {radius}");
+    }
+
+    #[test]
+    fn yaw_zero_puts_the_long_side_along_plus_z() {
+        let t = table(0.0);
+        // The start is on a straight that runs towards +z.
+        assert!(t.frame(0.0).forward.dot(DVec3::Z) > 0.99);
+    }
+}
+}
+pub mod frame {
+// Frames: at every point of the track, three arrows that say which way is forward, up and
+// right. A car's rotation comes from them.
+//
+// The trick is "rotation-minimising" frames: walk along the track and turn the up arrow only as
+// much as the track itself turns, never twisting it for no reason (like carrying a flag
+// along a path without spinning it). On a closed loop the arrow may come back slightly
+// twisted, so we measure that leftover twist and spread it evenly over the whole lap.
+
+use glam::{DQuat, DVec3};
+
+/// Position and orientation at one point of the track. For +Z forward and +Y up, `right` is +X.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Frame {
+    pub pos: DVec3,
+    pub forward: DVec3,
+    pub up: DVec3,
+    pub right: DVec3,
+}
+
+impl Default for Frame {
+    fn default() -> Self {
+        Frame {
+            pos: DVec3::ZERO,
+            forward: DVec3::Z,
+            up: DVec3::Y,
+            right: DVec3::X,
+        }
+    }
+}
+
+/// Take `v` and remove the part that points along `t`, so it is square to `t`.
+fn square_to(v: DVec3, t: DVec3) -> DVec3 {
+    (v - t * v.dot(t)).normalize_or_zero()
+}
+
+/// The up arrow for every direction in `tangents` (a closed loop of unit directions).
+pub fn compute_ups(tangents: &[DVec3]) -> Vec<DVec3> {
+    let n = tangents.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Start: world up, with any part along the track removed. (A vertical start would need
+    // another choice; tracks start flat in M1.)
+    let mut first = square_to(DVec3::Y, tangents[0]);
+    if first == DVec3::ZERO {
+        first = square_to(DVec3::X, tangents[0]);
+    }
+    let mut ups = Vec::with_capacity(n);
+    ups.push(first);
+    for k in 1..n {
+        ups.push(carry(ups[k - 1], tangents[k - 1], tangents[k]));
+    }
+    // Close the loop: carry the last arrow back to the start and see how far it is twisted.
+    let back = carry(ups[n - 1], tangents[n - 1], tangents[0]);
+    let twist = tangents[0].dot(first.cross(back)).atan2(first.dot(back));
+    // Spread the twist: the arrow k steps along is turned back by its share of it.
+    for (k, up) in ups.iter_mut().enumerate() {
+        let share = -twist * k as f64 / n as f64;
+        *up = DQuat::from_axis_angle(tangents[k], share) * *up;
+    }
+    ups
+}
+
+/// Carry the up arrow from a place where the track points along `from` to one where it points
+/// along `to`, turning it by the smallest possible rotation.
+pub fn carry(up: DVec3, from: DVec3, to: DVec3) -> DVec3 {
+    let turned = DQuat::from_rotation_arc(from, to) * up;
+    square_to(turned, to)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::htp_park::coaster::spline::Track;
+    use crate::game::htp_park::coaster::table::Table;
+
+    fn angle_deg(a: DVec3, b: DVec3) -> f64 {
+        a.dot(b).clamp(-1.0, 1.0).acos().to_degrees()
+    }
+
+    /// A closed loop with S-bends, hills and a sideways wobble.
+    fn s_bend_loop() -> Table {
+        let nodes: Vec<DVec3> = (0..24)
+            .map(|i| {
+                let a = i as f64 / 24.0 * std::f64::consts::TAU;
+                DVec3::new(
+                    30.0 * a.cos(),
+                    6.0 * (3.0 * a).sin(),
+                    10.0 * a.sin() + 6.0 * (2.0 * a).sin(),
+                )
+            })
+            .collect();
+        Table::new(&Track::closed(&nodes))
+    }
+
+    #[test]
+    fn no_flip_through_an_s_bend() {
+        let t = s_bend_loop();
+        let mut prev = t.frame(0.0);
+        let mut s = 0.1;
+        while s < t.length() {
+            let f = t.frame(s);
+            // Up never turns upside down and never jumps between neighbouring points. (On a wild 3D
+            // loop it may lean gradually: that is the carried-along twist, spread over the lap.)
+            assert!(f.up.dot(DVec3::Y) > 0.0, "up flipped at s = {s}");
+            assert!(angle_deg(prev.up, f.up) < 1.5, "up jumped at s = {s}");
+            assert!(f.up.dot(f.forward).abs() < 1e-9);
+            prev = f;
+            s += 0.1;
+        }
+    }
+
+    #[test]
+    fn on_a_closed_loop_up_comes_back_to_where_it_started() {
+        let t = s_bend_loop();
+        // Carry the last arrow back over the closing step: it must meet the first one.
+        let last = t.frame(t.length() - 0.05);
+        let start = t.frame(0.0);
+        let back = carry(last.up, last.forward, start.forward);
+        assert!(angle_deg(back, start.up) < 0.1, "leftover twist too big");
+    }
+}
+}
+pub mod spline {
+// The track curve: a closed "centripetal Catmull-Rom" spline [D42].
+//
+// Think of nodes as pins on a board and the track as a string pulled through every pin.
+// "Centripetal" is the flavour that never overshoots a pin or makes a little loop.
+// Each stretch between two pins is turned into a cubic Bézier curve (four points:
+// the two pins and two "handles"), which is easy to evaluate.
+
+use glam::DVec3;
+
+/// How uneven spacing is handled. 0.5 is the "centripetal" choice.
+const ALPHA: f64 = 0.5;
+
+/// One stretch of track between two nodes, as a cubic Bézier curve.
+#[derive(Clone, Copy, Debug)]
+pub struct Segment {
+    pub p0: DVec3,
+    pub p1: DVec3,
+    pub p2: DVec3,
+    pub p3: DVec3,
+}
+
+impl Segment {
+    /// The point at `t` (0 = first node, 1 = second node).
+    pub fn point(&self, t: f64) -> DVec3 {
+        let u = 1.0 - t;
+        self.p0 * (u * u * u)
+            + self.p1 * (3.0 * u * u * t)
+            + self.p2 * (3.0 * u * t * t)
+            + self.p3 * (t * t * t)
+    }
+}
+
+/// A closed loop of segments through every node.
+#[derive(Clone, Debug)]
+pub struct Track {
+    segments: Vec<Segment>,
+}
+
+/// Distance between two points to the power `ALPHA`, never zero (so we never divide by zero).
+fn knot_gap(a: DVec3, b: DVec3) -> f64 {
+    a.distance(b).max(1e-9).powf(ALPHA)
+}
+
+impl Track {
+    /// Build a closed track through `nodes` (at least 3). The last node connects back to the first.
+    pub fn closed(nodes: &[DVec3]) -> Track {
+        let n = nodes.len();
+        let mut segments = Vec::with_capacity(n);
+        if n < 3 {
+            return Track { segments };
+        }
+        for i in 0..n {
+            // The four nodes around this stretch; the loop wraps around the ends.
+            let a = nodes[(i + n - 1) % n];
+            let b = nodes[i];
+            let c = nodes[(i + 1) % n];
+            let d = nodes[(i + 2) % n];
+            let d1 = knot_gap(a, b);
+            let d2 = knot_gap(b, c);
+            let d3 = knot_gap(c, d);
+            // Catmull-Rom to Bézier handles (the standard centripetal formulas).
+            let h1 = (b * (2.0 * d1 * d1 + 3.0 * d1 * d2 + d2 * d2) - a * (d2 * d2)
+                + c * (d1 * d1))
+                / (3.0 * d1 * (d1 + d2));
+            let h2 = (c * (2.0 * d3 * d3 + 3.0 * d3 * d2 + d2 * d2) - d * (d2 * d2)
+                + b * (d3 * d3))
+                / (3.0 * d3 * (d3 + d2));
+            segments.push(Segment {
+                p0: b,
+                p1: h1,
+                p2: h2,
+                p3: c,
+            });
+        }
+        Track { segments }
+    }
+
+    /// The segments, in track order.
+    pub fn segments(&self) -> &[Segment] {
+        &self.segments
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn square() -> Vec<DVec3> {
+        vec![
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(10.0, 0.0, 0.0),
+            DVec3::new(10.0, 0.0, 10.0),
+            DVec3::new(0.0, 0.0, 10.0),
+        ]
+    }
+
+    #[test]
+    fn passes_exactly_through_every_node() {
+        let nodes = square();
+        let track = Track::closed(&nodes);
+        assert_eq!(track.segments().len(), 4);
+        for (i, seg) in track.segments().iter().enumerate() {
+            assert!(seg.point(0.0).distance(nodes[i]) < 1e-9);
+            assert!(seg.point(1.0).distance(nodes[(i + 1) % 4]) < 1e-9);
+        }
+    }
+
+    #[test]
+    fn too_few_nodes_give_an_empty_track() {
+        assert!(
+            Track::closed(&[DVec3::ZERO, DVec3::X])
+                .segments()
+                .is_empty()
+        );
+    }
+}
+}
+pub mod table {
+// The arc-length table: "how far along the track" (`s`, in blocks) to "where is that" (a point
+// and a frame).
+//
+// A curve's own parameter `t` does not move at an even pace: equal steps of `t` can be
+// different distances in the world. So we walk the whole curve once, measure the real distance,
+// and store a point every 0.1 block. Looking up `s` is then one division and a blend between
+// two stored points. Like a ruler laid along the track.
+
+use crate::game::htp_park::coaster::frame::{Frame, compute_ups};
+use crate::game::htp_park::coaster::spline::Track;
+use glam::DVec3;
+
+/// Wanted distance between stored points, in blocks.
+pub const STEP: f64 = 0.1;
+
+/// How many small straight pieces we cut each curve into per block, to measure it.
+const SAMPLES_PER_BLOCK: f64 = 64.0;
+
+/// Stored points, directions and "up" arrows along a closed track.
+#[derive(Clone, Debug)]
+pub struct Table {
+    length: f64,
+    step: f64,
+    points: Vec<DVec3>,
+    tangents: Vec<DVec3>,
+    ups: Vec<DVec3>,
+}
+
+impl Table {
+    /// Measure `track` and store a point every `STEP` blocks. The loop is closed: the last
+    /// stored point is followed by the first. Returns an empty table for an empty track.
+    pub fn new(track: &Track) -> Table {
+        // 1. Cut every segment into many tiny straight pieces and add up their lengths.
+        //    Each entry is (distance so far, point).
+        let mut dense: Vec<(f64, DVec3)> = Vec::new();
+        let mut total = 0.0;
+        for seg in track.segments() {
+            let chord = seg.p0.distance(seg.p3);
+            let n = ((chord * SAMPLES_PER_BLOCK).ceil() as usize).max(16);
+            for i in 0..=n {
+                let p = seg.point(i as f64 / n as f64);
+                if let Some(&(_, prev)) = dense.last() {
+                    if i == 0 {
+                        // The first point of a segment is the last point of the one before it.
+                        continue;
+                    }
+                    total += p.distance(prev);
+                }
+                dense.push((total, p));
+            }
+        }
+        if dense.len() < 2 || total <= 0.0 {
+            return Table {
+                length: 0.0,
+                step: STEP,
+                points: Vec::new(),
+                tangents: Vec::new(),
+                ups: Vec::new(),
+            };
+        }
+        // 2. Resample at an even distance. We pick the step so a whole number of steps fits the
+        //    loop exactly, which makes the wrap-around seamless.
+        let count = ((total / STEP).round() as usize).max(3);
+        let step = total / count as f64;
+        let mut points = Vec::with_capacity(count);
+        let mut j = 0;
+        for k in 0..count {
+            let s = k as f64 * step;
+            while j + 2 < dense.len() && dense[j + 1].0 < s {
+                j += 1;
+            }
+            let (s0, p0) = dense[j];
+            let (s1, p1) = dense[j + 1];
+            let f = if s1 > s0 {
+                ((s - s0) / (s1 - s0)).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            points.push(p0.lerp(p1, f));
+        }
+        // 3. Directions (neighbour to neighbour) and "up" arrows.
+        let tangents: Vec<DVec3> = (0..count)
+            .map(|k| {
+                let a = points[(k + count - 1) % count];
+                let b = points[(k + 1) % count];
+                (b - a).normalize_or_zero()
+            })
+            .collect();
+        let ups = compute_ups(&tangents);
+        Table {
+            length: total,
+            step,
+            points,
+            tangents,
+            ups,
+        }
+    }
+
+    /// Length of one lap, in blocks (0 for an empty table).
+    pub fn length(&self) -> f64 {
+        self.length
+    }
+
+    /// True when the track had nothing to measure.
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty()
+    }
+
+    /// Bring any `s` back into one lap: 0 up to (not including) the length. The track is a loop.
+    pub fn wrap(&self, s: f64) -> f64 {
+        if self.length <= 0.0 {
+            0.0
+        } else {
+            s.rem_euclid(self.length)
+        }
+    }
+
+    /// Which stored point `s` is just after, the next one, and how far (0..1) between them.
+    fn locate(&self, s: f64) -> (usize, usize, f64) {
+        let n = self.points.len();
+        let x = self.wrap(s) / self.step;
+        let i = (x.floor() as usize).min(n - 1);
+        (i, (i + 1) % n, x - i as f64)
+    }
+
+    /// The point on the track at distance `s` (wraps around the loop).
+    pub fn position(&self, s: f64) -> DVec3 {
+        if self.is_empty() {
+            return DVec3::ZERO;
+        }
+        let (i, j, f) = self.locate(s);
+        self.points[i].lerp(self.points[j], f)
+    }
+
+    /// The full frame (position, forward, up, right) at distance `s`.
+    pub fn frame(&self, s: f64) -> Frame {
+        if self.is_empty() {
+            return Frame::default();
+        }
+        let (i, j, f) = self.locate(s);
+        let pos = self.points[i].lerp(self.points[j], f);
+        let forward = self.tangents[i]
+            .lerp(self.tangents[j], f)
+            .normalize_or_zero();
+        // Blend the up arrows, then make sure "up" is exactly square to "forward".
+        let raw_up = self.ups[i].lerp(self.ups[j], f);
+        let up = (raw_up - forward * raw_up.dot(forward)).normalize_or_zero();
+        Frame {
+            pos,
+            forward,
+            up,
+            right: up.cross(forward),
+        }
+    }
+
+    /// The tightest bend on the track: the largest change of direction per block, measured over
+    /// about ±0.25 block (D15). 1 divided by this is the smallest curve radius.
+    pub fn max_curvature(&self) -> f64 {
+        let n = self.points.len();
+        if n < 8 {
+            return 0.0;
+        }
+        let half = ((0.25 / self.step).round() as usize).max(1);
+        let mut best: f64 = 0.0;
+        for k in 0..n {
+            let a = self.tangents[(k + n - half % n) % n];
+            let b = self.tangents[(k + half) % n];
+            let curvature = a.distance(b) / (2.0 * half as f64 * self.step);
+            best = best.max(curvature);
+        }
+        best
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A loop that goes up and down a bit, so the maths is tested in 3D.
+    fn wobbly_loop() -> Track {
+        let nodes: Vec<DVec3> = (0..16)
+            .map(|i| {
+                let a = i as f64 / 16.0 * std::f64::consts::TAU;
+                DVec3::new(20.0 * a.cos(), 3.0 * (2.0 * a).sin(), 12.0 * a.sin())
+            })
+            .collect();
+        Track::closed(&nodes)
+    }
+
+    #[test]
+    fn same_track_twice_gives_identical_tables() {
+        let a = Table::new(&wobbly_loop());
+        let b = Table::new(&wobbly_loop());
+        assert_eq!(a.length(), b.length());
+        for k in 0..50 {
+            let s = k as f64 * 1.37;
+            assert_eq!(a.frame(s).pos, b.frame(s).pos);
+            assert_eq!(a.frame(s).up, b.frame(s).up);
+        }
+    }
+
+    #[test]
+    fn a_lookup_at_s_and_at_s_plus_length_is_the_same_point() {
+        let t = Table::new(&wobbly_loop());
+        for k in 0..40 {
+            let s = k as f64 * 2.3;
+            assert!(t.position(s).distance(t.position(s + t.length())) < 1e-9);
+            assert!(t.position(s).distance(t.position(s - t.length())) < 1e-9);
+        }
+    }
+
+    #[test]
+    fn stored_points_are_about_a_tenth_of_a_block_apart() {
+        let t = Table::new(&wobbly_loop());
+        let d = t.position(5.0).distance(t.position(5.1));
+        assert!((d - 0.1).abs() < 0.01, "got {d}");
+    }
+
+    #[test]
+    fn an_empty_track_is_harmless() {
+        let t = Table::new(&Track::closed(&[]));
+        assert!(t.is_empty());
+        assert_eq!(t.position(3.0), DVec3::ZERO);
+        assert_eq!(t.length(), 0.0);
+    }
+}
+}
+}
+pub mod commands {
+// The exact text of every command the mod sends to the game (D43).
+//
+// Each function builds one command as a `String`. Nothing here talks to the game, so a test can
+// compare the text word for word. The runtime decides *what* to send; the glue just runs it.
+//
+// Numbers are written with 4 decimals and a `.` point, never with an exponent (`1e-5`),
+// and `-0` is written as `0.0000`, because the game's command reader wants plain numbers.
+
+use glam::{DQuat, DVec3};
+
+/// The ride id of the demo coaster.
+pub const DEMO: &str = "demo";
+
+/// The model items of the content mod (D47).
+pub const RAIL_ITEM: &str = "htp:rail";
+pub const CAR_ITEM: &str = "htp:car";
+
+/// What a seat is made of (D49). To switch the seats to saddled invisible pigs, change this one
+/// function and `summon_seat` below (see `summon_seat` for the pig version).
+pub const SEAT_ENTITY: &str = "minecraft:minecart";
+
+/// A number as the game wants it: 4 decimals, no exponent, and never "-0.0000".
+pub fn num(v: f64) -> String {
+    let text = format!("{v:.4}");
+    if text == "-0.0000" {
+        "0.0000".to_string()
+    } else {
+        text
+    }
+}
+
+/// A number with the `f` (float) ending that NBT data wants.
+fn float(v: f64) -> String {
+    format!("{}f", num(v))
+}
+
+/// Three numbers in a row, for a position.
+fn xyz(p: DVec3) -> String {
+    format!("{} {} {}", num(p.x), num(p.y), num(p.z))
+}
+
+/// The tag every entity of the mod carries.
+pub const TAG_ALL: &str = "htp";
+
+/// The tag of everything that belongs to one ride, e.g. `htp_demo`.
+pub fn tag_ride(ride: &str) -> String {
+    format!("htp_{ride}")
+}
+
+/// The tag of one car, e.g. `htp_car_demo_0`.
+pub fn tag_car(ride: &str, index: usize) -> String {
+    format!("htp_car_{ride}_{index}")
+}
+
+/// The tag of one seat, e.g. `htp_seat_demo_1`.
+pub fn tag_seat(ride: &str, index: usize) -> String {
+    format!("htp_seat_{ride}_{index}")
+}
+
+/// `Tags:["htp","htp_demo","…"]` with one extra tag for the specific piece.
+fn tags(ride: &str, extra: Option<String>) -> String {
+    let mut list = format!("\"{TAG_ALL}\",\"{}\"", tag_ride(ride));
+    if let Some(extra) = extra {
+        list.push_str(&format!(",\"{extra}\""));
+    }
+    format!("Tags:[{list}]")
+}
+
+/// The `transformation` data of a display: rotation, no shift, a size.
+fn transformation(rotation: DQuat, scale: DVec3) -> String {
+    format!(
+        "transformation:{{left_rotation:[{},{},{},{}],right_rotation:[0.0000f,0.0000f,0.0000f,1.0000f],translation:[0.0000f,0.0000f,0.0000f],scale:[{},{},{}]}}",
+        float(rotation.x),
+        float(rotation.y),
+        float(rotation.z),
+        float(rotation.w),
+        float(scale.x),
+        float(scale.y),
+        float(scale.z)
+    )
+}
+
+/// Put one piece of rail on the track. `rotation` turns the model so its long side follows the
+/// track, `scale` is (width, height, length) in blocks. Rails never move, so no `teleport_duration`.
+pub fn summon_rail(ride: &str, pos: DVec3, rotation: DQuat, scale: DVec3) -> String {
+    format!(
+        "summon minecraft:item_display {} {{{},item:{{id:\"{RAIL_ITEM}\",count:1}},{}}}",
+        xyz(pos),
+        tags(ride, None),
+        transformation(rotation, scale)
+    )
+}
+
+/// Put a car on the track. `teleport_ticks` is how long the display glides to each new spot
+/// (it can't be changed later, D44); `scale` is the size of the car's shell model.
+pub fn summon_car(
+    ride: &str,
+    index: usize,
+    pos: DVec3,
+    yaw: f64,
+    pitch: f64,
+    teleport_ticks: u32,
+    scale: DVec3,
+) -> String {
+    format!(
+        "summon minecraft:item_display {} {{{},Rotation:[{},{}],item:{{id:\"{CAR_ITEM}\",count:1}},teleport_duration:{teleport_ticks},{}}}",
+        xyz(pos),
+        tags(ride, Some(tag_car(ride, index))),
+        float(yaw),
+        float(pitch),
+        transformation(DQuat::IDENTITY, scale)
+    )
+}
+
+/// Send a car to a new spot, turned to face `yaw`/`pitch` (Minecraft's angles, in degrees).
+pub fn move_car(ride: &str, index: usize, pos: DVec3, yaw: f64, pitch: f64) -> String {
+    format!(
+        "tp @e[tag={},limit=1] {} {} {}",
+        tag_car(ride, index),
+        xyz(pos),
+        num(yaw),
+        num(pitch)
+    )
+}
+
+/// Put one seat on the track: a minecart the player boards by right-clicking it (D48, D49).
+///
+/// Returns a list of commands because another seat kind may need more than one. For a saddled
+/// invisible pig (the fallback in D49) the list would be:
+/// `summon minecraft:pig … {…,equipment:{saddle:{id:"minecraft:saddle",count:1}}}` followed by
+/// `effect give @e[tag=<seat tag>] minecraft:invisibility infinite 0 true`.
+pub fn summon_seat(ride: &str, index: usize, pos: DVec3) -> Vec<String> {
+    vec![format!(
+        "summon {SEAT_ENTITY} {} {{{}}}",
+        xyz(pos),
+        tags(ride, Some(tag_seat(ride, index)))
+    )]
+}
+
+/// Move one seat (and whoever sits in it), found by its tag [D49].
+pub fn move_seat(ride: &str, index: usize, pos: DVec3, yaw: f64, pitch: f64) -> String {
+    format!(
+        "tp @e[tag={},limit=1] {} {} {}",
+        tag_seat(ride, index),
+        xyz(pos),
+        num(yaw),
+        num(pitch)
+    )
+}
+
+/// Remove everything that carries `tag`.
+pub fn kill_tag(tag: &str) -> String {
+    format!("kill @e[tag={tag}]")
+}
+
+/// Remove every entity of one ride.
+pub fn kill_ride(ride: &str) -> String {
+    kill_tag(&tag_ride(ride))
+}
+
+/// Remove every entity of the mod (used when a world opens, D20).
+pub fn kill_all() -> String {
+    kill_tag(TAG_ALL)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numbers_have_four_decimals_a_point_and_no_exponent() {
+        assert_eq!(num(1.0), "1.0000");
+        assert_eq!(num(-2.5), "-2.5000");
+        assert_eq!(num(0.00004), "0.0000");
+        assert_eq!(num(123456.789012), "123456.7890");
+        assert_eq!(num(1.0e-9), "0.0000");
+        assert_eq!(num(1.0e9), "1000000000.0000");
+    }
+
+    #[test]
+    fn minus_zero_is_written_as_plain_zero() {
+        assert_eq!(num(-0.0), "0.0000");
+        assert_eq!(num(-0.00001), "0.0000");
+    }
+
+    #[test]
+    fn rail_summon_text() {
+        // A quarter turn about Y: the quaternion is (0, sin 45°, 0, cos 45°).
+        let q = DQuat::from_rotation_y(std::f64::consts::FRAC_PI_2);
+        let text = summon_rail(
+            DEMO,
+            DVec3::new(1.5, 70.0, -2.25),
+            q,
+            DVec3::new(0.5, 0.15, 4.0),
+        );
+        assert_eq!(
+            text,
+            "summon minecraft:item_display 1.5000 70.0000 -2.2500 {Tags:[\"htp\",\"htp_demo\"],item:{id:\"htp:rail\",count:1},transformation:{left_rotation:[0.0000f,0.7071f,0.0000f,0.7071f],right_rotation:[0.0000f,0.0000f,0.0000f,1.0000f],translation:[0.0000f,0.0000f,0.0000f],scale:[0.5000f,0.1500f,4.0000f]}}"
+        );
+    }
+
+    #[test]
+    fn car_summon_text() {
+        let text = summon_car(
+            DEMO,
+            0,
+            DVec3::new(0.0, 64.0, 0.0),
+            -90.0,
+            12.5,
+            3,
+            DVec3::new(1.6, 0.9, 3.0),
+        );
+        assert_eq!(
+            text,
+            "summon minecraft:item_display 0.0000 64.0000 0.0000 {Tags:[\"htp\",\"htp_demo\",\"htp_car_demo_0\"],Rotation:[-90.0000f,12.5000f],item:{id:\"htp:car\",count:1},teleport_duration:3,transformation:{left_rotation:[0.0000f,0.0000f,0.0000f,1.0000f],right_rotation:[0.0000f,0.0000f,0.0000f,1.0000f],translation:[0.0000f,0.0000f,0.0000f],scale:[1.6000f,0.9000f,3.0000f]}}"
+        );
+    }
+
+    #[test]
+    fn car_move_text_has_yaw_and_pitch() {
+        assert_eq!(
+            move_car(DEMO, 0, DVec3::new(1.0, 2.0, 3.0), 180.0, -45.0),
+            "tp @e[tag=htp_car_demo_0,limit=1] 1.0000 2.0000 3.0000 180.0000 -45.0000"
+        );
+    }
+
+    #[test]
+    fn seat_summon_and_move_text() {
+        assert_eq!(
+            summon_seat(DEMO, 1, DVec3::new(5.0, 70.5, 6.0)),
+            vec![
+                "summon minecraft:minecart 5.0000 70.5000 6.0000 {Tags:[\"htp\",\"htp_demo\",\"htp_seat_demo_1\"]}"
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            move_seat(DEMO, 1, DVec3::new(5.0, 70.5, 6.0), -90.0, 0.0),
+            "tp @e[tag=htp_seat_demo_1,limit=1] 5.0000 70.5000 6.0000 -90.0000 0.0000"
+        );
+    }
+
+    #[test]
+    fn kill_texts() {
+        assert_eq!(kill_all(), "kill @e[tag=htp]");
+        assert_eq!(kill_ride(DEMO), "kill @e[tag=htp_demo]");
+        assert_eq!(kill_tag("htp_seat_demo_0"), "kill @e[tag=htp_seat_demo_0]");
+    }
+}
+}
+pub mod host {
+// The "game door" (D43): everything park-core may ask of the game, and nothing else.
+//
+// park-core never touches Minecraft. It only calls the four small methods of `Host`, and the
+// glue next to the mod passes them on to Horizon. In tests, `FakeHost` stands in for the game
+// and simply writes down everything it is asked, so a test can check the exact list.
+//
+// Later, private fallbacks (for example "launch a player", D28) are added here as extra methods
+// with a default that says "not available", so this stays the only door [D7].
+
+use glam::DVec3;
+
+/// What park-core knows about one player who is fully in the world.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlayerInfo {
+    pub uuid: u128,
+    pub name: String,
+    pub pos: DVec3,
+    pub dimension: String,
+}
+
+/// The game, as park-core sees it.
+pub trait Host {
+    /// Players who have fully arrived in the world ("placed" players only).
+    fn players(&self) -> Vec<PlayerInfo>;
+    /// Run a console command (no leading slash). `true` means it ran without failing.
+    fn run(&mut self, command: &str) -> bool;
+    /// A line of chat for everyone, also written to the log.
+    fn broadcast(&mut self, text: &str);
+    /// A line of chat for one player.
+    fn tell(&mut self, player: u128, text: &str);
+}
+
+/// A pretend game for tests: it records every call, in order.
+#[derive(Clone, Debug, Default)]
+pub struct FakeHost {
+    /// The players the pretend world contains. Tests change this between ticks.
+    pub players: Vec<PlayerInfo>,
+    /// Every command that was run, in order.
+    pub commands: Vec<String>,
+    /// A command starting with any of these texts "fails" (returns `false`).
+    pub failing_prefixes: Vec<String>,
+    /// Every broadcast line.
+    pub broadcasts: Vec<String>,
+    /// Every private line, as (player, text).
+    pub tells: Vec<(u128, String)>,
+}
+
+impl FakeHost {
+    /// An empty pretend world.
+    pub fn new() -> FakeHost {
+        FakeHost::default()
+    }
+
+    /// Forget the recorded commands (keeps the players), so a test can look at one tick at a time.
+    pub fn take_commands(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.commands)
+    }
+}
+
+impl Host for FakeHost {
+    fn players(&self) -> Vec<PlayerInfo> {
+        self.players.clone()
+    }
+
+    fn run(&mut self, command: &str) -> bool {
+        self.commands.push(command.to_string());
+        !self
+            .failing_prefixes
+            .iter()
+            .any(|prefix| command.starts_with(prefix.as_str()))
+    }
+
+    fn broadcast(&mut self, text: &str) {
+        self.broadcasts.push(text.to_string());
+    }
+
+    fn tell(&mut self, player: u128, text: &str) {
+        self.tells.push((player, text.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_fake_host_records_commands_in_order() {
+        let mut host = FakeHost::new();
+        assert!(host.run("say one"));
+        assert!(host.run("say two"));
+        assert_eq!(host.commands, vec!["say one", "say two"]);
+        assert_eq!(host.take_commands().len(), 2);
+        assert!(host.commands.is_empty());
+    }
+
+    #[test]
+    fn a_command_can_be_made_to_fail() {
+        let mut host = FakeHost::new();
+        host.failing_prefixes.push("tp ".to_string());
+        assert!(!host.run("tp @s 1 2 3"));
+        assert!(host.run("summon pig"));
+        // Failed commands are still written down.
+        assert_eq!(host.commands.len(), 2);
+    }
+
+    #[test]
+    fn chat_lines_are_recorded() {
+        let mut host = FakeHost::new();
+        host.broadcast("hello");
+        host.tell(7, "psst");
+        assert_eq!(host.broadcasts, vec!["hello"]);
+        assert_eq!(host.tells, vec![(7, "psst".to_string())]);
+    }
+}
+}
+pub mod render {
+// What to draw and where: rail pieces, the car and its seats.
+//
+// Everything here is plain maths on a track `Table`. It answers questions such as "how long
+// should each piece of rail be?" and "where, and turned which way, does the car stand when it is
+// `s` blocks along?". `commands.rs` then turns the answers into command text.
+
+use crate::game::htp_park::coaster::frame::Frame;
+use crate::game::htp_park::coaster::table::Table;
+use glam::{DMat3, DQuat, DVec3};
+
+/// Longest allowed gap between a straight rail piece and the real curve, in blocks (D29, S3).
+pub const MAX_SAG: f64 = 0.03;
+/// Rail piece lengths we try, longest first (D29, S3).
+pub const PIECE_LENGTHS: [f64; 4] = [4.0, 3.0, 2.0, 1.0];
+/// Rail model size: width and height in blocks (the length comes from the piece).
+pub const RAIL_WIDTH: f64 = 0.5;
+pub const RAIL_HEIGHT: f64 = 0.15;
+
+/// How far the car's model sits above the track point. Tuned in the game (S5).
+pub const CAR_LIFT: f64 = 0.5;
+/// The car's shell model size (width, height, length). Tuned in the game (S5).
+pub const CAR_SCALE: DVec3 = DVec3::new(1.6, 0.9, 3.0);
+/// Where each seat sits along the car, in blocks from the car's middle (front, back).
+pub const SEAT_OFFSETS: [f64; 2] = [0.7, -0.7];
+/// How far a seat (a minecart's bottom) sits above the track point. Tuned in the game (S5).
+pub const SEAT_LIFT: f64 = 0.1;
+/// A rider's position is this far above their seat's position (spike R7).
+pub const RIDER_LIFT: f64 = 0.71875;
+
+/// The most a car's straight glide may stray from the track, in blocks (D44).
+pub const MAX_GLIDE_SAG: f64 = 0.05;
+/// One server tick, in seconds.
+pub const TICK_SECONDS: f64 = 0.05;
+/// The most ticks between two car moves (D44).
+pub const MAX_TELEPORT_TICKS: u32 = 5;
+
+/// A stretch of track covered by one piece of rail: from `s0` to `s1` blocks along.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Piece {
+    pub s0: f64,
+    pub s1: f64,
+}
+
+/// A rail piece ready to draw: middle point, rotation and size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RailPose {
+    pub pos: DVec3,
+    pub rotation: DQuat,
+    pub scale: DVec3,
+}
+
+/// A place and an orientation for a car or seat, in Minecraft's angles (degrees).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pose {
+    pub pos: DVec3,
+    pub yaw: f64,
+    pub pitch: f64,
+}
+
+/// How far the real track strays from the straight line between `s0` and `s1`: the "sag".
+pub fn sag(table: &Table, s0: f64, s1: f64) -> f64 {
+    let a = table.position(s0);
+    let b = table.position(s1);
+    let chord = b - a;
+    let len2 = chord.length_squared();
+    let mut worst: f64 = 0.0;
+    for i in 1..8 {
+        let p = table.position(s0 + (s1 - s0) * i as f64 / 8.0);
+        let t = if len2 > 0.0 {
+            ((p - a).dot(chord) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        worst = worst.max(p.distance(a + chord * t));
+    }
+    worst
+}
+
+/// Cut the whole lap into rail pieces: each as long as possible (4, 3, 2 or 1 block) while its
+/// sag stays within `MAX_SAG`. The pieces touch end to end and cover the lap exactly.
+pub fn rail_pieces(table: &Table) -> Vec<Piece> {
+    let total = table.length();
+    let mut pieces = Vec::new();
+    let mut s = 0.0;
+    while s < total - 1e-9 {
+        let mut chosen = None;
+        for &len in &PIECE_LENGTHS {
+            let end = (s + len).min(total);
+            if sag(table, s, end) <= MAX_SAG {
+                chosen = Some(end);
+                break;
+            }
+        }
+        // Even 1 block may be too bent on a very tight curve: use 1 block anyway.
+        let end = chosen.unwrap_or_else(|| (s + 1.0).min(total));
+        pieces.push(Piece { s0: s, s1: end });
+        s = end;
+    }
+    pieces
+}
+
+/// Where and how to draw one rail piece: its middle, turned along the chord, with the up arrow
+/// from the frame at its middle.
+pub fn rail_pose(table: &Table, piece: Piece) -> RailPose {
+    let a = table.position(piece.s0);
+    let b = table.position(piece.s1);
+    let chord = b - a;
+    let length = chord.length().max(1e-6);
+    let forward = chord / length;
+    let mid_frame = table.frame((piece.s0 + piece.s1) / 2.0);
+    let up = (mid_frame.up - forward * mid_frame.up.dot(forward)).normalize_or_zero();
+    let right = up.cross(forward);
+    RailPose {
+        pos: (a + b) / 2.0,
+        rotation: DQuat::from_mat3(&DMat3::from_cols(right, up, forward)),
+        scale: DVec3::new(RAIL_WIDTH, RAIL_HEIGHT, length),
+    }
+}
+
+/// Minecraft's yaw and pitch (degrees) for a direction of travel.
+/// Yaw 0 looks towards +Z, yaw -90 towards +X, yaw 180 towards -Z. Pitch is negative going up.
+pub fn yaw_pitch(forward: DVec3) -> (f64, f64) {
+    let yaw = (-forward.x).atan2(forward.z).to_degrees();
+    let pitch = -forward.y.clamp(-1.0, 1.0).asin().to_degrees();
+    (yaw, pitch)
+}
+
+/// The pose of something that follows the track `lift` blocks above it, at distance `s`.
+pub fn pose_at(table: &Table, s: f64, lift: f64) -> Pose {
+    pose_from_frame(&table.frame(s), lift)
+}
+
+fn pose_from_frame(frame: &Frame, lift: f64) -> Pose {
+    let (yaw, pitch) = yaw_pitch(frame.forward);
+    Pose {
+        pos: frame.pos + frame.up * lift,
+        yaw,
+        pitch,
+    }
+}
+
+/// The car's pose when its middle is at `s`.
+pub fn car_pose(table: &Table, s: f64) -> Pose {
+    pose_at(table, s, CAR_LIFT)
+}
+
+/// The pose of seat `index` of a car whose middle is at `s`.
+pub fn seat_pose(table: &Table, s: f64, index: usize) -> Pose {
+    pose_at(table, s + SEAT_OFFSETS[index], SEAT_LIFT)
+}
+
+/// Where a rider's body is when sitting in a seat at `seat` (D49, spike R7).
+pub fn rider_point(seat: DVec3) -> DVec3 {
+    seat + DVec3::new(0.0, RIDER_LIFT, 0.0)
+}
+
+/// How many ticks apart a car's moves are (*k*, D44), worked out once per ride: the largest
+/// *k* from 1 to 5 whose straight glide strays at most `MAX_GLIDE_SAG` from the track on its
+/// tightest curve at `speed` (blocks per second). A straight chord of length L on a curve of
+/// radius R sags about L² / (8R).
+pub fn teleport_ticks(table: &Table, speed: f64) -> u32 {
+    let curvature = table.max_curvature();
+    for k in (1..=MAX_TELEPORT_TICKS).rev() {
+        let chord = speed * TICK_SECONDS * k as f64;
+        if chord * chord * curvature / 8.0 <= MAX_GLIDE_SAG {
+            return k;
+        }
+    }
+    1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::htp_park::coaster::demo::{self, demo_nodes};
+    use crate::game::htp_park::coaster::spline::Track;
+
+    fn oval() -> Table {
+        Table::new(&Track::closed(&demo_nodes(DVec3::new(0.0, 70.0, 0.0), 0.0)))
+    }
+
+    #[test]
+    fn pieces_cover_the_whole_lap_with_no_gap_or_overlap() {
+        let t = oval();
+        let pieces = rail_pieces(&t);
+        assert_eq!(pieces[0].s0, 0.0);
+        assert!((pieces.last().unwrap().s1 - t.length()).abs() < 1e-9);
+        for pair in pieces.windows(2) {
+            assert_eq!(pair[0].s1, pair[1].s0);
+        }
+        for p in &pieces {
+            assert!(p.s1 > p.s0);
+        }
+    }
+
+    #[test]
+    fn every_piece_sags_no_more_than_the_limit() {
+        let t = oval();
+        for p in rail_pieces(&t) {
+            assert!(sag(&t, p.s0, p.s1) <= MAX_SAG + 1e-12, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn straights_use_four_block_pieces_and_curves_shorter_ones() {
+        let t = oval();
+        let pieces = rail_pieces(&t);
+        assert!(
+            pieces
+                .iter()
+                .filter(|p| (p.s1 - p.s0 - 4.0).abs() < 1e-9)
+                .count()
+                >= 2
+        );
+        for p in &pieces {
+            let mid = t.position((p.s0 + p.s1) / 2.0);
+            // Well inside a half circle (the curves are at |z| > 5.5): one-block pieces only.
+            if mid.z.abs() > 7.0 {
+                assert!(p.s1 - p.s0 <= 1.0 + 1e-9, "{p:?} at z {}", mid.z);
+            }
+        }
+        assert!(pieces.iter().any(|p| p.s1 - p.s0 < 4.0));
+    }
+
+    #[test]
+    fn a_rail_pose_points_its_long_side_along_the_track() {
+        let t = oval();
+        let piece = rail_pieces(&t)[0];
+        let pose = rail_pose(&t, piece);
+        // The model's long side is its local Z: after the rotation it must follow the chord.
+        let along = pose.rotation * DVec3::Z;
+        let chord = (t.position(piece.s1) - t.position(piece.s0)).normalize();
+        assert!(along.dot(chord) > 0.999999);
+        // And its up side must be the track's up (the oval is flat).
+        assert!((pose.rotation * DVec3::Y).dot(DVec3::Y) > 0.999);
+        assert!((pose.scale.z - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn yaw_and_pitch_follow_minecrafts_convention() {
+        let close =
+            |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9;
+        assert!(close(yaw_pitch(DVec3::Z), (0.0, 0.0)));
+        assert!(close(yaw_pitch(DVec3::X), (-90.0, 0.0)));
+        assert!(close(yaw_pitch(-DVec3::X), (90.0, 0.0)));
+        let back = yaw_pitch(-DVec3::Z);
+        assert!((back.0.abs() - 180.0).abs() < 1e-9 && back.1 == 0.0);
+        let climbing = DVec3::new(0.0, 1.0, 1.0).normalize();
+        assert!(close(yaw_pitch(climbing), (0.0, -45.0)));
+    }
+
+    #[test]
+    fn the_cars_pose_hovers_above_the_track() {
+        let t = oval();
+        let p = car_pose(&t, 3.0);
+        assert!((p.pos.y - (70.0 + CAR_LIFT)).abs() < 1e-9);
+        assert!(p.pitch.abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_demo_car_glides_three_ticks_at_a_time() {
+        // Tightest bend about 5.3 blocks at 8 blocks/s: 3 ticks sag about 0.034, 4 ticks 0.06.
+        assert_eq!(teleport_ticks(&oval(), demo::SPEED), 3);
+        // A very slow train can use the longest gap, a very fast one must update every tick.
+        assert_eq!(teleport_ticks(&oval(), 1.0), 5);
+        assert_eq!(teleport_ticks(&oval(), 200.0), 1);
+    }
+
+    #[test]
+    fn the_riders_point_is_a_bit_above_the_seat() {
+        let p = rider_point(DVec3::new(1.0, 2.0, 3.0));
+        assert_eq!(p, DVec3::new(1.0, 2.71875, 3.0));
+    }
+}
+}
+pub mod runtime {
+// The per-tick loop (D21): `Runtime` is the one object that holds all of the mod's state.
+//
+// The game calls `Runtime::tick` once per server tick. A tick does, in order:
+//   1. say hello (once per world) and clean up leftovers from an earlier session;
+//   2. carry out orders typed by players (`/coaster demo`, `/coaster remove`);
+//   3. send the next batch of "build" commands (rails, car, seats);
+//   4. see who sits in which seat, then move the train;
+//   5. move the car (every few ticks) and the seats (every tick).
+//
+// It never touches the game directly: it asks a `Host` (see `host.rs`) to run command text
+// from `commands.rs`. So all of this is checked by `cargo test` with a `FakeHost`.
+
+use crate::game::htp_park::coaster::demo::{self, demo_nodes};
+use crate::game::htp_park::coaster::spline::Track;
+use crate::game::htp_park::coaster::table::Table;
+use crate::game::htp_park::commands;
+use crate::game::htp_park::host::Host;
+use crate::game::htp_park::render;
+use crate::game::htp_park::welcome::Welcome;
+use glam::DVec3;
+use std::collections::VecDeque;
+
+/// The usages the glue registers with the game (they all share the word `coaster`).
+pub const COMMAND_USAGES: [&str; 3] = ["coaster demo", "coaster ride", "coaster remove"];
+
+/// The most commands sent in one tick [D21]; the rest wait for the next tick.
+pub const MAX_COMMANDS_PER_TICK: usize = 400;
+
+/// A player counts as sitting in a seat when within this distance of its rider point (D49).
+pub const RIDER_ON_DISTANCE: f64 = 0.5;
+/// A rider is "off" when nobody is within this distance of the rider point (D49, spike R7).
+pub const RIDER_OFF_DISTANCE: f64 = 2.0;
+
+/// The demo oval's middle is this far ahead of the player (3 blocks of space + half its length).
+const DEMO_AHEAD: f64 = 3.0 + demo::STRAIGHT / 2.0 + demo::RADIUS;
+/// The rails float this high above the player's feet (D47).
+const DEMO_HEIGHT: f64 = 3.0;
+/// Seats per car in the demo (D49).
+const SEATS: usize = 2;
+
+/// Who typed a command, and where they stand and look.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Caller {
+    pub uuid: u128,
+    pub pos: DVec3,
+    /// Minecraft's yaw in degrees (0 looks towards +Z).
+    pub yaw: f64,
+}
+
+/// A job waiting for the next tick (commands can't run inside the command hook).
+#[derive(Clone, Debug, PartialEq)]
+enum Order {
+    Demo(Caller),
+    Remove,
+}
+
+/// The one demo ride that exists in the world.
+#[derive(Clone, Debug)]
+struct Demo {
+    table: Table,
+    /// Ticks between car moves (D44).
+    k: u32,
+    /// Distance of the car's middle along the track.
+    s: f64,
+    /// True while the train is going round.
+    moving: bool,
+    /// Ticks since the train last started or the car was last sent.
+    phase: u32,
+    /// Is somebody sitting in each seat?
+    occupied: [bool; SEATS],
+    /// Where each seat was sent last (so we can tell who sits there).
+    seat_pos: [DVec3; SEATS],
+}
+
+/// All of the mod's state.
+#[derive(Clone, Debug)]
+pub struct Runtime {
+    welcome: Welcome,
+    orders: VecDeque<Order>,
+    /// True until the mod's leftover entities from an earlier session were removed (D20).
+    cleanup_pending: bool,
+    demo: Option<Demo>,
+    /// Build commands that did not fit into earlier ticks.
+    build_queue: VecDeque<String>,
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Runtime::new()
+    }
+}
+
+impl Runtime {
+    /// A fresh runtime. `const`, so the glue can keep one in a `static`.
+    pub const fn new() -> Runtime {
+        Runtime {
+            welcome: Welcome::new(),
+            orders: VecDeque::new(),
+            cleanup_pending: true,
+            demo: None,
+            build_queue: VecDeque::new(),
+        }
+    }
+
+    /// A new world opened: forget everything that belonged to the old one.
+    pub fn world_opened(&mut self) {
+        self.welcome.world_opened();
+        self.orders.clear();
+        self.build_queue.clear();
+        self.demo = None;
+        self.cleanup_pending = true;
+    }
+
+    /// A player typed `line` (without the slash). Returns the answer to show them, or `None`
+    /// when this is not one of our commands. Real work is queued for the next tick.
+    pub fn command(&mut self, line: &str, caller: Caller) -> Option<String> {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if words.first() != Some(&"coaster") {
+            return None;
+        }
+        let answer = match words.get(1).copied() {
+            Some("demo") if words.len() == 2 => {
+                self.orders.push_back(Order::Demo(caller));
+                "Building the demo coaster in front of you."
+            }
+            Some("ride") if words.len() == 2 => {
+                if self.demo.is_some() {
+                    "Right-click a seat in the car to ride."
+                } else {
+                    "There is no coaster yet. Type /coaster demo first."
+                }
+            }
+            Some("remove") if words.len() == 2 => {
+                self.orders.push_back(Order::Remove);
+                "Removing the demo coaster."
+            }
+            _ => "Usage: /coaster demo, /coaster ride or /coaster remove.",
+        };
+        Some(answer.to_string())
+    }
+
+    /// One server tick.
+    pub fn tick<H: Host>(&mut self, host: &mut H) {
+        // Reading the player list costs a little, so only do it when something needs it.
+        let need_players = self.welcome.waiting() || self.cleanup_pending || self.demo.is_some();
+        let players = if need_players {
+            host.players()
+        } else {
+            Vec::new()
+        };
+
+        if let Some(line) = self.welcome.tick(!players.is_empty()) {
+            host.broadcast(line);
+        }
+        if self.cleanup_pending && !players.is_empty() {
+            // D20: nothing is saved yet, so anything of ours left in the world is stale.
+            host.run(&commands::kill_all());
+            self.cleanup_pending = false;
+        }
+
+        while let Some(order) = self.orders.pop_front() {
+            match order {
+                Order::Demo(caller) => self.build_demo(host, &caller),
+                Order::Remove => {
+                    host.run(&commands::kill_ride(commands::DEMO));
+                    self.build_queue.clear();
+                    self.demo = None;
+                }
+            }
+        }
+
+        // Build commands first, keeping room for this tick's moves.
+        let room = MAX_COMMANDS_PER_TICK - (SEATS + 1);
+        for _ in 0..room.min(self.build_queue.len()) {
+            if let Some(command) = self.build_queue.pop_front() {
+                host.run(&command);
+            }
+        }
+
+        self.move_train(host, &players);
+    }
+
+    /// Turn a `/coaster demo` order into the list of build commands.
+    fn build_demo<H: Host>(&mut self, host: &mut H, caller: &Caller) {
+        host.run(&commands::kill_ride(commands::DEMO));
+        self.build_queue.clear();
+
+        let yaw = caller.yaw.to_radians();
+        let ahead = DVec3::new(-yaw.sin(), 0.0, yaw.cos()) * DEMO_AHEAD;
+        let center = caller.pos + ahead + DVec3::new(0.0, DEMO_HEIGHT, 0.0);
+        let table = Table::new(&Track::closed(&demo_nodes(center, caller.yaw)));
+        let k = render::teleport_ticks(&table, demo::SPEED);
+
+        // Rails, then the car, then the seats.
+        for piece in render::rail_pieces(&table) {
+            let pose = render::rail_pose(&table, piece);
+            self.build_queue.push_back(commands::summon_rail(
+                commands::DEMO,
+                pose.pos,
+                pose.rotation,
+                pose.scale,
+            ));
+        }
+        let car = render::car_pose(&table, 0.0);
+        self.build_queue.push_back(commands::summon_car(
+            commands::DEMO,
+            0,
+            car.pos,
+            car.yaw,
+            car.pitch,
+            k,
+            render::CAR_SCALE,
+        ));
+        let mut seat_pos = [DVec3::ZERO; SEATS];
+        for (i, slot) in seat_pos.iter_mut().enumerate() {
+            let pose = render::seat_pose(&table, 0.0, i);
+            *slot = pose.pos;
+            self.build_queue
+                .extend(commands::summon_seat(commands::DEMO, i, pose.pos));
+        }
+
+        self.demo = Some(Demo {
+            table,
+            k,
+            s: 0.0,
+            moving: false,
+            phase: 0,
+            occupied: [false; SEATS],
+            seat_pos,
+        });
+    }
+
+    /// Steps 4 and 5 of the tick: who sits where, the train, the car and the seats.
+    fn move_train<H: Host>(&mut self, host: &mut H, players: &[crate::game::htp_park::host::PlayerInfo]) {
+        let Some(demo) = self.demo.as_mut() else {
+            return;
+        };
+        let length = demo.table.length();
+        if length <= 0.0 {
+            return;
+        }
+
+        // Who sits in which seat? Close = yes, far = no, in between = no change.
+        for i in 0..SEATS {
+            let point = render::rider_point(demo.seat_pos[i]);
+            let nearest = players
+                .iter()
+                .map(|p| p.pos.distance(point))
+                .fold(f64::INFINITY, f64::min);
+            if nearest <= RIDER_ON_DISTANCE {
+                demo.occupied[i] = true;
+            } else if nearest > RIDER_OFF_DISTANCE {
+                demo.occupied[i] = false;
+            }
+        }
+        let anyone = demo.occupied.iter().any(|&o| o);
+
+        // The train waits at the start while empty, runs while anyone rides, and when the last
+        // rider is off it finishes the lap and stops at the start (D49).
+        let step = demo::SPEED * render::TICK_SECONDS;
+        let mut stopped_now = false;
+        if anyone && !demo.moving {
+            demo.moving = true;
+            demo.phase = 0;
+        }
+        if demo.moving {
+            demo.s += step;
+            if demo.s >= length && !anyone {
+                demo.s = 0.0;
+                demo.moving = false;
+                stopped_now = true;
+            } else if demo.s >= length {
+                demo.s -= length;
+            }
+        }
+
+        // The car glides for `k` ticks to where it will be `k` ticks later, so it is sent every
+        // `k` ticks. When the train is about to stop it is aimed at the start, not past it.
+        let car_due = (demo.moving && demo.phase % demo.k == 0) || stopped_now;
+        if car_due {
+            let aim = if stopped_now {
+                length
+            } else if anyone {
+                demo.s + step * demo.k as f64
+            } else {
+                (demo.s + step * demo.k as f64).min(length)
+            };
+            let pose = render::car_pose(&demo.table, aim);
+            host.run(&commands::move_car(
+                commands::DEMO,
+                0,
+                pose.pos,
+                pose.yaw,
+                pose.pitch,
+            ));
+        }
+        if demo.moving {
+            demo.phase += 1;
+        }
+
+        // Seats are moved every tick, ridden or not, so an empty minecart never falls or drifts.
+        for i in 0..SEATS {
+            let pose = render::seat_pose(&demo.table, demo.s, i);
+            demo.seat_pos[i] = pose.pos;
+            host.run(&commands::move_seat(
+                commands::DEMO,
+                i,
+                pose.pos,
+                pose.yaw,
+                pose.pitch,
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::htp_park::host::{FakeHost, PlayerInfo};
+
+    fn player(pos: DVec3) -> PlayerInfo {
+        PlayerInfo {
+            uuid: 1,
+            name: "Alex".to_string(),
+            pos,
+            dimension: "minecraft:overworld".to_string(),
+        }
+    }
+
+    fn caller() -> Caller {
+        Caller {
+            uuid: 1,
+            pos: DVec3::new(0.0, 70.0, 0.0),
+            yaw: 0.0,
+        }
+    }
+
+    /// A runtime with a built demo, one player far away, and the build commands already sent.
+    fn built() -> (Runtime, FakeHost) {
+        let mut rt = Runtime::new();
+        let mut host = FakeHost::new();
+        host.players.push(player(DVec3::new(500.0, 70.0, 500.0)));
+        rt.tick(&mut host); // greeting + cleanup
+        rt.command("coaster demo", caller());
+        rt.tick(&mut host);
+        host.take_commands();
+        (rt, host)
+    }
+
+    fn seat_move_count(commands: &[String]) -> usize {
+        commands
+            .iter()
+            .filter(|c| c.starts_with("tp @e[tag=htp_seat_demo_"))
+            .count()
+    }
+
+    /// Put the player exactly where seat 0's rider sits.
+    fn sit_in_seat_zero(rt: &Runtime, host: &mut FakeHost) {
+        let point = render::rider_point(rt.demo.as_ref().unwrap().seat_pos[0]);
+        host.players[0].pos = point;
+    }
+
+    #[test]
+    fn the_first_tick_with_a_player_greets_and_cleans_up_once() {
+        let mut rt = Runtime::new();
+        let mut host = FakeHost::new();
+        rt.tick(&mut host); // nobody here: silence
+        assert!(host.broadcasts.is_empty() && host.commands.is_empty());
+        host.players.push(player(DVec3::ZERO));
+        rt.tick(&mut host);
+        rt.tick(&mut host);
+        assert_eq!(host.broadcasts, vec!["Horizon Theme Park loaded"]);
+        assert_eq!(host.commands, vec!["kill @e[tag=htp]"]);
+    }
+
+    #[test]
+    fn a_new_world_greets_and_cleans_up_again() {
+        let (mut rt, mut host) = built();
+        rt.world_opened();
+        assert!(rt.demo.is_none());
+        rt.tick(&mut host);
+        assert_eq!(host.broadcasts.len(), 2);
+        assert_eq!(host.commands, vec!["kill @e[tag=htp]"]);
+    }
+
+    #[test]
+    fn demo_builds_rails_then_the_car_then_the_seats() {
+        let mut rt = Runtime::new();
+        let mut host = FakeHost::new();
+        host.players.push(player(DVec3::new(500.0, 70.0, 500.0)));
+        rt.tick(&mut host);
+        host.take_commands();
+
+        let answer = rt.command("coaster demo", caller());
+        assert_eq!(
+            answer.as_deref(),
+            Some("Building the demo coaster in front of you.")
+        );
+        assert!(
+            host.commands.is_empty(),
+            "nothing runs inside the command hook"
+        );
+        rt.tick(&mut host);
+
+        let cmds = &host.commands;
+        assert!(cmds.len() <= MAX_COMMANDS_PER_TICK);
+        assert_eq!(cmds[0], "kill @e[tag=htp_demo]");
+        let rails = cmds.iter().take_while(|c| !c.contains("htp:car")).count() - 1;
+        assert!(rails >= 15, "only {rails} rail pieces");
+        assert!(cmds[1..=rails].iter().all(|c| c.contains("htp:rail")));
+        assert!(
+            cmds[rails + 1].contains("\"htp_car_demo_0\"")
+                && cmds[rails + 1].contains("teleport_duration:3")
+        );
+        assert!(
+            cmds[rails + 2].starts_with("summon minecraft:minecart")
+                && cmds[rails + 2].contains("htp_seat_demo_0")
+        );
+        assert!(
+            cmds[rails + 3].starts_with("summon minecraft:minecart")
+                && cmds[rails + 3].contains("htp_seat_demo_1")
+        );
+        // Then this tick's two seat moves (the train waits, so no car move).
+        assert_eq!(cmds.len(), rails + 4 + 2);
+        assert_eq!(seat_move_count(&cmds[rails + 4..]), 2);
+    }
+
+    #[test]
+    fn the_rails_are_placed_in_front_of_the_player_and_above_their_feet() {
+        let (rt, _) = built();
+        let table = &rt.demo.as_ref().unwrap().table;
+        // Centre = 14.5 blocks ahead (+z for yaw 0) and 3 blocks up.
+        let start = table.position(0.0);
+        assert!((start.y - 73.0).abs() < 1e-9);
+        assert!(start.z > 3.0 && start.z < 26.0);
+    }
+
+    #[test]
+    fn never_more_than_400_commands_a_tick() {
+        let mut rt = Runtime::new();
+        let mut host = FakeHost::new();
+        host.players.push(player(DVec3::new(500.0, 70.0, 500.0)));
+        rt.tick(&mut host);
+        host.take_commands();
+        for i in 0..1000 {
+            rt.build_queue.push_back(format!("say {i}"));
+        }
+        let mut sent = 0;
+        for _ in 0..4 {
+            rt.tick(&mut host);
+            let this_tick = host.take_commands();
+            assert!(this_tick.len() <= MAX_COMMANDS_PER_TICK);
+            sent += this_tick.len();
+        }
+        assert_eq!(sent, 1000);
+        assert!(rt.build_queue.is_empty());
+    }
+
+    #[test]
+    fn with_a_rider_every_tick_moves_both_seats_and_car_ticks_send_the_car_first() {
+        let (mut rt, mut host) = built();
+        let k = rt.demo.as_ref().unwrap().k;
+        assert_eq!(k, 3);
+        sit_in_seat_zero(&rt, &mut host);
+
+        for tick in 0..7u32 {
+            rt.tick(&mut host);
+            let cmds = host.take_commands();
+            assert_eq!(seat_move_count(&cmds), 2, "tick {tick}");
+            if tick % k == 0 {
+                assert!(
+                    cmds[0].starts_with("tp @e[tag=htp_car_demo_0,limit=1]"),
+                    "tick {tick}"
+                );
+                assert_eq!(cmds.len(), 3);
+            } else {
+                assert_eq!(cmds.len(), 2, "tick {tick}");
+            }
+            sit_in_seat_zero(&rt, &mut host); // the rider goes along with the seat
+        }
+    }
+
+    #[test]
+    fn the_car_is_aimed_k_ticks_ahead_of_the_train() {
+        let (mut rt, mut host) = built();
+        sit_in_seat_zero(&rt, &mut host);
+        rt.tick(&mut host);
+        let cmds = host.take_commands();
+        // After the first step the train is at 0.4; the car glides to where it will be 3 ticks later.
+        let table = rt.demo.as_ref().unwrap().table.clone();
+        let want = render::car_pose(&table, 0.4 + 0.4 * 3.0);
+        assert_eq!(
+            cmds[0],
+            commands::move_car(commands::DEMO, 0, want.pos, want.yaw, want.pitch)
+        );
+    }
+
+    #[test]
+    fn the_train_waits_while_empty() {
+        let (mut rt, mut host) = built();
+        for _ in 0..40 {
+            rt.tick(&mut host);
+            let cmds = host.take_commands();
+            assert_eq!(cmds.len(), 2, "only the two seat moves");
+        }
+        let demo = rt.demo.as_ref().unwrap();
+        assert_eq!(demo.s, 0.0);
+        assert!(!demo.moving);
+    }
+
+    #[test]
+    fn a_player_between_the_two_distances_changes_nothing() {
+        let (mut rt, mut host) = built();
+        // Standing 1 block from the rider point: not close enough to count as sitting.
+        host.players[0].pos = render::rider_point(rt.demo.as_ref().unwrap().seat_pos[0]) + DVec3::X;
+        rt.tick(&mut host);
+        assert!(!rt.demo.as_ref().unwrap().occupied[0]);
+        // Sitting, then stepping 1 block away: still counts as sitting.
+        sit_in_seat_zero(&rt, &mut host);
+        rt.tick(&mut host);
+        assert!(rt.demo.as_ref().unwrap().occupied[0]);
+        host.players[0].pos += DVec3::X * 1.0;
+        rt.tick(&mut host);
+        assert!(rt.demo.as_ref().unwrap().occupied[0]);
+        // Walking right away (more than 2 blocks): off.
+        host.players[0].pos = DVec3::new(500.0, 70.0, 500.0);
+        rt.tick(&mut host);
+        assert!(!rt.demo.as_ref().unwrap().occupied[0]);
+    }
+
+    #[test]
+    fn when_the_rider_gets_off_the_train_finishes_the_lap_and_stops_at_the_start() {
+        let (mut rt, mut host) = built();
+        sit_in_seat_zero(&rt, &mut host);
+        for _ in 0..10 {
+            rt.tick(&mut host);
+            sit_in_seat_zero(&rt, &mut host);
+        }
+        assert!(rt.demo.as_ref().unwrap().moving);
+        host.take_commands();
+
+        // The rider leaves.
+        host.players[0].pos = DVec3::new(500.0, 70.0, 500.0);
+        let mut ticks = 0;
+        while rt.demo.as_ref().unwrap().moving {
+            rt.tick(&mut host);
+            ticks += 1;
+            assert!(ticks < 400, "the train never stopped");
+        }
+        // The lap is about 59.7 blocks at 0.4 blocks a tick: roughly 150 ticks in all.
+        assert!(ticks > 100 && ticks < 160, "ticks {ticks}");
+        assert_eq!(rt.demo.as_ref().unwrap().s, 0.0);
+
+        // The final car move sent it to the start, and afterwards only seat moves remain.
+        let table = rt.demo.as_ref().unwrap().table.clone();
+        let start = render::car_pose(&table, table.length());
+        let last_car = host
+            .commands
+            .iter()
+            .rev()
+            .find(|c| c.starts_with("tp @e[tag=htp_car_demo_0"))
+            .unwrap()
+            .clone();
+        assert_eq!(
+            last_car,
+            commands::move_car(commands::DEMO, 0, start.pos, start.yaw, start.pitch)
+        );
+        host.take_commands();
+        rt.tick(&mut host);
+        assert_eq!(host.take_commands().len(), 2);
+    }
+
+    #[test]
+    fn ride_is_only_a_hint_and_sends_no_commands() {
+        let mut empty = Runtime::new();
+        let mut host = FakeHost::new();
+        let before = empty.command("coaster ride", caller());
+        assert_eq!(
+            before.as_deref(),
+            Some("There is no coaster yet. Type /coaster demo first.")
+        );
+        let (mut rt, mut host2) = built();
+        let after = rt.command("coaster ride", caller());
+        assert_eq!(
+            after.as_deref(),
+            Some("Right-click a seat in the car to ride.")
+        );
+        rt.tick(&mut host2);
+        assert_eq!(host2.take_commands().len(), 2, "only the seat moves");
+        // And a runtime with no demo sends nothing at all.
+        empty.tick(&mut host);
+        assert!(host.commands.is_empty());
+    }
+
+    #[test]
+    fn remove_kills_everything_of_the_demo_and_stops_the_moves() {
+        let (mut rt, mut host) = built();
+        assert!(rt.command("coaster remove", caller()).is_some());
+        rt.tick(&mut host);
+        assert_eq!(host.take_commands(), vec!["kill @e[tag=htp_demo]"]);
+        assert!(rt.demo.is_none());
+        rt.tick(&mut host);
+        assert!(host.take_commands().is_empty());
+    }
+
+    #[test]
+    fn other_commands_are_not_ours_and_bad_usage_gets_a_hint() {
+        let mut rt = Runtime::new();
+        assert_eq!(rt.command("gamemode creative", caller()), None);
+        assert_eq!(rt.command("cooking", caller()), None);
+        assert!(
+            rt.command("coaster", caller())
+                .unwrap()
+                .starts_with("Usage:")
+        );
+        assert!(
+            rt.command("coaster demo now", caller())
+                .unwrap()
+                .starts_with("Usage:")
+        );
+        assert!(rt.orders.is_empty());
+        assert!(rt.command("  coaster   demo ", caller()).is_some());
+        assert_eq!(rt.orders.len(), 1);
+    }
+
+    #[test]
+    fn a_second_demo_replaces_the_first() {
+        let (mut rt, mut host) = built();
+        rt.command("coaster demo", caller());
+        rt.tick(&mut host);
+        assert_eq!(host.commands[0], "kill @e[tag=htp_demo]");
+        assert!(host.commands.iter().any(|c| c.contains("htp:car")));
+    }
+}
+}
 pub mod welcome {
 // The "Horizon Theme Park loaded" greeting.
 //

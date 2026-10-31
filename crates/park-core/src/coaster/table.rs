@@ -6,7 +6,7 @@
 //! and store a point every 0.1 block. Looking up `s` is then one division and a blend between
 //! two stored points. Like a ruler laid along the track.
 
-use crate::coaster::frame::{compute_ups, Frame};
+use crate::coaster::frame::{Frame, compute_ups};
 use crate::coaster::spline::Track;
 use glam::DVec3;
 

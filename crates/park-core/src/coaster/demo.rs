@@ -69,7 +69,10 @@ mod tests {
     use crate::coaster::table::Table;
 
     fn table(yaw: f64) -> Table {
-        Table::new(&Track::closed(&demo_nodes(DVec3::new(100.0, 70.0, -40.0), yaw)))
+        Table::new(&Track::closed(&demo_nodes(
+            DVec3::new(100.0, 70.0, -40.0),
+            yaw,
+        )))
     }
 
     #[test]

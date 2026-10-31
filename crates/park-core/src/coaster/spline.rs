@@ -59,9 +59,11 @@ impl Track {
             let d2 = knot_gap(b, c);
             let d3 = knot_gap(c, d);
             // Catmull-Rom to Bézier handles (the standard centripetal formulas).
-            let h1 = (b * (2.0 * d1 * d1 + 3.0 * d1 * d2 + d2 * d2) - a * (d2 * d2) + c * (d1 * d1))
+            let h1 = (b * (2.0 * d1 * d1 + 3.0 * d1 * d2 + d2 * d2) - a * (d2 * d2)
+                + c * (d1 * d1))
                 / (3.0 * d1 * (d1 + d2));
-            let h2 = (c * (2.0 * d3 * d3 + 3.0 * d3 * d2 + d2 * d2) - d * (d2 * d2) + b * (d3 * d3))
+            let h2 = (c * (2.0 * d3 * d3 + 3.0 * d3 * d2 + d2 * d2) - d * (d2 * d2)
+                + b * (d3 * d3))
                 / (3.0 * d3 * (d3 + d2));
             segments.push(Segment {
                 p0: b,
@@ -105,6 +107,10 @@ mod tests {
 
     #[test]
     fn too_few_nodes_give_an_empty_track() {
-        assert!(Track::closed(&[DVec3::ZERO, DVec3::X]).segments().is_empty());
+        assert!(
+            Track::closed(&[DVec3::ZERO, DVec3::X])
+                .segments()
+                .is_empty()
+        );
     }
 }

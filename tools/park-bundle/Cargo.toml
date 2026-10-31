@@ -7,3 +7,7 @@ license.workspace = true
 
 # No dependencies on purpose (D34): nothing to download, and the whole tool is short enough to read.
 [dependencies]
+
+[dev-dependencies]
+# Only for tests/glued.rs: the glued park.rs uses glam, exactly as inside Horizon (D9, rule 10).
+glam = "=0.30.10"
