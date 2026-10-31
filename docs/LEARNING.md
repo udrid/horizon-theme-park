@@ -361,3 +361,22 @@ A plain text table: one row per line, values separated by commas. Any spreadshee
 
 ## Dry run (simulating ahead)
 Running the ride's maths forward without the game, to see what will happen. The mod uses it to know where the car will be a few ticks from now, so it can aim the car there.
+
+## Banking (and "level" frames)
+Banking is tilting the track sideways in a turn, like a velodrome, so the ride pushes you into the seat instead of sideways. M2 has no banking. So the car's "up" arrow must always point as near to the sky as the track allows. M1's frames carried "up" along the track without ever re-checking the sky, so in a climbing turn they slowly rolled over. `Table::new_level` fixes that for tracks that never go upside down.
+
+## Grade, crest and valley
+The grade is how steeply the track climbs or falls, as an angle (30 degrees up, 52 degrees down). A crest is the top of a hill and a valley is the bottom of a dip. Real coasters round every change of grade into a smooth curve, because a sharp corner would be a sudden shove. Our layout lists the grades in `demo.rs`.
+
+## Easing (a smooth blend)
+Changing from one value to another gradually, starting and ending gently, like a car pulling away without a jerk. We blend the track's angle between two grades with a cosine curve. A wider blend means a gentler bend.
+
+## g-onset (how fast the g changes)
+Your body copes with a heavy 4 g better than with a g that jumps by 3 in a quarter second. Designers limit how fast the g-force can change. Our limit is 3 g per second (D58), so valleys are rounded over long stretches.
+
+## Action bar
+The line of text above your hotbar in Minecraft. We use it for your speed in km/h and the station countdown. Only riders see it.
+
+## Clamp
+Forcing a number to stay between a smallest and a biggest value. `x.clamp(0.0, 1.0)` turns -3 into 0 and 7 into 1. We use it to keep a blend between 0 and 100 percent.
+
