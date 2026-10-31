@@ -26,8 +26,10 @@ pub const STRAIGHT: f64 = 11.0;
 pub const RADIUS: f64 = 6.0;
 /// The oval's exact length in blocks: both straights plus a full circle.
 pub const EXACT_LENGTH: f64 = 2.0 * STRAIGHT + std::f64::consts::TAU * RADIUS;
-/// Constant speed of the demo train, in blocks per second (about 29 km/h).
-pub const SPEED: f64 = 8.0;
+/// Constant speed of the demo train, in blocks per second.
+/// EXPERIMENT (2026-10-31): was 8.0 (about 29 km/h, D47). 20.0 is 72 km/h, to feel how the
+/// rider's stepping camera (D23) behaves at speed. Set it back to 8.0 to undo.
+pub const SPEED: f64 = 20.0;
 
 /// Spacing of nodes along the straights, in blocks.
 const STRAIGHT_NODE_GAP: f64 = 2.2;
@@ -1263,12 +1265,15 @@ mod tests {
     }
 
     #[test]
-    fn the_demo_car_glides_three_ticks_at_a_time() {
+    fn the_car_glides_fewer_ticks_at_a_time_the_faster_it_goes() {
         // Tightest bend about 5.3 blocks at 8 blocks/s: 3 ticks sag about 0.034, 4 ticks 0.06.
-        assert_eq!(teleport_ticks(&oval(), demo::SPEED), 3);
+        assert_eq!(teleport_ticks(&oval(), 8.0), 3);
+        // At 20 blocks/s (the demo's experiment speed): 2 ticks would sag 0.09, so every tick.
+        assert_eq!(teleport_ticks(&oval(), 20.0), 1);
         // A very slow train can use the longest gap, a very fast one must update every tick.
         assert_eq!(teleport_ticks(&oval(), 1.0), 5);
         assert_eq!(teleport_ticks(&oval(), 200.0), 1);
+        let _ = demo::SPEED;
     }
 
     #[test]
@@ -1709,7 +1714,7 @@ mod tests {
         assert!(cmds[1..=rails].iter().all(|c| c.contains("htp:rail")));
         assert!(
             cmds[rails + 1].contains("\"htp_car_demo_0\"")
-                && cmds[rails + 1].contains("teleport_duration:3")
+                && cmds[rails + 1].contains("teleport_duration:")
         );
         assert!(
             cmds[rails + 2].starts_with("summon minecraft:minecart")
@@ -1759,7 +1764,7 @@ mod tests {
     fn with_a_rider_every_tick_moves_both_seats_and_car_ticks_send_the_car_first() {
         let (mut rt, mut host) = built();
         let k = rt.demo.as_ref().unwrap().k;
-        assert_eq!(k, 3);
+        assert!((1..=render::MAX_TELEPORT_TICKS).contains(&k));
         sit_in_seat_zero(&rt, &mut host);
 
         for tick in 0..7u32 {
@@ -1785,9 +1790,12 @@ mod tests {
         sit_in_seat_zero(&rt, &mut host);
         rt.tick(&mut host);
         let cmds = host.take_commands();
-        // After the first step the train is at 0.4; the car glides to where it will be 3 ticks later.
+        // After the first step the train is one step along; the car glides to where it will be
+        // k ticks later.
         let table = rt.demo.as_ref().unwrap().table.clone();
-        let want = render::car_pose(&table, 0.4 + 0.4 * 3.0);
+        let k = rt.demo.as_ref().unwrap().k as f64;
+        let step = demo::SPEED * render::TICK_SECONDS;
+        let want = render::car_pose(&table, step + step * k);
         assert_eq!(
             cmds[0],
             commands::move_car(commands::DEMO, 0, want.pos, want.yaw, want.pitch)
@@ -1866,8 +1874,10 @@ mod tests {
             ticks += 1;
             assert!(ticks < 400, "the train never stopped");
         }
-        // The lap is about 59.7 blocks at 0.4 blocks a tick: roughly 150 ticks in all.
-        assert!(ticks > 100 && ticks < 160, "ticks {ticks}");
+        // The lap is about 59.7 blocks, one step per tick: about length / step ticks in all.
+        let lap = (rt.demo.as_ref().unwrap().table.length() / (demo::SPEED * render::TICK_SECONDS))
+            as i32;
+        assert!((ticks - lap).abs() < 12, "ticks {ticks}, lap {lap}");
         assert_eq!(rt.demo.as_ref().unwrap().s, 0.0);
 
         // The final car move sent it to the start, and afterwards only seat moves remain.

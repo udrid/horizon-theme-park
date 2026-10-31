@@ -267,12 +267,15 @@ mod tests {
     }
 
     #[test]
-    fn the_demo_car_glides_three_ticks_at_a_time() {
+    fn the_car_glides_fewer_ticks_at_a_time_the_faster_it_goes() {
         // Tightest bend about 5.3 blocks at 8 blocks/s: 3 ticks sag about 0.034, 4 ticks 0.06.
-        assert_eq!(teleport_ticks(&oval(), demo::SPEED), 3);
+        assert_eq!(teleport_ticks(&oval(), 8.0), 3);
+        // At 20 blocks/s (the demo's experiment speed): 2 ticks would sag 0.09, so every tick.
+        assert_eq!(teleport_ticks(&oval(), 20.0), 1);
         // A very slow train can use the longest gap, a very fast one must update every tick.
         assert_eq!(teleport_ticks(&oval(), 1.0), 5);
         assert_eq!(teleport_ticks(&oval(), 200.0), 1);
+        let _ = demo::SPEED;
     }
 
     #[test]

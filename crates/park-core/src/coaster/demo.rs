@@ -11,8 +11,10 @@ pub const STRAIGHT: f64 = 11.0;
 pub const RADIUS: f64 = 6.0;
 /// The oval's exact length in blocks: both straights plus a full circle.
 pub const EXACT_LENGTH: f64 = 2.0 * STRAIGHT + std::f64::consts::TAU * RADIUS;
-/// Constant speed of the demo train, in blocks per second (about 29 km/h).
-pub const SPEED: f64 = 8.0;
+/// Constant speed of the demo train, in blocks per second.
+/// EXPERIMENT (2026-10-31): was 8.0 (about 29 km/h, D47). 20.0 is 72 km/h, to feel how the
+/// rider's stepping camera (D23) behaves at speed. Set it back to 8.0 to undo.
+pub const SPEED: f64 = 20.0;
 
 /// Spacing of nodes along the straights, in blocks.
 const STRAIGHT_NODE_GAP: f64 = 2.2;

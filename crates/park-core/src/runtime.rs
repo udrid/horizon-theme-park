@@ -428,7 +428,7 @@ mod tests {
         assert!(cmds[1..=rails].iter().all(|c| c.contains("htp:rail")));
         assert!(
             cmds[rails + 1].contains("\"htp_car_demo_0\"")
-                && cmds[rails + 1].contains("teleport_duration:3")
+                && cmds[rails + 1].contains("teleport_duration:")
         );
         assert!(
             cmds[rails + 2].starts_with("summon minecraft:minecart")
@@ -478,7 +478,7 @@ mod tests {
     fn with_a_rider_every_tick_moves_both_seats_and_car_ticks_send_the_car_first() {
         let (mut rt, mut host) = built();
         let k = rt.demo.as_ref().unwrap().k;
-        assert_eq!(k, 3);
+        assert!((1..=render::MAX_TELEPORT_TICKS).contains(&k));
         sit_in_seat_zero(&rt, &mut host);
 
         for tick in 0..7u32 {
@@ -504,9 +504,12 @@ mod tests {
         sit_in_seat_zero(&rt, &mut host);
         rt.tick(&mut host);
         let cmds = host.take_commands();
-        // After the first step the train is at 0.4; the car glides to where it will be 3 ticks later.
+        // After the first step the train is one step along; the car glides to where it will be
+        // k ticks later.
         let table = rt.demo.as_ref().unwrap().table.clone();
-        let want = render::car_pose(&table, 0.4 + 0.4 * 3.0);
+        let k = rt.demo.as_ref().unwrap().k as f64;
+        let step = demo::SPEED * render::TICK_SECONDS;
+        let want = render::car_pose(&table, step + step * k);
         assert_eq!(
             cmds[0],
             commands::move_car(commands::DEMO, 0, want.pos, want.yaw, want.pitch)
@@ -585,8 +588,10 @@ mod tests {
             ticks += 1;
             assert!(ticks < 400, "the train never stopped");
         }
-        // The lap is about 59.7 blocks at 0.4 blocks a tick: roughly 150 ticks in all.
-        assert!(ticks > 100 && ticks < 160, "ticks {ticks}");
+        // The lap is about 59.7 blocks, one step per tick: about length / step ticks in all.
+        let lap = (rt.demo.as_ref().unwrap().table.length() / (demo::SPEED * render::TICK_SECONDS))
+            as i32;
+        assert!((ticks - lap).abs() < 12, "ticks {ticks}, lap {lap}");
         assert_eq!(rt.demo.as_ref().unwrap().s, 0.0);
 
         // The final car move sent it to the start, and afterwards only seat moves remain.
