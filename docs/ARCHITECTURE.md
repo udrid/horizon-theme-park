@@ -306,10 +306,10 @@ The spike proves this works (R5).
 | Call | Command |
 |---|---|
 | spawn_display | `summon minecraft:item_display X Y Z {UUID:[I;a,b,c,d],Tags:["htp","htp_<id>"],item:{id:"htp:<model>"},transformation:{left_rotation:[x,y,z,w],right_rotation:[0,0,0,1],translation:[0,0,0],scale:[sx,sy,sz]},view_range:R,teleport_duration:T}` |
-| move_display | `tp <uuid> X Y Z` (teleport_duration was set at summon) |
-| set_rotation | `data merge entity <uuid> {transformation:{left_rotation:[…]},interpolation_duration:N,start_interpolation:0}` |
+| move_display | `tp <selector> X Y Z`, sent every *k* ticks and aimed *k* ticks ahead with `teleport_duration` *k* [D32]. `tp <uuid>` does not find displays yet, so the selector is `@e[tag=<unique tag>,limit=1]`; each costs about 0.7 µs per entity in the world [D25]. Seats use the rider's name instead [D31] |
+| set_rotation | `tp <selector> X Y Z <yaw> <pitch>`, sent together with the move [D24]. `data merge` on displays does nothing in this build, so no roll after spawn |
 | remove_display / remove_tagged | `kill <uuid>` / `kill @e[tag=<tag>]` |
-| seat / unseat | `ride <player> mount <uuid>` / `ride <player> dismount` |
+| seat / unseat | `ride <player> mount <seat mob>` / `ride <player> dismount`. Only mobs can be ridden [D23]. A seat with a rider is moved with `execute as <PlayerName> on vehicle run tp @s X Y Z` [D31] |
 | teleport_player | `tp <player> X Y Z` |
 | launch_player | No vanilla command sets a player's velocity, as far as we know. The spike looks for one (R9); otherwise this call is `host_mixin`'s job |
 | particles | `particle <kind> X Y Z 0 0 0 0 <count> force` |
@@ -336,18 +336,20 @@ scripted `players()`. Runtime tests assert on that list: order, count, and the e
 
 ## 6. Rendering [D16, D17, D19]
 
-- **Rails:** one `item_display` per `track_spacing` (1 block), at `s = (k + 0.5)·spacing`, showing
-  `htp:rail` from the content mod. Its rotation is the frame turned into a quaternion, and it's stretched to
-  `spacing` along forward. Rails are placed once and never moved.
-- **Cars:** one `item_display` per car (`htp:car_<style>`). Each tick: one `move_display` (position)
-  plus one `set_rotation` (frame quaternion, `interpolation_ticks` = 1).
-- **Seats:** one invisible display (`Shows::Nothing`) per seat, moved each tick to
-  `car frame + seat offset`. Riders are seated with `ride` [D16]. A 6-car, 2-seat train costs
-  6 × 2 + 12 = 24 commands per tick.
+- **Rails [D29]:** adaptive pieces: up to 4 blocks long while the track is straight or bends gently, 1 block
+  where it bends more than a set angle (`track_spacing` is the minimum length). Each is an `item_display`
+  showing `htp:rail` from the content mod, rotated by the frame's quaternion and stretched to its length along
+  forward. Rails are placed once and never moved. Check in game: how a stretched model looks.
+- **Cars:** one `item_display` per car (`htp:car_<style>`). Every *k* ticks: one `tp` that carries both the
+  position and the yaw/pitch of where the car will be *k* ticks later [D24, D32], with `teleport_duration` *k*; no roll.
+- **Seats:** one invisible **mob** per seat (not a display: Horizon only lets players ride mobs) [D23],
+  moved every tick to `car frame + seat offset` through its rider's name [D31] (O(1), about 7 µs each). The rider's camera steps 20 times a second. Riders are seated with `ride`. A 6-car, 2-seat train costs
+  6 × 2 + 6 = 18 commands per tick.
 - **Blocks, not entities:** supports, stations, queues and decor are content-mod blocks [D17].
-- **Parking [D19]:** a ride with no player within 128 blocks has its displays removed
-  (`remove_tagged("htp_<id>")`). A player within 112 blocks gets it redrawn, at most 50 displays per tick.
-  Physics keeps running while parked. A redraw bumps the ride's "generation", so UUIDs never repeat.
+- **Parking [D19, D30]:** the track is split into groups of about 16 pieces. A group with no player within
+  96 blocks (3D distance) has its displays removed; a player within 80 blocks gets it redrawn, at most 50
+  pieces per tick. Physics keeps running while parked. A redraw bumps the group's "generation", so UUIDs
+  never repeat. Check in game: pop-in margin at speed (80 blocks vs the 64-block draw range).
 - **Budget [D19]:** count the displays within 160 blocks of each player. The limit is set by the spike
   (first guess 2,000–3,000). Past it, the mod warns in chat and won't unpark more rides near that player.
 - **Free view, fling-off dismount [D22]:** the rider's view is never turned by the car. A rider who
@@ -397,7 +399,7 @@ At most 400 commands per tick. The rest carry over, with one log warning per rid
 
 | # | Risk | How the spike proves it | If it fails |
 |---|---|---|---|
-| R1 | `/ride` onto an `item_display` works in Horizon, including an empty (invisible) one | Part A command test, screenshot | Try `interaction` or `armor_stand` seats (round 9, option C) |
+| R1 | `/ride` onto an `item_display` works in Horizon, including an empty (invisible) one | Part A command test, screenshot | **Spike result: ❌ for displays; mobs work** [D23]. See SPIKE_RESULTS.md |
 | R2 | A ridden display moving every tick feels smooth | Ride at `teleport_duration` 1, 2, 3; record video | Use the smoothest value; consider the fallback host |
 | R3 | `tp` position and `data merge` rotation stay in step (separate clocks in `text_displays.rs`) | Watch a rolling car at speed | Match interpolation lengths, or rotate only every 2nd tick |
 | R4 | 500 / 1,000 displays, and a packed park (6,000 over 400 × 400), keep good FPS and tick time; tracking range really limits what is sent | FPS and `horizon-ctl state` while walking | Lower budget; adaptive spacing (round 10, B); less detail far away |
