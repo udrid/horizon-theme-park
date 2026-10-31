@@ -1,7 +1,7 @@
 id = "htp"
 name = "Horizon Theme Park content"
 version = "0.1.0"
-description = "Models for Horizon Theme Park: the rail piece and the car shell used by the demo coaster."
+description = "Models for Horizon Theme Park: the rail piece, the car shell, the track wand and the node marker."
 authors = ["Horizon Theme Park"]
 api = "0.2"
 side = "both"

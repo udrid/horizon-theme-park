@@ -6,19 +6,22 @@
 // `cargo test` checks it. Here we do three small jobs:
 //   1. keep ONE `Runtime` for the whole game (behind a lock);
 //   2. show park-core the game through the `Host` "door" (players, run a command, chat);
-//   3. hand the game's four news items (world opened, tick, register commands, a command
-//      was typed) to the runtime.
+//   3. hand the game's news items (world opened or closing, tick, register commands, a command
+//      was typed, the track wand used) to the runtime.
 //
 // RULE: nothing in here may panic (crash). A panic inside a hook can take the whole world down.
 // So there is no `unwrap()` and no `expect()`.
 
 use crate::game::Game;
+use crate::game::htp_park::commands::WAND_ITEM;
 use crate::game::htp_park::host::{Host, PlayerInfo};
-use crate::game::htp_park::runtime::{COMMAND_USAGES, Caller, Runtime};
+use crate::game::htp_park::runtime::{COMMAND_USAGES, Caller, Runtime, WandClick};
 use crate::game::native_lifecycle::{ServerTickPhase, WorldPhase};
 use crate::game::native_server::{NativeCommand, NativeServerPlayer};
 use glam::DVec3;
+use horizon_client::items::ItemStack;
 use horizon_client::text::Text;
+use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
 // One `Runtime` for the whole game, behind a lock (a "Mutex"): only one piece of code can use it
@@ -75,15 +78,31 @@ impl Host for GameHost<'_, '_> {
         // The game's log only (logs/latest.log); nothing in chat.
         log::info!("{text}");
     }
+
+    fn world_dir(&self) -> Option<PathBuf> {
+        // The open world's folder, where the rides are saved (None when no world is open).
+        self.0.native_world_dir()
+    }
 }
 
 /// Called from the world-lifecycle hook (see on_world.rs).
-pub(super) fn world(phase: WorldPhase) {
-    if matches!(phase, WorldPhase::WorldOpenReady) {
-        // In single-player nobody is "placed" in the world yet at this moment, so a chat line
-        // would not arrive. We only log it, and tell park-core a new world has started.
-        log::info!("Horizon Theme Park: world open ready");
-        runtime().world_opened();
+pub(super) fn world(game: &mut Game<'_>, phase: WorldPhase) {
+    match phase {
+        WorldPhase::WorldOpenReady => {
+            // In single-player nobody is "placed" in the world yet at this moment, so a chat line
+            // would not arrive. We only log it, and tell park-core a new world has started.
+            // The world folder is logged too: the first build checks that it is already known here (F5).
+            log::info!(
+                "Horizon Theme Park: world open ready, world folder = {:?}",
+                game.native_world_dir()
+            );
+            runtime().world_opened();
+        }
+        WorldPhase::WorldCloseFinal => {
+            // Save anything not saved yet. Rides are also saved right after every change.
+            runtime().world_closing(&mut GameHost(game));
+        }
+        _ => {}
     }
 }
 
@@ -117,10 +136,40 @@ pub(super) fn command(
     // to read which way they look: that would be a private Horizon field, D52.)
     let caller = Caller {
         uuid: player.uuid,
+        name: player.name.clone(),
         pos: DVec3::new(player.position[0], player.position[1], player.position[2]),
     };
     if let Some(answer) = runtime().command(line, caller) {
         *ran = true;
         game.native_feedback(Text::literal(answer));
+    }
+}
+
+/// Called when a player right-clicks a BLOCK with an item (see on_use_item_on.rs). Only the track
+/// wand is claimed (so it places no block and opens nothing); every other item is left alone.
+/// Commands are refused inside this hook, so park-core only queues the click for the next tick.
+pub(super) fn use_item_on(
+    game: &mut Game<'_>,
+    stack: &ItemStack,
+    pos: [i32; 3],
+    claimed: &mut bool,
+) {
+    if stack.item.to_string() != WAND_ITEM {
+        return;
+    }
+    *claimed = true;
+    if let Some(player) = game.native_acting_player() {
+        runtime().wand_click(player.uuid, WandClick::Block(pos));
+    }
+}
+
+/// Called when a player right-clicks the AIR with an item (see on_use_item.rs). Same rules as above.
+pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut bool) {
+    if stack.item.to_string() != WAND_ITEM {
+        return;
+    }
+    *claimed = true;
+    if let Some(player) = game.native_acting_player() {
+        runtime().wand_click(player.uuid, WandClick::Air);
     }
 }

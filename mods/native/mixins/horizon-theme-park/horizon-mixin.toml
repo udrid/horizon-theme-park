@@ -24,13 +24,15 @@ file = "crates/horizon-client/src/game.rs"
 name = "htp_glue"
 source = "glue.rs"
 
-# At the start of every world phase change, tell the glue (it notes "a new world opened").
+# At the start of every world phase change, tell the glue (it notes "a new world opened", and
+# saves the rides when the world closes).
 [[injection]]
 id = "world"
 kind = "HEAD"
 target = "horizon_client::game::native_hooks::Game<'_>::native_world_lifecycle"
 helper = "on_world.rs"
 bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "phase", ty = "crate::game::native_lifecycle::WorldPhase", value = "phase" },
 ]
 
@@ -45,7 +47,7 @@ bindings = [
   { name = "phase", ty = "crate::game::native_lifecycle::ServerTickPhase", value = "phase" },
 ]
 
-# When the game asks which commands mods add, the glue adds `/coaster demo`, `ride` and `remove`.
+# When the game asks which commands mods add, the glue adds the `/coaster ...` commands.
 [[injection]]
 id = "commands"
 kind = "HEAD"
@@ -66,4 +68,29 @@ bindings = [
   { name = "player", ty = "&crate::game::native_server::NativeServerPlayer", value = "player" },
   { name = "command", ty = "&str", value = "command" },
   { name = "ran", ty = "&mut bool", value = "&mut *ran" },
+]
+
+# A right-click on a block with the track wand (API 13): the glue claims it and queues the click.
+[[injection]]
+id = "use_item_on"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_use_item_on"
+helper = "on_use_item_on.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+  { name = "claimed", ty = "&mut bool", value = "&mut *claimed" },
+]
+
+# A right-click in the air with the track wand (API 13): changes the wand's mode.
+[[injection]]
+id = "use_item"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_use_item"
+helper = "on_use_item.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
+  { name = "claimed", ty = "&mut bool", value = "&mut *claimed" },
 ]

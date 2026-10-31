@@ -392,3 +392,21 @@ Temporary blocks you place only to stand on or click on, then remove. Builders u
 
 ## Leftover (stale) entity
 An entity the mod meant to remove, but that sat in an unloaded part of the world when it tried. It comes back when that area loads again. A session tag lets the mod recognise and remove it.
+
+## Serde (saving and loading)
+A helper library that turns our Rust data into text and back. You write `#[derive(Serialize, Deserialize)]` above a type, and serde learns how to save it. It's like a label-maker: it labels every part of a ride ("pos", "kind") so the same labels can be read back later. We use it only in `save.rs`.
+
+## Safe save (`.tmp` and `.bak`)
+Saving straight over a file is risky: if the game crashes half way, the file is half written. So we write the new text into `thunder.json.tmp`, copy the old file to `thunder.json.bak`, and only then swap the new one in. It's like writing a new page on scrap paper and gluing it in only once it's finished, keeping the old page in a drawer.
+
+## Format version
+A number at the top of every saved file (`"format": 1`). If a newer mod saves format 2, an older mod sees the bigger number and refuses to touch the file, instead of damaging something it doesn't understand.
+
+## Generation
+A counter on each group of rail pieces. Every time the group is drawn again, the number goes up, and the new pieces carry it as a tag (`htp_gen_2`). Any piece with an older number is a leftover and can be removed.
+
+## Parking
+Taking down the displays of track far from every player and drawing them again when someone walks up (D30). The ride is still there and still runs; only its pictures are put away. It's like a stage crew that only builds the scenery the audience can see.
+
+## Realism report
+The chat summary after `/coaster create`: top speed, g-forces, drops and lift height, with anything past the realism limits (D58) shown in red. It comes from one pretend lap run on paper (a "dry lap") before anyone rides.
