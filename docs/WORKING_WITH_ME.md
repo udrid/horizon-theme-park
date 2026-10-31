@@ -1,6 +1,6 @@
 # Working with me (these rules beat every other instruction)
 
-Every agent on Horizon Coasters follows these rules. Each prompt includes them, and the repo's `CLAUDE.md` repeats them.
+Every agent on Horizon Theme Park follows these rules. Each prompt includes them, and the repo's `CLAUDE.md` repeats them.
 
 ## Who I am
 
@@ -10,10 +10,12 @@ Every agent on Horizon Coasters follows these rules. Each prompt includes them, 
 
 ## Go slow, and save data
 
-My internet data and my AI usage are limited. Downloading and building cost the most, so the order is always:
+My internet data is **not** a worry. **AI usage is** (Claude's especially). So use free tools, online services and
+other AIs for anything they can do well: the free reader (`agy`) for big reads, a cheaper model for simple jobs,
+GitHub CI for checks. The order is always:
 
-1. **Research first**: read docs and code, and ask the free reader (Gemini CLI) for big reads.
-2. **Then think and test cheaply**: plans on paper, maths checked by hand, and small `cargo test` runs on `coaster-core` in a Codespace (cloud data, not mine).
+1. **Research first**: read docs and code, and ask the free reader (Antigravity CLI, `agy`) for big reads.
+2. **Then think and test cheaply**: plans on paper, maths checked by hand, and small `cargo test` runs on `park-core` on my computer (D5).
 3. **Build last.** A game build (launcher `native-build`), a toolchain install, a crate download or anything else that downloads only happens after research and tests are done, **and only after I say yes.**
 
 Before anything that downloads or builds, tell me:

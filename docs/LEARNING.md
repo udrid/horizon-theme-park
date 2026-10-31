@@ -181,3 +181,102 @@ A very long ID number (128 bits) that names one entity. We pick each display's U
 
 ## Engine spike
 A short, throwaway experiment that proves the risky parts work before we build on them. Like testing one tile before tiling the whole bathroom.
+
+## Summon
+The command that creates an entity, like ordering a new item from a shop. `summon minecraft:item_display 10 70 10 {…}` makes a display at that spot; the `{…}` part is a list of settings (its tags, its item, its size, even its UUID).
+
+## Teleport duration (`teleport_duration`)
+A setting on a display: how many ticks it takes to glide to a new spot after a `tp`. 0 means it jumps; 1 means it glides over one tick, so on screen it moves smoothly. Like a slide on a train: the longer the slide, the smoother but the more it trails behind.
+
+## Interpolation
+The game drawing the in-between positions of something that only changes 20 times a second, so you see 100+ smooth pictures a second instead of 20 jumps. Like the frames drawn between two key poses in a cartoon.
+
+## Tick (and tick time)
+One step of the game's clock; there are 20 a second, so each has 50 milliseconds to finish everything. "Tick time" is how long it really took. If it goes over 50 ms the whole game slows down.
+
+## Selector
+The `@e[tag=x]` part of a command: "every entity that matches this". The game checks every entity to answer, so the more entities exist, the slower each selector gets. Like finding a person by calling out their hair colour in a crowd, instead of by their ID card.
+
+## Datapack function
+A text file of commands the game can run with one `function` command, and which can schedule itself again a tick later. We used one in the spike to move things every tick without writing a mod.
+
+## Seat (mob seat)
+The thing a rider sits on. In Horizon today only a mob (a living creature, like a chicken) can carry a rider, so our "invisible seat" would be an invisible mob.
+
+## Velocity
+Speed together with direction, how fast and which way something is moving right now. A rider thrown off a coaster keeps the coaster's velocity. Horizon has no command to give a player one.
+
+## Stepped vs smooth
+Stepped motion shows only the 20 positions per second the game calculates, so it looks like a slideshow at high speed. Smooth motion draws the positions in between. We tested the difference by looking at a striped floor: stepped shows the stripes at exactly the same screen spots every time.
+
+## Lookup vs scan
+A lookup goes straight to one thing by its name or ID, like finding a book by its shelf number. A scan checks everything until it finds a match, like reading every spine in the library. A command that finds a player by name is a lookup; `@e[tag=x]` is a scan, so it gets slower the more entities exist.
+
+## Aimed ahead (our term)
+Instead of moving a car every tick, the mod sends it to where it will be a few ticks from now and tells the game to glide there over those ticks. Like throwing a ball to where your friend will be, not to where they are.
+
+## Chord
+The straight line between two points on a curve. A car gliding between two updates travels along the chord, so on a tight curve the updates must come more often or the car cuts the corner.
+
+## Compile (compiler)
+Turning the Rust text we write into a program the computer can run. The compiler is strict, like a teacher marking every spelling mistake before you may hand in the essay. "It compiles" means it passed that check.
+
+## Panic
+A Rust program stopping on purpose because something "can't happen" did happen, like a machine's emergency stop button. Inside the game a panic can take the whole world down, so our glue code must never panic.
+
+## Edition (Rust edition)
+A version of Rust's grammar rules. Every few years Rust adds new rules; each project says which set it follows, like a board game played with the 2021 or the 2024 rulebook. Horizon plays with 2024. Our code gets glued into Horizon, so it is judged by the 2024 rulebook there.
+
+## Attribute
+A sticky note on a piece of code for the compiler, written `#[…]`. `#[test]` says "this is a test"; `#[cfg(test)]` says "only include this when testing". A note with `!`, `#![…]`, sticks to the whole file instead of one item. Horizon's mixin tool refuses those whole-file notes.
+
+## Doc comment
+A comment meant for documentation. `///` describes the thing below it; `//!` describes the whole file. To Rust, `//!` is a whole-file attribute, so our glue tool turns it into a plain `//` comment.
+
+## Macro
+A shortcut that writes code for you, recognised by its `!`, like `println!` or `env!`. `env!` reads a setting from the project being built. Inside the game that would be Horizon's project, not ours, so `park-core` doesn't use it.
+
+## Module path (`crate::`)
+The address of a piece of code. `crate::welcome::Welcome` means "in this project, the drawer `welcome`, the item `Welcome`". When the glue tool moves `park-core` into the game, the address changes to `crate::game::htp_park::welcome::Welcome`, like updating every address book after moving house.
+
+## Generated file (and "stale")
+A file a tool writes, never a person. `park.rs` is generated by `park-bundle`. It is "stale" when the source changed but nobody re-ran the tool, like a printed timetable that is out of date. The `--check` step catches that.
+
+## Test-only code
+Code marked `#[cfg(test)]`. It is included only when running tests and left out of the real build, like scaffolding that is never part of the finished house. That's why our glue tool can leave it in the game file: the game never builds it.
+
+## Integration test (and sample tree)
+A test that uses code from the outside, the way someone else would. Ours will paste the glued file into a pretend "game" folder and check it works there. A sample tree (also called a fixture) is a small set of made-up files the tests run on, like practice dough before baking the real cake.
+
+## Library feature
+An optional extra in a library that a project can switch on, like the options list when you buy a car. Horizon's `glam` has no extras switched on, so our code must not rely on any (for example the one that lets `serde` save a `DVec3`).
+
+## serde
+A library that turns our data into text (like JSON) and back. Like a translator between "what the program holds in memory" and "what goes in a file". We'll use it to save rides at M3.
+
+## Parser (and syn)
+A parser reads text and works out its structure, like a reader spotting sentences and paragraphs. `syn` is a library that reads Rust exactly like the compiler. Our glue tool could use it, or simply read the text line by line.
+
+## Line endings
+The invisible mark at the end of each line of text. Windows uses two characters (written CRLF), Linux and Mac use one (LF), like two countries writing dates differently. Git on your PC converts between them, so our tools must treat both as the same. A `.gitattributes` file tells Git which style to keep for a file.
+
+## Exit code
+A number a program gives back when it finishes: 0 means "all good", anything else means "something failed". CI reads it, like a traffic light: `park-bundle --check` returns 1 (red) when `park.rs` is stale.
+
+## Pin (pinning a commit)
+Fixing exactly which version of Horizon our mod is built against, by its commit ID (`b5b451de…`). Like writing "use the 2026 edition of this textbook": later changes to Horizon can't break us until we choose to move.
+
+## Injection (HEAD) and helper
+An injection tells the mixin tool where to add our code inside Horizon. A `HEAD` injection adds it at the very start of a Horizon function, like a note clipped to the front of a letter. The helper is the one small function that gets pasted in there; ours just calls into `htp_glue`.
+
+## Placed player (Horizon's word)
+A player who has fully arrived in the world, not still connecting or loading. Horizon only sends chat to placed players, and its player list only shows them. That's why the "loaded" line waits until someone is placed.
+
+## World open ready
+The moment Horizon says "the world has finished opening". In single-player this comes before your own connection is set up, so you aren't in the world yet when it fires.
+
+## Log file (`latest.log`)
+A diary the game writes while it runs: every message, warning and error, with the time. It lives in the game's `logs` folder. When something is invisible on screen, the log often still shows what happened.
+
+## Static (and Mutex)
+A `static` is one value that lives for the whole time the game runs, like a whiteboard on the wall that everybody can read. A `Mutex` is a lock on it, like a talking stick: only the one holding it may write. Our glue keeps one `Welcome` this way.
