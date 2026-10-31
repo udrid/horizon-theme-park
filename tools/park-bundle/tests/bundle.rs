@@ -396,3 +396,80 @@ fn unknown_arguments_are_a_usage_error() {
     let root = make_project("usage", WELCOME_V1);
     assert_eq!(run(&args(&["--nope"]), &root).code, 2);
 }
+
+// ---------------------------------------------------------------- 9. the mod's toml matches the prefix
+
+fn mod_folder() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(OUTPUT_FILE)
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+/// The text after `key =` on a line, without the quotes (`name = "x"` gives `x`).
+fn toml_value(line: &str, key: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix(key)?.trim_start();
+    let value = rest.strip_prefix('=')?.trim();
+    Some(value.trim_matches('"').to_string())
+}
+
+/// The `name` of the `[[module]]` block whose `source` is `source`.
+fn module_name_for_source(toml: &str, source: &str) -> Option<String> {
+    let mut found = None;
+    let mut name = None;
+    let mut this_source = None;
+    // A line starting with `[` begins a new block, so the block before it is complete.
+    for line in toml.lines().chain(std::iter::once("[end]")) {
+        if line.trim_start().starts_with('[') {
+            if this_source.as_deref() == Some(source) {
+                found = name.take();
+            }
+            name = None;
+            this_source = None;
+        }
+        name = toml_value(line, "name").or(name);
+        this_source = toml_value(line, "source").or(this_source);
+    }
+    found
+}
+
+#[test]
+fn the_mixin_toml_names_the_module_that_the_prefix_points_at() {
+    let toml = fs::read_to_string(mod_folder().join("horizon-mixin.toml")).unwrap();
+    let park_file = Path::new(OUTPUT_FILE)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap();
+
+    // "crate::game::htp_park::" -> the module is called "htp_park".
+    let expected = GAME_PREFIX
+        .strip_prefix("crate::game::")
+        .unwrap()
+        .trim_end_matches("::");
+    assert_eq!(
+        module_name_for_source(&toml, park_file).as_deref(),
+        Some(expected),
+        "horizon-mixin.toml must install park.rs as the module the prefix points at"
+    );
+    assert_eq!(expected, "htp_park");
+}
+
+#[test]
+fn the_pinned_horizon_commit_is_the_same_in_both_files() {
+    let folder = mod_folder();
+    let toml = fs::read_to_string(folder.join("horizon-mixin.toml")).unwrap();
+    let json = fs::read_to_string(folder.join("../../compatibility.json")).unwrap();
+
+    let pin_in_toml = toml
+        .lines()
+        .find_map(|line| toml_value(line, "horizon_revision"))
+        .expect("horizon-mixin.toml has a horizon_revision");
+    assert_eq!(pin_in_toml.len(), 40, "a full commit id is 40 characters");
+    assert!(
+        json.contains(&pin_in_toml),
+        "compatibility.json has a different pin"
+    );
+}

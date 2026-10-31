@@ -1,0 +1,46 @@
+[mod]
+id = "horizon-theme-park"
+version = "0.1.0"
+priority = 100
+
+# This mod uses only the stable native hook points, so it needs hook API 21
+# (see ../../compatibility.json). The pinned commit is the merge of horizon#4610 (API 21).
+[compatibility]
+horizon_revision = "b5b451de7c9d8d3dfc851c9405d4754724205e1b"
+
+# park.rs is the GENERATED copy of park-core (never edit it by hand, run `cargo run -p park-bundle`).
+# It is added to the game as the module `crate::game::htp_park`. That name must match
+# park-bundle's `crate::` rewrite (tools/park-bundle: GAME_PREFIX); a test checks it.
+[[module]]
+id = "park"
+file = "crates/horizon-client/src/game.rs"
+name = "htp_park"
+source = "park.rs"
+
+# glue.rs is our thin layer between the game and park-core: `crate::game::htp_glue`.
+[[module]]
+id = "glue"
+file = "crates/horizon-client/src/game.rs"
+name = "htp_glue"
+source = "glue.rs"
+
+# At the start of every world phase change, tell the glue (it notes "a new world opened").
+[[injection]]
+id = "world"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_world_lifecycle"
+helper = "on_world.rs"
+bindings = [
+  { name = "phase", ty = "crate::game::native_lifecycle::WorldPhase", value = "phase" },
+]
+
+# At the start of every server tick hook, tell the glue (it greets the first placed player).
+[[injection]]
+id = "tick"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_server_tick"
+helper = "on_tick.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "phase", ty = "crate::game::native_lifecycle::ServerTickPhase", value = "phase" },
+]

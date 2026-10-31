@@ -304,3 +304,12 @@ A built-in instruction that pastes another file's text into this spot while comp
 
 ## Dead code (and `#[allow(dead_code)]`)
 Code that is written but never used. Rust warns about it, and our checks treat warnings as errors. In the compile test the pretend game doesn't use all of park-core yet, so we switch that one warning off with `#[allow(dead_code)]`. Like telling a smoke alarm "I know about the toast, thanks".
+
+## Visibility (`pub`, `pub(super)`)
+Who is allowed to use a piece of code. `pub` means everyone, nothing means only the same file or module, and `pub(super)` means "my parent module and its children". Horizon marks its hook helpers `pub(super)`, so our glue can use them, but only because our module is pasted inside the same parent (`game`).
+
+## Poisoned lock
+If code panics while holding a `Mutex` (the talking stick), Rust marks the lock "poisoned" as a warning. Normal code then crashes too. Our glue instead says "use it anyway", because a missed greeting is far better than a crashed world.
+
+## Stand-in (stub) and dry run
+A stand-in is a fake part shaped like the real one, for example a pretend `Game` that records chat lines. A dry run uses stand-ins to try our real mod files in seconds, like a rehearsal with cardboard props before the real play. We did one for M0 outside the repo, before asking you to start the 6-minute game build.

@@ -1,0 +1,6 @@
+{
+  "game": "26.3",
+  "hooks": 21,
+  "horizon_repository": "https://github.com/horizon-rust/horizon",
+  "horizon_revision": "b5b451de7c9d8d3dfc851c9405d4754724205e1b"
+}
