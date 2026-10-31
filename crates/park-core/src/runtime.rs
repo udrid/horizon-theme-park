@@ -38,8 +38,8 @@ pub const RIDER_OFF_DISTANCE: f64 = 2.0;
 /// station's EAST end (the train runs west through it), so it is placed one station length
 /// further east.
 const DEMO_EAST: f64 = 3.0 + demo::STATION_LENGTH;
-/// The rails float this high above the player's feet (D47).
-const DEMO_HEIGHT: f64 = 3.0;
+/// The rails float this high above the player's feet (D60, raised from 3 by D47's first value).
+const DEMO_HEIGHT: f64 = 5.0;
 /// Seats per car in the demo (D49).
 const SEATS_PER_CAR: usize = 2;
 /// Cars in the demo train (D55).
@@ -69,6 +69,8 @@ struct Demo {
     course: Course,
     physics: Physics,
     train: Train,
+    /// The stone platform beside the station (D60), so it can be cleared again.
+    platform: render::Platform,
     /// Ticks between moves of each car (D44), worked out once from a dry lap (S3).
     k: [u32; CARS],
     /// Ticks since the train last left the station (a car is sent when this divides by its `k`).
@@ -182,6 +184,7 @@ impl Runtime {
                 Order::Demo(caller) => self.build_demo(host, &caller),
                 Order::Remove => {
                     host.run(&commands::kill_ride(commands::DEMO));
+                    self.clear_platform(host);
                     self.build_queue.clear();
                     self.demo = None;
                 }
@@ -200,9 +203,21 @@ impl Runtime {
         self.move_train(host, &players);
     }
 
+    /// Remove the old demo's stone platform, and only those exact blocks (D60).
+    fn clear_platform<H: Host>(&self, host: &mut H) {
+        if let Some(demo) = &self.demo {
+            host.run(&commands::fill(
+                demo.platform.min,
+                demo.platform.max,
+                "minecraft:air",
+            ));
+        }
+    }
+
     /// Turn a `/coaster demo` order into the list of build commands.
     fn build_demo<H: Host>(&mut self, host: &mut H, caller: &Caller) {
         host.run(&commands::kill_ride(commands::DEMO));
+        self.clear_platform(host);
         self.build_queue.clear();
 
         // East of the player (+X), so the mod never has to read which way they look (D52).
@@ -216,7 +231,13 @@ impl Runtime {
         let worst = sim::worst_speed_sq_curvature(&course, &train, &physics);
         let k = render::teleport_ticks_for(worst);
 
-        // Rails, then the cars, then the seats.
+        // The station platform first (D60), then the rails, the cars and the seats.
+        let platform = render::station_platform(&course.table, stop, CARS, train.spacing);
+        self.build_queue.push_back(commands::fill(
+            platform.min,
+            platform.max,
+            commands::PLATFORM_BLOCK,
+        ));
         for piece in render::rail_pieces(&course.table) {
             let pose = render::rail_pose(&course.table, piece);
             self.build_queue.push_back(commands::summon_rail(
@@ -250,6 +271,7 @@ impl Runtime {
             course,
             physics,
             train,
+            platform,
             k: [k; CARS],
             phase: 0,
             was_held: true,
@@ -523,7 +545,8 @@ mod tests {
     }
 
     #[test]
-    fn the_station_is_three_blocks_east_of_the_player_and_the_rails_float_above_their_feet() {
+    fn the_station_is_three_blocks_east_of_the_player_and_the_rails_float_five_blocks_above_their_feet()
+     {
         let (rt, _) = built();
         let table = &demo(&rt).course.table;
         // The player stands at (0, 70, 0). The station's near end is 3 blocks east.
@@ -535,8 +558,8 @@ mod tests {
         assert!((near - 3.0).abs() < 0.3, "station near end at x {near}");
         let at_stop = table.position(stop);
         assert!(
-            (at_stop.y - 73.0).abs() < 0.01,
-            "the station is 3 up: {}",
+            (at_stop.y - 75.0).abs() < 0.01,
+            "the station is 5 up: {}",
             at_stop.y
         );
         assert!(at_stop.z.abs() < 0.01);
@@ -820,7 +843,10 @@ mod tests {
         let (mut rt, mut host) = built();
         assert!(rt.command("coaster remove", caller()).is_some());
         rt.tick(&mut host);
-        assert_eq!(host.take_commands(), vec!["kill @e[tag=htp_demo]"]);
+        let cmds = host.take_commands();
+        assert_eq!(cmds[0], "kill @e[tag=htp_demo]");
+        assert!(cmds[1].starts_with("fill ") && cmds[1].ends_with(" minecraft:air"));
+        assert_eq!(cmds.len(), 2);
         assert!(rt.demo.is_none());
         rt.tick(&mut host);
         assert!(host.take_commands().is_empty());
@@ -852,6 +878,75 @@ mod tests {
         rt.command("coaster demo", caller());
         rt.tick(&mut host);
         assert_eq!(host.commands[0], "kill @e[tag=htp_demo]");
+        // The old platform is cleared before the new one is placed (D60).
+        assert!(host.commands[1].ends_with(" minecraft:air"));
         assert!(host.commands.iter().any(|c| c.contains("htp:rail")));
+    }
+
+    #[test]
+    fn the_demo_places_a_smooth_stone_platform_first_and_remove_clears_exactly_those_blocks() {
+        let mut rt = Runtime::new();
+        let mut host = FakeHost::new();
+        host.players.push(player(1, far_away()));
+        rt.tick(&mut host);
+        host.take_commands();
+        // The player stands at (0, 70, 0): the station track is at y 75, z 0, x -9.5 .. 3 east of them.
+        rt.command("coaster demo", caller());
+        let mut all = Vec::new();
+        while rt.demo.is_none() || !rt.build_queue.is_empty() {
+            rt.tick(&mut host);
+            all.extend(host.take_commands());
+        }
+        let place: Vec<&String> = all.iter().filter(|c| c.starts_with("fill ")).collect();
+        assert_eq!(place.len(), 1, "{place:?}");
+        let platform = demo(&rt).platform;
+        assert_eq!(
+            *place[0],
+            commands::fill(platform.min, platform.max, "minecraft:smooth_stone")
+        );
+        // Placed before the first rail.
+        let at = |needle: &str| all.iter().position(|c| c.contains(needle)).unwrap();
+        assert!(at("smooth_stone") < at("htp:rail"));
+        // Two wide and as long as the train (3 cars + gaps = about 10 blocks).
+        let width = platform.max[2] - platform.min[2] + 1;
+        let length = platform.max[0] - platform.min[0] + 1;
+        assert_eq!((width, platform.max[1] == platform.min[1]), (2, true));
+        assert!((10..=12).contains(&length), "length {length}");
+
+        rt.command("coaster remove", caller());
+        rt.tick(&mut host);
+        let cmds = host.take_commands();
+        assert_eq!(
+            cmds[1],
+            commands::fill(platform.min, platform.max, "minecraft:air")
+        );
+    }
+
+    #[test]
+    fn the_platform_stays_clear_of_the_rails_and_the_cars_and_sits_on_the_outer_side() {
+        let (rt, _) = built();
+        let d = demo(&rt);
+        let p = d.platform;
+        let (x0, x1) = (p.min[0] as f64, p.max[0] as f64 + 1.0);
+        let (z0, z1) = (p.min[2] as f64, p.max[2] as f64 + 1.0);
+        let (y0, y1) = (p.min[1] as f64, p.min[1] as f64 + 1.0);
+        let mut s = 0.0;
+        while s < d.course.table.length() {
+            let pos = d.course.table.position(s);
+            // A rail is 0.5 wide and 0.15 tall; the car shell is 1.6 wide, from 0.05 above the track.
+            let inside_flat =
+                pos.x > x0 - 0.8 && pos.x < x1 + 0.8 && pos.z > z0 - 0.8 && pos.z < z1 + 0.8;
+            let overlaps_height = pos.y - 0.075 < y1 && pos.y + 0.075 > y0;
+            assert!(
+                !(inside_flat && overlaps_height),
+                "track at s = {s} touches the platform"
+            );
+            s += 0.1;
+        }
+        // Left of the direction of travel: the track runs west (-x) here, so left is +z (south).
+        let stop = d.course.table.position(d.course.station().unwrap().1);
+        assert!(z0 > stop.z, "the platform is on the far side from the turn");
+        // The top is below the track's line.
+        assert!(y1 < stop.y);
     }
 }

@@ -163,6 +163,73 @@ pub fn rider_point(seat: DVec3) -> DVec3 {
     seat + DVec3::new(0.0, RIDER_LIFT, 0.0)
 }
 
+/// The station platform: a one-block-thick slab of whole blocks beside the station track (D60).
+/// `min` and `max` are the two corner blocks, both included.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Platform {
+    pub min: [i32; 3],
+    pub max: [i32; 3],
+}
+
+/// How wide the platform is, in blocks.
+pub const PLATFORM_WIDTH: i32 = 2;
+/// The platform's top surface sits at least this far below the track (so the car's shell, which
+/// hangs 0.05 block below the track line plus its lift, clears it). Tune in the game (D60).
+pub const PLATFORM_BELOW_TRACK: f64 = 0.2;
+/// Half a car's length: the car shell is 3 blocks long.
+const CAR_HALF_LENGTH: f64 = 1.5;
+/// The gap kept between the rail's middle and the platform's nearest edge.
+const PLATFORM_GAP: f64 = 0.5;
+
+/// Where the platform goes for a train of `cars` cars (`spacing` apart) standing with its front
+/// car at `stop`: as long as the train, `PLATFORM_WIDTH` wide, on the LEFT of the direction of
+/// travel (the side away from the inside of the turns, because the demo bends right), with its top
+/// a whole block number at or below `PLATFORM_BELOW_TRACK` under the track. Only for a station on
+/// a straight run along the X or Z axis.
+pub fn station_platform(table: &Table, stop: f64, cars: usize, spacing: f64) -> Platform {
+    let front = stop + CAR_HALF_LENGTH;
+    let rear = stop - (cars.max(1) - 1) as f64 * spacing - CAR_HALF_LENGTH;
+    let here = table.frame(stop);
+    // The side: left of travel, flattened to the ground, then the axis it mostly follows.
+    let left = -here.right;
+    let across_x = left.x.abs() > left.z.abs();
+    let sign = if across_x {
+        left.x.signum()
+    } else {
+        left.z.signum()
+    };
+    let pick = |p: DVec3| if across_x { (p.x, p.z) } else { (p.z, p.x) };
+    let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+    let mut s = rear;
+    while s <= front + 1e-9 {
+        let (_, along) = pick(table.position(s));
+        lo = lo.min(along);
+        hi = hi.max(along);
+        s += 0.1;
+    }
+    let (across, _) = pick(table.position(stop));
+    let (a0, a1) = if sign > 0.0 {
+        let first = (across + PLATFORM_GAP).ceil() as i32;
+        (first, first + PLATFORM_WIDTH - 1)
+    } else {
+        let last = (across - PLATFORM_GAP).floor() as i32 - 1;
+        (last - PLATFORM_WIDTH + 1, last)
+    };
+    let (l0, l1) = (lo.floor() as i32, hi.ceil() as i32 - 1);
+    let y = (here.pos.y - PLATFORM_BELOW_TRACK).floor() as i32 - 1;
+    if across_x {
+        Platform {
+            min: [a0, y, l0],
+            max: [a1, y, l1],
+        }
+    } else {
+        Platform {
+            min: [l0, y, a0],
+            max: [l1, y, a1],
+        }
+    }
+}
+
 /// How many ticks apart a car's moves are (*k*, D44), worked out once per ride: the largest
 /// *k* from 1 to 5 whose straight glide strays at most `MAX_GLIDE_SAG` from the track on its
 /// tightest curve at `speed` (blocks per second). A straight chord of length L on a curve of
@@ -287,5 +354,27 @@ mod tests {
     fn the_riders_point_hangs_below_the_seat() {
         let p = rider_point(DVec3::new(1.0, 2.0, 3.0));
         assert!(p.distance(DVec3::new(1.0, 0.7875, 3.0)) < 1e-9);
+    }
+
+    #[test]
+    fn the_station_platform_has_exact_corners_beside_the_demo_station() {
+        // Station track: y 75, z -40, running west from x 100; the front car stops at x 90.
+        let course = crate::coaster::demo::demo_course(DVec3::new(100.0, 75.0, -40.0));
+        let stop = course.station().unwrap().1;
+        let p = station_platform(&course.table, stop, 3, crate::coaster::physics::CAR_SPACING);
+        // Cars span x 88.5 (front end) to 97.9 (rear end): blocks 88 to 97. The platform is on
+        // the left of the direction of travel (south, +z): blocks -39 and -38. Its top is the
+        // whole block number under (track - 0.2): 74, so the blocks are at y 73.
+        assert_eq!(
+            p,
+            Platform {
+                min: [88, 73, -39],
+                max: [97, 73, -38]
+            }
+        );
+        assert_eq!(
+            crate::commands::fill(p.min, p.max, crate::commands::PLATFORM_BLOCK),
+            "fill 88 73 -39 97 73 -38 minecraft:smooth_stone"
+        );
     }
 }

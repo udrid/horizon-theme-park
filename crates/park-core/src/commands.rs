@@ -154,6 +154,17 @@ pub fn action_bar(player_name: &str, text: &str) -> String {
     format!("title {player_name} actionbar {{\"text\":\"{text}\"}}")
 }
 
+/// The block the station platform is made of (D60).
+pub const PLATFORM_BLOCK: &str = "minecraft:smooth_stone";
+
+/// Fill the box between two corners (both included) with `block`. Corners are whole block numbers.
+pub fn fill(from: [i32; 3], to: [i32; 3], block: &str) -> String {
+    format!(
+        "fill {} {} {} {} {} {} {block}",
+        from[0], from[1], from[2], to[0], to[1], to[2]
+    )
+}
+
 /// Remove everything that carries `tag`.
 pub fn kill_tag(tag: &str) -> String {
     format!("kill @e[tag={tag}]")
@@ -250,6 +261,18 @@ mod tests {
         assert_eq!(
             action_bar("Alex", "Speed: 54 km/h"),
             "title Alex actionbar {\"text\":\"Speed: 54 km/h\"}"
+        );
+    }
+
+    #[test]
+    fn fill_texts() {
+        assert_eq!(
+            fill([88, 73, -39], [97, 73, -38], PLATFORM_BLOCK),
+            "fill 88 73 -39 97 73 -38 minecraft:smooth_stone"
+        );
+        assert_eq!(
+            fill([88, 73, -39], [97, 73, -38], "minecraft:air"),
+            "fill 88 73 -39 97 73 -38 minecraft:air"
         );
     }
 
