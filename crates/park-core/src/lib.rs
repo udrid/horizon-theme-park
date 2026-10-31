@@ -6,4 +6,7 @@
 //! and the per-tick loop in `runtime`.
 
 pub mod coaster;
+pub mod commands;
+pub mod host;
+pub mod render;
 pub mod welcome;
