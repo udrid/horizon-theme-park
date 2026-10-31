@@ -23,18 +23,12 @@ D23–D32. M1's plan builds on them.
 
 ## M1: First ride
 
-- **Scope:** hard-coded closed oval (about 60 blocks); spline, arc-length table and frames; rails
-  drawn with displays every 1 block; one car at **constant speed** (no gravity yet); one seat;
-  `/coaster ride` seats you; `FakeHost` and `HostCmd` with exact-text tests; content mod with the rail
-  and car models.
+- **Scope:** closed demo oval (59.7 blocks) built by `/coaster demo`; spline, arc-length table, frames; adaptive rails; one car with two minecart seats; board by right-click; the train waits at the start while empty, runs while anyone rides, and finishes its lap and stops after the last rider gets off; `/coaster ride` is only a hint; content mod `htp`.
 - **Out of scope:** gravity, elements, building tools, saving, multiple cars, parking.
-- **Tests:** frames tests (no flip in an S-bend, closed loop `up` matches within 0.1°); arc-length
-  table total matches the analytic oval length within 0.1%; `commands.rs` number formatting
-  (4 decimals, no exponent, negative zero written as `0.0000`); runtime test with `FakeHost`: one tick
-  gives exactly 1 car `tp`, 1 car rotation, 1 seat `tp`, in that order.
+- **Tests:** the 12 tests of the M1 plan (`docs/milestones/M1.md`), plus a rider-height check.
 - **Video, "I made a roller coaster in Rust Minecraft":**
   1. Fly-over of the oval track.
-  2. Typing `/coaster ride`.
+  2. Typing `/coaster demo` and right-clicking a seat.
   3. Full POV lap.
   4. Side shot of the car gliding past.
   5. Close-up of the rails curving.

@@ -204,12 +204,9 @@ pub struct Coaster {
 }
 ```
 
-### Curve choice (OPEN: decide at M1 planning)
+### Curve choice [D42]
 
-`Segment` stores Bézier control points, so either curve type fits. Proposal to put to the owner:
-**centripetal Catmull-Rom** (the curve passes through every node, with no loops or overshoot), converted to
-Bézier control points. The alternative is Bézier with handles the player edits, as in NoLimits 2. That's
-harder to build with in Minecraft.
+Centripetal Catmull-Rom through every node, converted to Bézier segments (`Segment` stores the four control points). Decided at M1.
 
 ### Arc-length table and frames
 
@@ -283,83 +280,23 @@ apply element limits (lift floor, brake ceiling, station hold); wrap or clamp s
 6. 6-car train cresting a hill: the back car's speed at the top is greater than the front car's was.
 7. Frames: no flip through an S-bend; a closed loop's `up` matches its start within 0.1°.
 
-## 5. The Host trait: the only door to the game [D7]
+## 5. The Host trait: the only door to the game [D7, D43]
 
-> **Status:** this is the original sketch. The Host trait is redesigned in the M1 plan, where code and tests use
-> it, to fit the engine spike's findings (D23–D32: seats are mobs, moves run every *k* ticks through selectors,
-> the fling-off needs a private call). Don't build from the code block below as it stands. [D38]
+`Host` has four methods (`players`, `run(command) -> bool`, `broadcast`, `tell`) plus `log` (default: nothing).
+Anything private is added later as one more method with a "not available" default, so this stays the only door.
+All command text lives in `commands.rs` as pure functions, tested word for word:
 
-```rust
-// host.rs
-pub struct DisplayId(pub u128);          // a UUID WE choose (hash of ride id, piece, generation)
-pub struct PlayerId(pub u128);
-pub enum Shows { Item { model: String }, Block { state: String }, Nothing } // Nothing = invisible seat
-pub struct DisplaySpec {
-    pub id: DisplayId,
-    pub shows: Shows,
-    pub pos: DVec3,
-    pub rotation: DQuat,                 // goes in the transformation's left_rotation
-    pub scale: DVec3,
-    pub tags: Vec<String>,               // always "htp" and "htp_<ride id>"
-    pub view_range: f32,
-}
-pub struct PlayerInfo { pub id: PlayerId, pub name: String, pub pos: DVec3, pub dimension: String }
-
-pub trait Host {
-    fn players(&self) -> Vec<PlayerInfo>;
-    fn spawn_display(&mut self, spec: &DisplaySpec);
-    fn move_display(&mut self, id: DisplayId, pos: DVec3, teleport_ticks: u8);
-    fn set_rotation(&mut self, id: DisplayId, rotation: DQuat, interpolation_ticks: u8);
-    fn remove_display(&mut self, id: DisplayId);
-    fn remove_tagged(&mut self, tag: &str);
-    fn seat(&mut self, player: PlayerId, seat: DisplayId);
-    fn unseat(&mut self, player: PlayerId);
-    fn teleport_player(&mut self, player: PlayerId, pos: DVec3);
-    fn launch_player(&mut self, player: PlayerId, velocity: DVec3); // blocks/s; fling-off [D22]
-    fn particles(&mut self, kind: &str, at: DVec3, count: u32);
-    fn tell(&mut self, player: PlayerId, text: &str);
-    fn action_bar(&mut self, player: PlayerId, text: &str);
-}
-```
-
-We choose every display's UUID ourselves, so we never need to read a command's answer to learn an ID.
-The spike proves this works (R5).
-
-### `HostCmd` (main path, `commands.rs` + `glue.rs`)
-
-`commands.rs` turns each call into command text; `glue.rs` passes the strings to
-`native_run_command`, at most 400 per tick [D21]. Each Host call becomes one command:
-
-| Call | Command |
+| Job | Command |
 |---|---|
-| spawn_display | `summon minecraft:item_display X Y Z {UUID:[I;a,b,c,d],Tags:["htp","htp_<id>"],item:{id:"htp:<model>"},transformation:{left_rotation:[x,y,z,w],right_rotation:[0,0,0,1],translation:[0,0,0],scale:[sx,sy,sz]},view_range:R,teleport_duration:T}` |
-| move_display | `tp <selector> X Y Z`, sent every *k* ticks and aimed *k* ticks ahead with `teleport_duration` *k* [D32]. `tp <uuid>` does not find displays yet, so the selector is `@e[tag=<unique tag>,limit=1]`; each costs about 0.7 µs per entity in the world [D25]. Seats use the rider's name instead [D31] |
-| set_rotation | `tp <selector> X Y Z <yaw> <pitch>`, sent together with the move [D24]. `data merge` on displays does nothing in this build, so no roll after spawn |
-| remove_display / remove_tagged | `kill <uuid>` / `kill @e[tag=<tag>]` |
-| seat / unseat | `ride <player> mount <seat mob>` / `ride <player> dismount`. Only mobs can be ridden [D23]. A seat with a rider is moved with `execute as <PlayerName> on vehicle run tp @s X Y Z` [D31] |
-| teleport_player | `tp <player> X Y Z` |
-| launch_player | No vanilla command sets a player's velocity: the spike found none (R9). This call needs a private Horizon call in `host_mixin`, built only after the owner approves [D28] |
-| particles | `particle <kind> X Y Z 0 0 0 0 <count> force` |
-| tell / action_bar | the API 8 / API 21 helpers directly (`native_tell`, `native_action_bar`), not commands |
+| rail piece | `summon minecraft:item_display X Y Z {Tags:["htp","htp_demo"],item:{id:"htp:rail",count:1},transformation:{…}}` |
+| car | the same with `htp:car`, `Rotation`, `teleport_duration` *k*, tag `htp_car_demo_0` |
+| move car | `tp @e[tag=htp_car_demo_0,limit=1] X Y Z yaw pitch`, every *k* ticks, aimed *k* ticks ahead [D32, D44] |
+| seat | `summon minecraft:minecart …` with tag `htp_seat_demo_<i>` (a minecart per seat; one line in `commands.rs` switches the kind) [D49] |
+| move seat | `tp @e[tag=htp_seat_demo_<i>,limit=1] X Y Z yaw pitch`, every tick, ridden or not |
+| remove | `kill @e[tag=htp_demo]`; at world open `kill @e[tag=htp]` [D20] |
 
-- Number format: fixed 4 decimals, `.` as the decimal point, never exponent notation. Tested.
-- UUIDs are written in the hyphenated form for `tp`/`kill`, and as 4 signed ints for `summon`.
-- Never call `native_run_command` inside a player's hook (it is refused there): `native_perform_command`
-  only queues an order; the tick runs it [D21].
-- The display's yaw and pitch stay 0. All rotation lives in the transformation, because a `tp` can't
-  express roll.
-
-### `HostMixin` (fallback, `host_mixin.rs`)
-
-The same trait, through Horizon's private functions, pinned to one `horizon_revision`. It is built only
-for a job the engine spike shows commands do badly, such as tick time with 400 commands, and only after
-the owner approves it. It's the only file allowed to call private Horizon code [D7].
-
-### `FakeHost` (tests, `host.rs`)
-
-It records every call in `Vec<HostCall>` (one enum variant per method, with its arguments) and returns
-scripted `players()`. Runtime tests assert on that list: order, count, and the exact command text through
-`commands.rs`.
+Players board by their own right-click, since the console cannot mount them [D48]. Commands never run inside the
+command hook: orders are queued for the tick [D21]. `FakeHost` records the strings in order.
 
 ## 6. Rendering [D16, D17, D19]
 
@@ -367,11 +304,8 @@ scripted `players()`. Runtime tests assert on that list: order, count, and the e
   where it bends more than a set angle (`track_spacing` is the minimum length). Each is an `item_display`
   showing `htp:rail` from the content mod, rotated by the frame's quaternion and stretched to its length along
   forward. Rails are placed once and never moved. Check in game: how a stretched model looks.
-- **Cars:** one `item_display` per car (`htp:car_<style>`). Every *k* ticks: one `tp` that carries both the
-  position and the yaw/pitch of where the car will be *k* ticks later [D24, D32], with `teleport_duration` *k*; no roll.
-- **Seats:** one invisible **mob** per seat (not a display: Horizon only lets players ride mobs) [D23],
-  moved every tick to `car frame + seat offset` through its rider's name [D31] (O(1), about 7 µs each). The rider's camera steps 20 times a second. Riders are seated with `ride`. A 6-car, 2-seat train costs
-  6 × 2 + 6 = 18 commands per tick.
+- **Cars:** one `item_display` per car showing the `htp:car` shell, moved every *k* ticks (*k* from 1 to 5, worked out once per ride from the tightest bend and speed [D44]).
+- **Seats:** one minecart per seat, hidden inside the shell, moved every tick by its tag [D49]. A rider hangs 1.2125 blocks below the seat (measured), so "rider on" means a player within 1.0 block of that point and "off" means beyond 2.0. The rider's camera steps 20 times a second [D23].
 - **Blocks, not entities:** supports, stations, queues and decor are content-mod blocks [D17].
 - **Parking [D19, D30]:** the track is split into groups of about 16 pieces. A group with no player within
   96 blocks (3D distance) has its displays removed; a player within 80 blocks gets it redrawn, at most 50
