@@ -9,7 +9,8 @@
 //!   * `mod name;` becomes `mod name {`, then the file's lines, then `}`. `pub` and the
 //!     attributes written above the line (like `#[cfg(test)]`) are kept.
 //!   * `crate::` becomes `crate::game::htp_park::`, because in the game our code sits at
-//!     that path. `my_crate::` and `$crate::` are left alone.
+//!     that path. `$crate::` (inside a home-made macro) gets the same change, because in the game
+//!     `$crate` means Horizon. `my_crate::` is a different word and is left alone.
 //!   * `//!` comments become `//` (the mixin tool refuses `//!`, it counts them as file attributes).
 //!   * Items the game cannot take are refused with the file and line (see `find_refusal`).
 //!   * Windows and Linux line endings are treated the same; the output always uses Linux ones.
@@ -168,9 +169,13 @@ fn paste_file(file: &Path, child_dir: &Path, out: &mut String) -> Result<(), Bun
             Some(declaration) => {
                 let (module_file, module_dir) =
                     find_module_file(file, line_number, declaration.name, child_dir)?;
+                // The visibility can hold a path too, like `pub(in crate::x) mod y;`, so it
+                // gets the same `crate::` rewrite as every other line.
                 out.push_str(&format!(
                     "{}{}mod {} {{\n",
-                    declaration.indent, declaration.visibility, declaration.name
+                    declaration.indent,
+                    rewrite_crate_paths(declaration.visibility),
+                    declaration.name
                 ));
                 paste_file(&module_file, &module_dir, out)?;
                 out.push_str(declaration.indent);
@@ -204,15 +209,18 @@ fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// Replace `crate::` with `GAME_PREFIX`, except in `my_crate::` and `$crate::`.
+/// Replace `crate::` with `GAME_PREFIX`, except in `my_crate::` (a different word).
+/// `$crate::` is rewritten too (it becomes `$crate::game::htp_park::`), because inside a macro
+/// defined in the glued code, `$crate` means Horizon's crate, not park-core.
 fn rewrite_crate_paths(line: &str) -> String {
     const NEEDLE: &str = "crate::";
     let mut out = String::with_capacity(line.len());
     let mut copied_up_to = 0;
     for (at, _) in line.match_indices(NEEDLE) {
-        // Look at the character just before: a name character or `$` means it's a different word.
+        // Look at the character just before: a name character means it's a different word
+        // (`my_crate::`). A `$` is fine: that is `$crate::`, which also needs the new prefix.
         let before = line[..at].chars().next_back();
-        if before.is_some_and(|c| is_ident_char(c) || c == '$') {
+        if before.is_some_and(is_ident_char) {
             continue;
         }
         out.push_str(&line[copied_up_to..at]);
@@ -231,7 +239,7 @@ pub struct Refusal {
 }
 
 // Attribute-like items. They are matched with all spaces removed, so `#[ path = "x" ]` is caught too.
-const REFUSED_ATTRIBUTES: [(&str, Refusal); 3] = [
+const REFUSED_ATTRIBUTES: [(&str, Refusal); 4] = [
     (
         "#![",
         Refusal {
@@ -251,6 +259,13 @@ const REFUSED_ATTRIBUTES: [(&str, Refusal); 3] = [
         Refusal {
             item: "`#[macro_export]`",
             why: "an exported macro would leak out of our module into Horizon",
+        },
+    ),
+    (
+        "/*!",
+        Refusal {
+            item: "an inner block doc comment `/*! … */`",
+            why: "the mixin tool counts it as a file attribute, like `//!`. Use `//!` lines instead (they are turned into `//`)",
         },
     ),
 ];

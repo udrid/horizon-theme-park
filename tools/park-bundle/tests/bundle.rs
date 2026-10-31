@@ -136,9 +136,33 @@ fn crate_paths_get_the_game_prefix_but_other_crates_do_not() {
     assert!(out.contains("    crate::game::htp_park::a::hello()"));
     assert!(out.contains("    use crate::game::htp_park::a::hello;"));
     assert!(out.contains("    crate::game::htp_park::b::c::twice(x)"));
-    // `my_crate::` and `$crate::` are different words and stay as they are.
+    // `my_crate::` is a different word and stays as it is.
     assert!(out.contains("    my_crate::something();"));
-    assert!(out.contains("        $crate::b::double($x)"));
+    // `$crate::` is rewritten too: in the game, `$crate` inside our macro would mean Horizon.
+    assert!(out.contains("        $crate::game::htp_park::b::double($x)"));
+}
+
+#[test]
+fn a_path_inside_a_module_visibility_is_rewritten_too() {
+    let dir = make_tree(
+        "visibility-path",
+        &[
+            (
+                "lib.rs",
+                "mod a;\npub(in crate::a) mod y;\npub(crate) mod z;\n",
+            ),
+            ("a.rs", "// a\n"),
+            ("y.rs", "// y\n"),
+            ("z.rs", "// z\n"),
+        ],
+    );
+    let out = bundle(&dir).unwrap();
+    assert!(
+        out.contains("pub(in crate::game::htp_park::a) mod y {\n"),
+        "{out}"
+    );
+    // A visibility with no path in it is left alone.
+    assert!(out.contains("pub(crate) mod z {\n"), "{out}");
 }
 
 // ---------------------------------------------------------------- 5. //! comments
@@ -193,6 +217,7 @@ fn forbidden_items_are_refused_with_file_and_line() {
         ),
         ("macro-export", "#[macro_export]", "`#[macro_export]`"),
         ("extern-crate", "extern crate alloc;", "`extern crate`"),
+        ("inner-block-doc", "/*! inner docs */", "`/*! … */`"),
     ];
     for (case, offending, label) in cases {
         let error = refused_error(&format!("refuse-{case}"), offending);
@@ -230,6 +255,7 @@ fn look_alikes_and_comments_are_not_refused() {
             "lib.rs",
             "// env!(\"X\") and #![x] and include!(\"y\") in a comment\n\
              /// extern crate in a doc comment\n\
+             /* an ordinary block comment is fine */\n\
              pub fn my_env_name() {}\n\
              pub fn f() { my_env!(1); my_include!(2); }\n",
         )],
@@ -286,11 +312,11 @@ fn the_output_has_no_refused_items_and_no_bare_crate_paths() {
         );
     }
 
-    // Every `crate::` is either the new prefix, or part of another word (`$crate::`, `my_crate::`).
+    // Every `crate::` is either the new prefix (`$crate::` gets it too), or part of another
+    // word like `my_crate::`.
     for (at, _) in out.match_indices("crate::") {
         let before = out[..at].chars().next_back();
-        let part_of_another_word =
-            before.is_some_and(|c| c == '$' || c == '_' || c.is_alphanumeric());
+        let part_of_another_word = before.is_some_and(|c| c == '_' || c.is_alphanumeric());
         let is_new_prefix = out[at..].starts_with(GAME_PREFIX);
         assert!(
             part_of_another_word || is_new_prefix,
