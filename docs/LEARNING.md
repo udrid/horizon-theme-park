@@ -340,3 +340,21 @@ How far a straight line between two points on a curve strays from the curve itse
 
 ## Guest vs local player (Horizon)
 Horizon's two ways of holding a player: the "local" player of a single-player game, and a "guest" who joined a hosted world. Some commands, like `/ride`, only handle one kind, which is why M1 tests mounting first.
+
+## Catmull-Rom spline (and Bézier segment)
+A smooth curve that passes exactly through every point you give it, like a string pulled through pins on a board. Inside, each stretch between two pins is turned into a Bézier segment: a curve shaped by the two pins plus two invisible "handles". The "centripetal" flavour we use never overshoots a pin or makes a little loop.
+
+## Arc-length table
+A ruler laid along the track. It stores the point and direction every 0.1 block of distance, so "where is the car after 25 blocks?" is one quick lookup. Without it, equal steps along the curve would be different real distances.
+
+## Frame (forward, up, right)
+Three arrows at a point of the track that say which way is ahead, which way is up and which way is right. A car's turning comes from them. We keep "up" from twisting for no reason by only turning it as much as the track turns (a "rotation-minimising" frame).
+
+## Tag (and tag selector)
+A label on an entity. `@e[tag=htp_seat_demo_0]` means "the entity labelled htp_seat_demo_0". The mod labels everything it makes, so it can find, move or remove exactly its own things.
+
+## Seat (minecart seat)
+The thing a rider sits in. In M1 each seat is a plain minecart hidden inside the car's model; you board it by right-clicking, like a boat, and the mod moves it every tick. The seat kind sits in one place in the code (`commands.rs`), so it can change later.
+
+## Hysteresis (two distances)
+Using two different limits to decide "on" and "off" so it doesn't flicker. A player counts as sitting when within 0.5 block of the seat, and as gone only when beyond 2 blocks. In between, nothing changes. Like a thermostat that heats at 18 and stops at 20.

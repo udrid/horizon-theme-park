@@ -34,7 +34,7 @@ bindings = [
   { name = "phase", ty = "crate::game::native_lifecycle::WorldPhase", value = "phase" },
 ]
 
-# At the start of every server tick hook, tell the glue (it greets the first placed player).
+# At the start of every server tick hook, tell the glue (it runs the whole mod, step by step).
 [[injection]]
 id = "tick"
 kind = "HEAD"
@@ -43,4 +43,27 @@ helper = "on_tick.rs"
 bindings = [
   { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
   { name = "phase", ty = "crate::game::native_lifecycle::ServerTickPhase", value = "phase" },
+]
+
+# When the game asks which commands mods add, the glue adds `/coaster demo`, `ride` and `remove`.
+[[injection]]
+id = "commands"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_register_commands"
+helper = "on_commands.rs"
+bindings = [
+  { name = "commands", ty = "&mut Vec<crate::game::native_server::NativeCommand>", value = "&mut *commands" },
+]
+
+# When a player types a registered command, the glue queues the order and answers them.
+[[injection]]
+id = "command"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_perform_command"
+helper = "on_command.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "player", ty = "&crate::game::native_server::NativeServerPlayer", value = "player" },
+  { name = "command", ty = "&str", value = "command" },
+  { name = "ran", ty = "&mut bool", value = "&mut *ran" },
 ]
