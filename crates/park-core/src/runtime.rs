@@ -808,20 +808,26 @@ impl Runtime {
             self.waited
         ));
         self.loaded = true;
-        match save::load_park(&dir) {
+        match save::load_park_notice(&dir) {
             Err(error) => {
                 host.broadcast(&format!(
                     "Horizon Theme Park: park.json: {error}. Rides will not be saved this time."
                 ));
                 return;
             }
-            Ok(park) => {
+            Ok((park, notice)) => {
+                if let Some(notice) = notice {
+                    host.broadcast(&format!("Horizon Theme Park: {notice}"));
+                }
                 self.session = park.session + 1;
                 self.world = Some(dir.clone());
                 self.park_dirty = true;
             }
         }
         let found = save::load_all(&dir);
+        for notice in &found.notices {
+            host.broadcast(&format!("Horizon Theme Park: {notice}"));
+        }
         for problem in &found.problems {
             host.broadcast(&format!("Horizon Theme Park: {problem}"));
         }

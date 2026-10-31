@@ -21,7 +21,7 @@ use crate::coaster::elements::{BRAKE_DECEL, BRAKE_TARGET, DWELL, LIFT_SPEED, STA
 use crate::coaster::physics::{CAR_SPACING, Physics};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 /// The file format this version of the mod writes and understands.
@@ -194,7 +194,12 @@ pub fn write_safely(path: &Path, text: &str) -> io::Result<()> {
         fs::create_dir_all(folder)?;
     }
     let tmp = with_suffix(path, ".tmp");
-    fs::write(&tmp, text)?;
+    // Make sure the bytes are really on the disk before the swap, so a power cut can't leave an
+    // empty file behind.
+    let mut file = fs::File::create(&tmp)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
     if path.exists() {
         fs::copy(path, with_suffix(path, ".bak"))?;
     }
@@ -264,8 +269,14 @@ pub fn ride_exists(world: &Path, id: &str) -> bool {
 /// Put a ride aside: `<id>.json` becomes `<id>.json.deleted` (S3 keeps it, nothing is lost).
 pub fn delete_ride(world: &Path, id: &str) -> Result<(), String> {
     let path = ride_path(world, id);
-    fs::rename(&path, with_suffix(&path, ".deleted"))
-        .map_err(|e| format!("could not delete {id}.json: {e}"))
+    // Never replace an older `.deleted` file: count up (`.deleted.2`, `.deleted.3`, ...).
+    let mut target = with_suffix(&path, ".deleted");
+    let mut n = 2;
+    while target.exists() {
+        target = with_suffix(&path, &format!(".deleted.{n}"));
+        n += 1;
+    }
+    fs::rename(&path, target).map_err(|e| format!("could not delete {id}.json: {e}"))
 }
 
 /// What loading every ride gave: the good ones, and a plain sentence for each one that failed.
@@ -275,6 +286,22 @@ pub struct Loaded {
     pub problems: Vec<String>,
     /// Ride ids whose files exist but could not be used. They are never overwritten.
     pub locked: Vec<String>,
+    /// Things worth telling the player that are not failures (a backup was used).
+    pub notices: Vec<String>,
+}
+
+/// Put a damaged file aside as `<file>.broken` (numbered if that exists) and make the backup the
+/// real file again. Nothing is ever deleted.
+fn restore_backup(path: &Path) -> io::Result<()> {
+    let mut broken = with_suffix(path, ".broken");
+    let mut n = 2;
+    while broken.exists() {
+        broken = with_suffix(path, &format!(".broken.{n}"));
+        n += 1;
+    }
+    fs::rename(path, broken)?;
+    fs::copy(with_suffix(path, ".bak"), path)?;
+    Ok(())
 }
 
 /// Load every `rides/*.json`, in name order. A leftover `.tmp`, a `.bak` and a `.deleted` file
@@ -295,7 +322,18 @@ pub fn load_all(world: &Path) -> Loaded {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        match load_ride(&path) {
+        let mut result = load_ride(&path);
+        // A damaged file (not a newer one) can be replaced by its backup.
+        if matches!(result, Err(LoadError::Broken(_)))
+            && let Ok(backup) = load_ride(&with_suffix(&path, ".bak"))
+            && restore_backup(&path).is_ok()
+        {
+            out.notices.push(format!(
+                "loaded the backup of {stem} (the damaged file is kept as {stem}.json.broken)"
+            ));
+            result = Ok(backup);
+        }
+        match result {
             Ok(ride) if ride.id == stem => out.rides.push(ride),
             Ok(ride) => {
                 out.problems.push(format!(
@@ -315,13 +353,37 @@ pub fn load_all(world: &Path) -> Loaded {
 
 /// Read `park.json`. No file yet is fine (a fresh default); a newer or damaged file is an error.
 pub fn load_park(world: &Path) -> Result<ParkFile, LoadError> {
-    let text = match fs::read_to_string(park_path(world)) {
+    load_park_notice(world).map(|(park, _)| park)
+}
+
+fn read_park(path: &Path) -> Result<ParkFile, LoadError> {
+    let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ParkFile::default()),
         Err(e) => return Err(LoadError::Unreadable(e.to_string())),
     };
     let (value, _) = read_format(&text)?;
     serde_json::from_value(value).map_err(|e| LoadError::Broken(e.to_string()))
+}
+
+/// Like `load_park`, but a damaged `park.json` is replaced by its backup when that is good (so the
+/// session number does not start again at 0), and the second answer says so.
+pub fn load_park_notice(world: &Path) -> Result<(ParkFile, Option<String>), LoadError> {
+    let path = park_path(world);
+    match read_park(&path) {
+        Ok(park) => Ok((park, None)),
+        Err(LoadError::Broken(why)) => {
+            let backup = with_suffix(&path, ".bak");
+            match read_park(&backup) {
+                Ok(park) if backup.exists() && restore_backup(&path).is_ok() => Ok((
+                    park,
+                    Some("loaded the backup of park.json (the damaged file is kept as park.json.broken)".to_string()),
+                )),
+                _ => Err(LoadError::Broken(why)),
+            }
+        }
+        Err(other) => Err(other),
+    }
 }
 
 /// Write `park.json` the safe way.
@@ -477,6 +539,70 @@ mod tests {
         assert!(!ride_exists(&world, "gone"));
         assert!(with_suffix(&ride_path(&world, "gone"), ".deleted").exists());
         assert!(load_all(&world).rides.is_empty());
+    }
+
+    #[test]
+    fn a_broken_ride_file_is_replaced_by_its_backup_and_kept_as_broken() {
+        let world = scratch("backup");
+        let ride = sample("tough");
+        save_ride(&world, &ride).unwrap();
+        let mut v2 = ride.clone();
+        v2.trains[0].cars = 6;
+        save_ride(&world, &v2).unwrap(); // the backup now holds `ride`
+        let path = ride_path(&world, "tough");
+        fs::write(&path, "{ half a file").unwrap();
+        let loaded = load_all(&world);
+        assert_eq!(loaded.rides, vec![ride]);
+        assert!(loaded.problems.is_empty() && loaded.locked.is_empty());
+        assert_eq!(loaded.notices.len(), 1);
+        assert!(loaded.notices[0].starts_with("loaded the backup of tough"));
+        assert_eq!(
+            fs::read_to_string(with_suffix(&path, ".broken")).unwrap(),
+            "{ half a file"
+        );
+        // The real file is good again.
+        assert!(load_ride(&path).is_ok());
+        // A newer file is never replaced by a backup.
+        fs::write(&path, r#"{"format":5}"#).unwrap();
+        assert_eq!(load_all(&world).locked, vec!["tough"]);
+    }
+
+    #[test]
+    fn a_broken_park_json_comes_back_from_its_backup_keeping_the_session_number() {
+        let world = scratch("park-backup");
+        let mut park = ParkFile {
+            session: 7,
+            ..ParkFile::default()
+        };
+        save_park(&world, &park).unwrap();
+        park.session = 8;
+        save_park(&world, &park).unwrap(); // backup holds session 7
+        fs::write(park_path(&world), "garbage").unwrap();
+        let (back, notice) = load_park_notice(&world).unwrap();
+        assert_eq!(back.session, 7);
+        assert!(
+            notice
+                .unwrap()
+                .starts_with("loaded the backup of park.json")
+        );
+        assert!(with_suffix(&park_path(&world), ".broken").exists());
+        // No backup: still an error.
+        let none = scratch("park-nobackup");
+        fs::create_dir_all(none.join(FOLDER)).unwrap();
+        fs::write(park_path(&none), "garbage").unwrap();
+        assert!(matches!(load_park(&none), Err(LoadError::Broken(_))));
+    }
+
+    #[test]
+    fn deleting_twice_keeps_both_files() {
+        let world = scratch("delete-twice");
+        save_ride(&world, &sample("again")).unwrap();
+        delete_ride(&world, "again").unwrap();
+        save_ride(&world, &sample("again")).unwrap();
+        delete_ride(&world, "again").unwrap();
+        let path = ride_path(&world, "again");
+        assert!(with_suffix(&path, ".deleted").exists());
+        assert!(with_suffix(&path, ".deleted.2").exists());
     }
 
     #[test]

@@ -101,6 +101,8 @@ pub struct Session {
     pub mode: Kind,
     /// Set by `/coaster edit`: this session may save over that ride.
     pub editing: Option<String>,
+    /// The ride being edited, as saved: `create` keeps its settings and trains (cars, speeds...).
+    pub base: Option<RideFile>,
     /// The tick of the last wand use.
     pub last_use: u64,
     /// How many node markers are on show in the world right now (kept in step by the runtime).
@@ -157,6 +159,7 @@ impl Builder {
                     nodes: Vec::new(),
                     mode: Kind::Track,
                     editing: None,
+                    base: None,
                     last_use: now,
                     markers: 0,
                     version: 0,
@@ -209,6 +212,7 @@ impl Builder {
         session.nodes = ride.nodes.clone();
         session.mode = Kind::Track;
         session.editing = Some(ride.id.clone());
+        session.base = Some(ride.clone());
         session.version += 1;
         session.reload = true;
     }
@@ -219,6 +223,7 @@ impl Builder {
             session.nodes.clear();
             session.mode = Kind::Track;
             session.editing = None;
+            session.base = None;
             session.version += 1;
             session.reload = true;
         }
@@ -242,7 +247,14 @@ impl Builder {
                 "A ride called {name} already exists. Use /coaster edit {name} to change it."
             ));
         }
-        let ride = RideFile::new(name, session.nodes.clone());
+        // Editing a ride keeps everything but its nodes.
+        let ride = match &session.base {
+            Some(base) if session.editing.as_deref() == Some(name) => RideFile {
+                nodes: session.nodes.clone(),
+                ..base.clone()
+            },
+            _ => RideFile::new(name, session.nodes.clone()),
+        };
         course_from(&ride)?;
         Ok(ride)
     }
@@ -615,6 +627,27 @@ pub(crate) mod tests {
         assert!(b.create(1, "thunder", taken).is_ok());
         // ...but not another name that exists.
         assert!(b.create(1, "other", |_| true).is_err());
+    }
+
+    #[test]
+    fn editing_and_creating_again_keeps_the_cars_and_settings() {
+        let mut old = RideFile {
+            id: "thunder".into(),
+            ..ride_with(loop_nodes())
+        };
+        old.trains[0].cars = 5;
+        old.settings.friction = 0.03;
+        let mut b = Builder::new();
+        b.load_for_edit(1, &old, 0);
+        // Change one node, then create again.
+        b.sessions_mut()[0].nodes[5].pos = [26.0, 74.0, 26.0];
+        let new = b.create(1, "thunder", |n| n == "thunder").unwrap();
+        assert_eq!(new.trains[0].cars, 5);
+        assert_eq!(new.settings.friction, 0.03);
+        assert_eq!(new.nodes[5].pos, [26.0, 74.0, 26.0]);
+        // A different name starts from defaults.
+        let other = b.create(1, "other", |_| false).unwrap();
+        assert_eq!(other.trains[0].cars, 3);
     }
 
     #[test]
