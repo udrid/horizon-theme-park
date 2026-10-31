@@ -343,3 +343,21 @@ Horizon's two ways of holding a player: the "local" player of a single-player ga
 
 ## Hysteresis (two distances)
 Using two different limits to decide "on" and "off" so it doesn't flicker. A player counts as sitting when within 0.5 block of the seat, and as gone only when beyond 2 blocks. In between, nothing changes. Like a thermostat that heats at 18 and stops at 20.
+
+## Lift hill (chain lift)
+The first climb of most coasters, where a chain under the track pulls the train up at a steady, slow speed. At the top the chain lets go, and gravity does the rest of the ride.
+
+## Brake run
+A stretch of track that slows the train down, like a car braking before a junction. Ours slows the train to a set speed before the station.
+
+## Dispatch
+Sending the train out of the station. On real rides an operator presses a button; ours counts down 5 seconds once someone sits.
+
+## Airtime
+The floaty feeling over the top of a hill, when the track drops away faster than you fall and the seat stops pushing on you. It's near 0 g, or even below.
+
+## CSV file
+A plain text table: one row per line, values separated by commas. Any spreadsheet program can open it and draw charts from it. `park-sim` writes the ride's numbers as CSV.
+
+## Dry run (simulating ahead)
+Running the ride's maths forward without the game, to see what will happen. The mod uses it to know where the car will be a few ticks from now, so it can aim the car there.
