@@ -8,3 +8,7 @@ license.workspace = true
 [dependencies]
 # Same exact version as Horizon (D9). No extra features (rule 10).
 glam = "=0.30.10"
+# Saving (D20). Horizon's exact versions from its Cargo.lock at b5b451de; Horizon already turns on
+# serde's "derive", so nothing extra is switched on (rule 10).
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
