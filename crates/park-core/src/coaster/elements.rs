@@ -98,6 +98,30 @@ impl Course {
         })
     }
 
+    /// Check that every element sits inside one lap without crossing the wrap point `s = 0`
+    /// (the physics compares plain `s` values, so a stretch that wraps would break it), and that
+    /// the station's stop point lies inside its stretch.
+    pub fn validate(&self) -> Result<(), String> {
+        let length = self.table.length();
+        for p in &self.placed {
+            if !(0.0 <= p.s0 && p.s0 < p.s1 && p.s1 <= length + 1e-9) {
+                return Err(format!(
+                    "an element covers {}..{} but the lap is {length} blocks: elements must lie inside one lap and may not cross the lap's start",
+                    p.s0, p.s1
+                ));
+            }
+            if let Element::Station { stop, .. } = p.element
+                && !(p.s0 < stop && stop < p.s1)
+            {
+                return Err(format!(
+                    "the station's stop point {stop} is outside its stretch {}..{}",
+                    p.s0, p.s1
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The station, if the course has one.
     pub fn station(&self) -> Option<(&Placed, f64, f64)> {
         self.placed.iter().find_map(|p| match p.element {
@@ -131,6 +155,30 @@ mod tests {
         assert_eq!(BRAKE_TARGET, 3.0);
         assert_eq!(STATION_PUSH, 2.0);
         assert_eq!(DWELL, 5.0);
+    }
+
+    #[test]
+    fn a_station_that_crosses_the_lap_start_is_refused_with_a_clear_message() {
+        let mut course = loop_course();
+        let lap = course.table.length();
+        course.placed.push(Placed {
+            s0: lap - 5.0,
+            s1: lap + 5.0,
+            element: Element::station(lap - 1.0),
+        });
+        let message = course.validate().unwrap_err();
+        assert!(
+            message.contains("may not cross the lap's start"),
+            "{message}"
+        );
+        course.placed[0] = Placed {
+            s0: 10.0,
+            s1: 20.0,
+            element: Element::station(18.0),
+        };
+        assert!(course.validate().is_ok());
+        course.placed[0].element = Element::station(25.0);
+        assert!(course.validate().unwrap_err().contains("stop point"));
     }
 
     #[test]

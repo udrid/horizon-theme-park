@@ -224,7 +224,9 @@ pub fn course_for(shape: &Shape, origin: DVec3) -> Course {
             element: Element::lift(),
         },
     ];
-    Course { table, placed }
+    let course = Course { table, placed };
+    debug_assert!(course.validate().is_ok(), "{:?}", course.validate());
+    course
 }
 
 /// The distance along the table of the point at `u` blocks along the path seen from above.
@@ -393,6 +395,21 @@ mod tests {
     }
 
     #[test]
+    fn the_demos_elements_pass_the_courses_own_checks() {
+        assert_eq!(course().validate(), Ok(()));
+    }
+
+    #[test]
+    fn nobody_feels_a_jolt_along_the_lap() {
+        let st = sim::stats(&lap(&course()));
+        assert!(
+            st.max_longitudinal <= 1.0,
+            "forward/back push {} g",
+            st.max_longitudinal
+        );
+    }
+
+    #[test]
     fn the_elements_are_where_they_should_be() {
         let c = course();
         let len = c.table.length();
@@ -516,6 +533,30 @@ impl Course {
         })
     }
 
+    /// Check that every element sits inside one lap without crossing the wrap point `s = 0`
+    /// (the physics compares plain `s` values, so a stretch that wraps would break it), and that
+    /// the station's stop point lies inside its stretch.
+    pub fn validate(&self) -> Result<(), String> {
+        let length = self.table.length();
+        for p in &self.placed {
+            if !(0.0 <= p.s0 && p.s0 < p.s1 && p.s1 <= length + 1e-9) {
+                return Err(format!(
+                    "an element covers {}..{} but the lap is {length} blocks: elements must lie inside one lap and may not cross the lap's start",
+                    p.s0, p.s1
+                ));
+            }
+            if let Element::Station { stop, .. } = p.element
+                && !(p.s0 < stop && stop < p.s1)
+            {
+                return Err(format!(
+                    "the station's stop point {stop} is outside its stretch {}..{}",
+                    p.s0, p.s1
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The station, if the course has one.
     pub fn station(&self) -> Option<(&Placed, f64, f64)> {
         self.placed.iter().find_map(|p| match p.element {
@@ -549,6 +590,30 @@ mod tests {
         assert_eq!(BRAKE_TARGET, 3.0);
         assert_eq!(STATION_PUSH, 2.0);
         assert_eq!(DWELL, 5.0);
+    }
+
+    #[test]
+    fn a_station_that_crosses_the_lap_start_is_refused_with_a_clear_message() {
+        let mut course = loop_course();
+        let lap = course.table.length();
+        course.placed.push(Placed {
+            s0: lap - 5.0,
+            s1: lap + 5.0,
+            element: Element::station(lap - 1.0),
+        });
+        let message = course.validate().unwrap_err();
+        assert!(
+            message.contains("may not cross the lap's start"),
+            "{message}"
+        );
+        course.placed[0] = Placed {
+            s0: 10.0,
+            s1: 20.0,
+            element: Element::station(18.0),
+        };
+        assert!(course.validate().is_ok());
+        course.placed[0].element = Element::station(25.0);
+        assert!(course.validate().unwrap_err().contains("stop point"));
     }
 
     #[test]
@@ -976,9 +1041,12 @@ const SNAP_SPEED: f64 = 0.05;
 /// The station slows the train to a stop along a curve with this much slowing-down (blocks/s²)...
 const STATION_COMFORT_DECEL: f64 = 1.0;
 /// ...but never creeps slower than this, so a train always reaches the stop point.
-const STATION_CREEP: f64 = 0.3;
+const STATION_CREEP: f64 = 0.05;
 /// A train this close to the stop point counts as arrived.
 const STATION_ARRIVE: f64 = 0.02;
+/// How hard the chain, the station wheels and the push-out accelerate the train, blocks per
+/// second squared (about 0.15 g, like a real chain engaging). Nothing ever jumps the speed.
+pub const ELEMENT_ACCEL: f64 = 1.5;
 
 /// The numbers the physics needs (D11, D14). Defaults are the approved ones.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1170,10 +1238,29 @@ impl Train {
         let arriving = station.filter(|(p, stop, _)| front >= p.s0 && front < *stop);
         let leaving = station.filter(|(_, stop, _)| front >= *stop);
 
+        let mut braking = false;
         if let Some((_, (target, decel))) = brake
             && self.v > target
         {
             a -= decel;
+            braking = true;
+        }
+        // Some elements pull a slow train UP to a speed: the chain, the station's push-out and
+        // the station's wheels. They never jump the speed: they accelerate the train gently
+        // (`ELEMENT_ACCEL`), cancelling gravity and friction first, like a chain engaging.
+        let chain_speed = match (lift, leaving) {
+            (Some((_, speed)), Some((_, _, push))) => Some(speed.max(push)),
+            (Some((_, speed)), None) => Some(speed),
+            (None, Some((_, _, push))) => Some(push),
+            (None, None) => None,
+        };
+        let mut pull_to: Option<f64> = None;
+        let mut raise = |target: f64| pull_to = Some(pull_to.map_or(target, |t| t.max(target)));
+        if let Some((_, speed)) = lift {
+            raise(speed);
+        }
+        if let Some((_, _, push)) = leaving {
+            raise(push);
         }
         // Arriving: follow a gentle slowing-down curve that ends exactly at the stop point.
         let mut station_speed = None;
@@ -1185,8 +1272,18 @@ impl Train {
             );
             station_speed = Some(wanted);
             if self.v > wanted {
-                a -= crate::game::htp_park::coaster::elements::BRAKE_DECEL;
+                // Brakes do not stack: a train already being braked is not braked twice as hard.
+                if !braking {
+                    a -= crate::game::htp_park::coaster::elements::BRAKE_DECEL;
+                }
+            } else {
+                raise(wanted);
             }
+        }
+        if let Some(target) = pull_to
+            && self.v < target
+        {
+            a = ELEMENT_ACCEL;
         }
 
         // 4. Speed first...
@@ -1201,20 +1298,28 @@ impl Train {
             self.v = target; // the brake never takes more than it must
         }
         if let Some(wanted) = station_speed
+            && v_before > wanted
             && self.v < wanted
         {
-            // Never slower than the curve: the station's wheels pull a slow train along.
-            self.v = wanted;
+            self.v = wanted; // the curve is a floor for a train that is too fast
         }
-        if let Some((_, _, push)) = leaving
-            && self.v < push
+        if let Some(target) = pull_to
+            && v_before < target
+            && self.v > target
         {
-            self.v = push; // pushed out of the station
+            self.v = target; // the pull stops at its speed
         }
-        if let Some((_, speed)) = lift
-            && self.v < speed
+        // The chain (and the push-out) HOLD their speed against gravity: a train that has just
+        // reached it is not allowed to slip back below it.
+        if let Some(target) = chain_speed
+            && v_before >= target
+            && self.v < target
+            && self.v > target - 0.5
         {
-            self.v = speed; // the chain grabs; no rolling back
+            self.v = target;
+        }
+        if lift.is_some() && self.v < 0.0 {
+            self.v = 0.0; // safety net: the chain never lets the train roll back
         }
         // A train on a gentle slope that is nearly stopped stays stopped (no jitter).
         if lift.is_none()
@@ -1246,6 +1351,7 @@ impl Train {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::htp_park::coaster::demo;
     use crate::game::htp_park::coaster::elements::Placed;
     use crate::game::htp_park::coaster::spline::Track;
     use crate::game::htp_park::coaster::table::Table;
@@ -1407,7 +1513,7 @@ mod tests {
 
     // Test 6: a long train over an uneven hill: gentle up, steep down.
     #[test]
-    fn the_back_car_is_faster_at_the_top_than_the_front_car_was() {
+    fn on_an_uneven_hill_the_back_car_is_faster_at_the_top_than_the_front_car_was() {
         // A hill: slope +15 degrees up, then -45 degrees down, rounded at the top.
         let mut nodes = Vec::new();
         let (up, down) = (15f64.to_radians().tan(), -(45f64.to_radians().tan()));
@@ -1509,22 +1615,33 @@ mod tests {
             s1: 110.0,
             element: Element::lift(),
         });
-        // A train stopped at the foot of the lift: the chain takes it.
-        let mut train = Train::free(3, 24.0, 0.0);
-        let mut min_v = f64::MAX;
-        let mut left_at = None;
-        for tick in 0..2000 {
-            train.step(&course, &Physics::default());
-            if train.s > 26.0 && train.s - 2.0 * CAR_SPACING < 110.0 {
-                min_v = min_v.min(train.v);
+        // A train stopped on the lift: the chain takes it up to its speed, gently.
+        let mut train = Train::free(3, 30.0, 0.0);
+        let mut at_speed = false;
+        let mut left = false;
+        for _ in 0..2000 {
+            for _ in 0..SUBSTEPS {
+                train.substep(&course, &Physics::default());
+                assert!(train.v >= 0.0, "rolled back: {}", train.v);
+                assert!(train.a.abs() <= ELEMENT_ACCEL + 1e-6, "jolt: {}", train.a);
+            }
+            if train.v >= 5.0 - 1e-9 {
+                at_speed = true;
+            }
+            if at_speed && train.s - 2.0 * CAR_SPACING < 110.0 {
+                assert!(train.v >= 5.0 - 1e-9, "slower than the chain: {}", train.v);
             }
             if train.s - 2.0 * CAR_SPACING >= 111.0 {
-                left_at = Some((tick, train.v));
+                left = true;
                 break;
             }
         }
-        assert!(min_v >= 5.0 - 1e-9, "min speed on the lift {min_v}");
-        assert!(left_at.is_some(), "never left the lift");
+        assert!(at_speed && left, "never got going or never left the lift");
+        assert!(
+            (train.v - 5.0).abs() < 0.5,
+            "leaves at about the chain speed: {}",
+            train.v
+        );
     }
 
     // Test 9: the brake.
@@ -1578,11 +1695,84 @@ mod tests {
             train.step(&course, &Physics::default());
         }
         assert!(!train.is_held(), "still held after the dwell");
-        // ...and is pushed out at the push speed.
+        // ...and is pushed out gently, up to the push speed.
         for _ in 0..4 {
             train.step(&course, &Physics::default());
         }
-        assert!(train.v >= 2.0 - 1e-9 && train.s > 40.0);
+        assert!(train.v > 0.0 && train.v < 2.0 && train.s > 40.0);
+        for _ in 0..40 {
+            train.step(&course, &Physics::default());
+        }
+        assert!((train.v - 2.0).abs() < 0.05, "pushed to {}", train.v);
+    }
+
+    /// The demo course with `cars` cars, released from the station.
+    fn demo_run(cars: usize) -> (Course, Train) {
+        let course = demo::demo_course(DVec3::ZERO);
+        let stop = course.station().unwrap().1;
+        let mut train = Train::held(cars, stop);
+        train.start_countdown(0.0);
+        (course, train)
+    }
+
+    // The planner's realism fix: nothing jumps the speed.
+    #[test]
+    fn nothing_on_the_demo_lap_jolts_the_train() {
+        let (course, mut train) = demo_run(3);
+        let mut left = false;
+        let mut worst_a: f64 = 0.0;
+        for _ in 0..4000 {
+            for _ in 0..SUBSTEPS {
+                train.substep(&course, &Physics::default());
+                worst_a = worst_a.max(train.a.abs());
+            }
+            if !train.is_held() {
+                left = true;
+            } else if left {
+                break;
+            }
+        }
+        assert!(left && train.is_held(), "the lap should end in the station");
+        assert!(worst_a <= 15.0, "worst acceleration {worst_a} blocks/s^2");
+    }
+
+    // Test 6 for real (D13): over the lift crest the back car goes faster than the front car did.
+    #[test]
+    fn over_the_lift_crest_the_back_car_is_clearly_faster_than_the_front_car_was() {
+        let (course, mut train) = demo_run(6);
+        let lift = course
+            .placed
+            .iter()
+            .find(|p| matches!(p.element, Element::Lift { .. }))
+            .unwrap();
+        // The crest is the highest point of the lift.
+        let (mut crest, mut best, mut s) = (lift.s0, f64::MIN, lift.s0);
+        while s < lift.s1 {
+            let y = course.table.position(s).y;
+            if y > best {
+                best = y;
+                crest = s;
+            }
+            s += 0.05;
+        }
+        let back = 5.0 * CAR_SPACING;
+        let (mut v_front, mut v_back) = (None, None);
+        for _ in 0..3000 {
+            let before = train;
+            train.step(&course, &Physics::default());
+            if v_front.is_none() && before.s < crest && train.s >= crest {
+                v_front = Some(train.v);
+            }
+            if v_back.is_none() && before.s - back < crest && train.s - back >= crest {
+                v_back = Some(train.v);
+            }
+        }
+        let (front, back) = (v_front.unwrap(), v_back.unwrap());
+        assert!(
+            (front - 5.0).abs() < 0.3,
+            "front car crosses at chain speed: {front}"
+        );
+        assert!(back > front + 1.0, "front {front}, back {back}");
     }
 }
 }
@@ -1672,6 +1862,8 @@ pub struct Stats {
     pub min_vertical: f64,
     /// Largest sideways g, ignoring the sign.
     pub max_lateral: f64,
+    /// Largest forward or backward push, ignoring the sign.
+    pub max_longitudinal: f64,
     /// Biggest change of vertical g over any one second (D58: at most 3 g per second).
     pub max_vertical_rate: f64,
     /// The same measured over a quarter second, scaled to g per second: stricter, for information.
@@ -1701,6 +1893,7 @@ pub fn stats(samples: &[Sample]) -> Stats {
             st.max_vertical = st.max_vertical.max(f.vertical);
             st.min_vertical = st.min_vertical.min(f.vertical);
             st.max_lateral = st.max_lateral.max(f.lateral.abs());
+            st.max_longitudinal = st.max_longitudinal.max(f.longitudinal.abs());
             if k >= WINDOW {
                 let before = samples[k - WINDOW].felt[i].vertical;
                 st.max_vertical_rate = st
@@ -2449,7 +2642,7 @@ pub trait Host {
     fn log(&mut self, _text: &str) {}
     /// Show a line on one player's action bar (above the hotbar). Optional: the default says "not
     /// available" (`false`) and park-core then falls back to the `title ... actionbar` command.
-    /// The glue can later answer this with Horizon's API 21 helper (D43's "extra method" rule).
+    /// The glue answers this with Horizon's API 21 helper `native_action_bar` (D43's "extra method" rule).
     fn action_bar(&mut self, _player: u128, _text: &str) -> bool {
         false
     }

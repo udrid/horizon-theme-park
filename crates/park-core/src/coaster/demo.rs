@@ -209,7 +209,9 @@ pub fn course_for(shape: &Shape, origin: DVec3) -> Course {
             element: Element::lift(),
         },
     ];
-    Course { table, placed }
+    let course = Course { table, placed };
+    debug_assert!(course.validate().is_ok(), "{:?}", course.validate());
+    course
 }
 
 /// The distance along the table of the point at `u` blocks along the path seen from above.
@@ -375,6 +377,21 @@ mod tests {
             assert!(c.table.position(s).y > -0.5, "low at s = {s}");
             s += 0.25;
         }
+    }
+
+    #[test]
+    fn the_demos_elements_pass_the_courses_own_checks() {
+        assert_eq!(course().validate(), Ok(()));
+    }
+
+    #[test]
+    fn nobody_feels_a_jolt_along_the_lap() {
+        let st = sim::stats(&lap(&course()));
+        assert!(
+            st.max_longitudinal <= 1.0,
+            "forward/back push {} g",
+            st.max_longitudinal
+        );
     }
 
     #[test]

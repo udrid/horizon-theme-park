@@ -32,7 +32,7 @@ pub trait Host {
     fn log(&mut self, _text: &str) {}
     /// Show a line on one player's action bar (above the hotbar). Optional: the default says "not
     /// available" (`false`) and park-core then falls back to the `title ... actionbar` command.
-    /// The glue can later answer this with Horizon's API 21 helper (D43's "extra method" rule).
+    /// The glue answers this with Horizon's API 21 helper `native_action_bar` (D43's "extra method" rule).
     fn action_bar(&mut self, _player: u128, _text: &str) -> bool {
         false
     }

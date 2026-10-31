@@ -83,6 +83,8 @@ pub struct Stats {
     pub min_vertical: f64,
     /// Largest sideways g, ignoring the sign.
     pub max_lateral: f64,
+    /// Largest forward or backward push, ignoring the sign.
+    pub max_longitudinal: f64,
     /// Biggest change of vertical g over any one second (D58: at most 3 g per second).
     pub max_vertical_rate: f64,
     /// The same measured over a quarter second, scaled to g per second: stricter, for information.
@@ -112,6 +114,7 @@ pub fn stats(samples: &[Sample]) -> Stats {
             st.max_vertical = st.max_vertical.max(f.vertical);
             st.min_vertical = st.min_vertical.min(f.vertical);
             st.max_lateral = st.max_lateral.max(f.lateral.abs());
+            st.max_longitudinal = st.max_longitudinal.max(f.longitudinal.abs());
             if k >= WINDOW {
                 let before = samples[k - WINDOW].felt[i].vertical;
                 st.max_vertical_rate = st

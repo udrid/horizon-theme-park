@@ -65,6 +65,12 @@ impl Host for GameHost<'_, '_> {
         let _ = self.0.native_tell(player, Text::literal(text.to_string()));
     }
 
+    fn action_bar(&mut self, player: u128, text: &str) -> bool {
+        // The line over the player's hotbar (hook API 21 helper, stable). False if they are not on.
+        self.0
+            .native_action_bar(player, Text::literal(text.to_string()))
+    }
+
     fn log(&mut self, text: &str) {
         // The game's log only (logs/latest.log); nothing in chat.
         log::info!("{text}");
