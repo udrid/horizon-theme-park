@@ -143,7 +143,8 @@ pub mod frame {
 
 use glam::{DQuat, DVec3};
 
-/// Position and orientation at one point of the track. For +Z forward and +Y up, `right` is +X.
+/// Position and orientation at one point of the track. `right` is the rider's right hand:
+/// `forward × up`. Facing +Z (south) with +Y up, that is -X (west); facing +X it is +Z.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Frame {
     pub pos: DVec3,
@@ -158,7 +159,7 @@ impl Default for Frame {
             pos: DVec3::ZERO,
             forward: DVec3::Z,
             up: DVec3::Y,
-            right: DVec3::X,
+            right: DVec3::NEG_X,
         }
     }
 }
@@ -229,6 +230,19 @@ mod tests {
     }
 
     #[test]
+    fn right_is_the_riders_right_hand() {
+        use crate::game::htp_park::coaster::demo::demo_nodes;
+        // Facing +Z (yaw 0): right is -X. Facing +X (yaw -90): right is +Z.
+        for (yaw, forward, right) in [(0.0, DVec3::Z, -DVec3::X), (-90.0, DVec3::X, DVec3::Z)] {
+            let t = Table::new(&Track::closed(&demo_nodes(DVec3::ZERO, yaw)));
+            let f = t.frame(0.0);
+            assert!(f.forward.dot(forward) > 0.99);
+            assert!(f.right.dot(right) > 0.99, "yaw {yaw}: right {:?}", f.right);
+            assert!(f.right.dot(f.up).abs() < 1e-9);
+        }
+    }
+
+    #[test]
     fn no_flip_through_an_s_bend() {
         let t = s_bend_loop();
         let mut prev = t.frame(0.0);
@@ -237,6 +251,8 @@ mod tests {
             let f = t.frame(s);
             // Up never turns upside down and never jumps between neighbouring points. (On a wild 3D
             // loop it may lean gradually: that is the carried-along twist, spread over the lap.)
+            // NOTE: `up·Y > 0` is right for M1's tracks only. Loops turn riders upside down, so the
+            // M5 plan replaces it with the continuity check (the jump test below) alone.
             assert!(f.up.dot(DVec3::Y) > 0.0, "up flipped at s = {s}");
             assert!(angle_deg(prev.up, f.up) < 1.5, "up jumped at s = {s}");
             assert!(f.up.dot(f.forward).abs() < 1e-9);
@@ -526,7 +542,7 @@ impl Table {
             pos,
             forward,
             up,
-            right: up.cross(forward),
+            right: forward.cross(up),
         }
     }
 
@@ -884,6 +900,8 @@ pub trait Host {
     fn broadcast(&mut self, text: &str);
     /// A line of chat for one player.
     fn tell(&mut self, player: u128, text: &str);
+    /// A line for the game's log only (nobody sees it in chat). Optional: the default drops it.
+    fn log(&mut self, _text: &str) {}
 }
 
 /// A pretend game for tests: it records every call, in order.
@@ -899,6 +917,8 @@ pub struct FakeHost {
     pub broadcasts: Vec<String>,
     /// Every private line, as (player, text).
     pub tells: Vec<(u128, String)>,
+    /// Every log line.
+    pub logs: Vec<String>,
 }
 
 impl FakeHost {
@@ -932,6 +952,10 @@ impl Host for FakeHost {
 
     fn tell(&mut self, player: u128, text: &str) {
         self.tells.push((player, text.to_string()));
+    }
+
+    fn log(&mut self, text: &str) {
+        self.logs.push(text.to_string());
     }
 }
 
@@ -1087,10 +1111,13 @@ pub fn rail_pose(table: &Table, piece: Piece) -> RailPose {
     let forward = chord / length;
     let mid_frame = table.frame((piece.s0 + piece.s1) / 2.0);
     let up = (mid_frame.up - forward * mid_frame.up.dot(forward)).normalize_or_zero();
-    let right = up.cross(forward);
+    // The model's +X side is the LEFT of the direction of travel (Minecraft's model axes are
+    // x = left, y = up, z = forward when facing +Z), so the model's x axis is up × forward, which
+    // is `-frame.right`. Using it keeps the matrix a proper rotation (no mirror).
+    let model_x = up.cross(forward);
     RailPose {
         pos: (a + b) / 2.0,
-        rotation: DQuat::from_mat3(&DMat3::from_cols(right, up, forward)),
+        rotation: DQuat::from_mat3(&DMat3::from_cols(model_x, up, forward)),
         scale: DVec3::new(RAIL_WIDTH, RAIL_HEIGHT, length),
     }
 }
@@ -1281,7 +1308,9 @@ pub const COMMAND_USAGES: [&str; 3] = ["coaster demo", "coaster ride", "coaster 
 pub const MAX_COMMANDS_PER_TICK: usize = 400;
 
 /// A player counts as sitting in a seat when within this distance of its rider point (D49).
-pub const RIDER_ON_DISTANCE: f64 = 0.5;
+/// Generous on purpose: a cart that falls between our moves can shift the rider by a few tenths
+/// of a block, and the train must never refuse to start.
+pub const RIDER_ON_DISTANCE: f64 = 1.0;
 /// A rider is "off" when nobody is within this distance of the rider point (D49, spike R7).
 pub const RIDER_OFF_DISTANCE: f64 = 2.0;
 
@@ -1502,6 +1531,22 @@ impl Runtime {
                 .map(|p| p.pos.distance(point))
                 .fold(f64::INFINITY, f64::min);
             if nearest <= RIDER_ON_DISTANCE {
+                if !demo.occupied[i] {
+                    // Once per boarding: write down where the rider really is, so the heights can
+                    // be checked in the log (D49: the cart's fall may move them).
+                    if let Some(p) = players
+                        .iter()
+                        .min_by(|a, b| a.pos.distance(point).total_cmp(&b.pos.distance(point)))
+                    {
+                        let d = p.pos - demo.seat_pos[i];
+                        host.log(&format!(
+                            "Horizon Theme Park: seat {i} boarded, rider minus seat = {} {} {}",
+                            commands::num(d.x),
+                            commands::num(d.y),
+                            commands::num(d.z)
+                        ));
+                    }
+                }
                 demo.occupied[i] = true;
             } else if nearest > RIDER_OFF_DISTANCE {
                 demo.occupied[i] = false;
@@ -1765,8 +1810,9 @@ mod tests {
     #[test]
     fn a_player_between_the_two_distances_changes_nothing() {
         let (mut rt, mut host) = built();
-        // Standing 1 block from the rider point: not close enough to count as sitting.
-        host.players[0].pos = render::rider_point(rt.demo.as_ref().unwrap().seat_pos[0]) + DVec3::X;
+        // Standing 1.5 blocks from the rider point: not close enough to count as sitting.
+        host.players[0].pos =
+            render::rider_point(rt.demo.as_ref().unwrap().seat_pos[0]) + DVec3::X * 1.5;
         rt.tick(&mut host);
         assert!(!rt.demo.as_ref().unwrap().occupied[0]);
         // Sitting, then stepping 1 block away: still counts as sitting.
@@ -1780,6 +1826,25 @@ mod tests {
         host.players[0].pos = DVec3::new(500.0, 70.0, 500.0);
         rt.tick(&mut host);
         assert!(!rt.demo.as_ref().unwrap().occupied[0]);
+    }
+
+    #[test]
+    fn boarding_is_logged_once_with_the_measured_offset_and_a_loose_fit_still_counts() {
+        let (mut rt, mut host) = built();
+        // A rider hanging 0.9 block off the expected spot still counts as sitting.
+        let seat = rt.demo.as_ref().unwrap().seat_pos[0];
+        host.players[0].pos = render::rider_point(seat) + DVec3::new(0.0, -0.9, 0.0);
+        for _ in 0..5 {
+            rt.tick(&mut host);
+            host.players[0].pos = render::rider_point(rt.demo.as_ref().unwrap().seat_pos[0])
+                + DVec3::new(0.0, -0.9, 0.0);
+        }
+        assert!(rt.demo.as_ref().unwrap().moving);
+        assert_eq!(host.logs.len(), 1, "{:?}", host.logs);
+        assert_eq!(
+            host.logs[0],
+            "Horizon Theme Park: seat 0 boarded, rider minus seat = 0.0000 -2.1125 0.0000"
+        );
     }
 
     #[test]

@@ -64,6 +64,11 @@ impl Host for GameHost<'_, '_> {
     fn tell(&mut self, player: u128, text: &str) {
         let _ = self.0.native_tell(player, Text::literal(text.to_string()));
     }
+
+    fn log(&mut self, text: &str) {
+        // The game's log only (logs/latest.log); nothing in chat.
+        log::info!("{text}");
+    }
 }
 
 /// Called from the world-lifecycle hook (see on_world.rs).

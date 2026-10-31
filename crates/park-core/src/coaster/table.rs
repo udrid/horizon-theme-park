@@ -149,7 +149,7 @@ impl Table {
             pos,
             forward,
             up,
-            right: up.cross(forward),
+            right: forward.cross(up),
         }
     }
 

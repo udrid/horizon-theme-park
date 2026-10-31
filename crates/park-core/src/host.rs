@@ -28,6 +28,8 @@ pub trait Host {
     fn broadcast(&mut self, text: &str);
     /// A line of chat for one player.
     fn tell(&mut self, player: u128, text: &str);
+    /// A line for the game's log only (nobody sees it in chat). Optional: the default drops it.
+    fn log(&mut self, _text: &str) {}
 }
 
 /// A pretend game for tests: it records every call, in order.
@@ -43,6 +45,8 @@ pub struct FakeHost {
     pub broadcasts: Vec<String>,
     /// Every private line, as (player, text).
     pub tells: Vec<(u128, String)>,
+    /// Every log line.
+    pub logs: Vec<String>,
 }
 
 impl FakeHost {
@@ -76,6 +80,10 @@ impl Host for FakeHost {
 
     fn tell(&mut self, player: u128, text: &str) {
         self.tells.push((player, text.to_string()));
+    }
+
+    fn log(&mut self, text: &str) {
+        self.logs.push(text.to_string());
     }
 }
 

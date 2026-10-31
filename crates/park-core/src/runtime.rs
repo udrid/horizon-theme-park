@@ -27,7 +27,9 @@ pub const COMMAND_USAGES: [&str; 3] = ["coaster demo", "coaster ride", "coaster 
 pub const MAX_COMMANDS_PER_TICK: usize = 400;
 
 /// A player counts as sitting in a seat when within this distance of its rider point (D49).
-pub const RIDER_ON_DISTANCE: f64 = 0.5;
+/// Generous on purpose: a cart that falls between our moves can shift the rider by a few tenths
+/// of a block, and the train must never refuse to start.
+pub const RIDER_ON_DISTANCE: f64 = 1.0;
 /// A rider is "off" when nobody is within this distance of the rider point (D49, spike R7).
 pub const RIDER_OFF_DISTANCE: f64 = 2.0;
 
@@ -248,6 +250,22 @@ impl Runtime {
                 .map(|p| p.pos.distance(point))
                 .fold(f64::INFINITY, f64::min);
             if nearest <= RIDER_ON_DISTANCE {
+                if !demo.occupied[i] {
+                    // Once per boarding: write down where the rider really is, so the heights can
+                    // be checked in the log (D49: the cart's fall may move them).
+                    if let Some(p) = players
+                        .iter()
+                        .min_by(|a, b| a.pos.distance(point).total_cmp(&b.pos.distance(point)))
+                    {
+                        let d = p.pos - demo.seat_pos[i];
+                        host.log(&format!(
+                            "Horizon Theme Park: seat {i} boarded, rider minus seat = {} {} {}",
+                            commands::num(d.x),
+                            commands::num(d.y),
+                            commands::num(d.z)
+                        ));
+                    }
+                }
                 demo.occupied[i] = true;
             } else if nearest > RIDER_OFF_DISTANCE {
                 demo.occupied[i] = false;
@@ -511,8 +529,9 @@ mod tests {
     #[test]
     fn a_player_between_the_two_distances_changes_nothing() {
         let (mut rt, mut host) = built();
-        // Standing 1 block from the rider point: not close enough to count as sitting.
-        host.players[0].pos = render::rider_point(rt.demo.as_ref().unwrap().seat_pos[0]) + DVec3::X;
+        // Standing 1.5 blocks from the rider point: not close enough to count as sitting.
+        host.players[0].pos =
+            render::rider_point(rt.demo.as_ref().unwrap().seat_pos[0]) + DVec3::X * 1.5;
         rt.tick(&mut host);
         assert!(!rt.demo.as_ref().unwrap().occupied[0]);
         // Sitting, then stepping 1 block away: still counts as sitting.
@@ -526,6 +545,25 @@ mod tests {
         host.players[0].pos = DVec3::new(500.0, 70.0, 500.0);
         rt.tick(&mut host);
         assert!(!rt.demo.as_ref().unwrap().occupied[0]);
+    }
+
+    #[test]
+    fn boarding_is_logged_once_with_the_measured_offset_and_a_loose_fit_still_counts() {
+        let (mut rt, mut host) = built();
+        // A rider hanging 0.9 block off the expected spot still counts as sitting.
+        let seat = rt.demo.as_ref().unwrap().seat_pos[0];
+        host.players[0].pos = render::rider_point(seat) + DVec3::new(0.0, -0.9, 0.0);
+        for _ in 0..5 {
+            rt.tick(&mut host);
+            host.players[0].pos = render::rider_point(rt.demo.as_ref().unwrap().seat_pos[0])
+                + DVec3::new(0.0, -0.9, 0.0);
+        }
+        assert!(rt.demo.as_ref().unwrap().moving);
+        assert_eq!(host.logs.len(), 1, "{:?}", host.logs);
+        assert_eq!(
+            host.logs[0],
+            "Horizon Theme Park: seat 0 boarded, rider minus seat = 0.0000 -2.1125 0.0000"
+        );
     }
 
     #[test]

@@ -115,10 +115,13 @@ pub fn rail_pose(table: &Table, piece: Piece) -> RailPose {
     let forward = chord / length;
     let mid_frame = table.frame((piece.s0 + piece.s1) / 2.0);
     let up = (mid_frame.up - forward * mid_frame.up.dot(forward)).normalize_or_zero();
-    let right = up.cross(forward);
+    // The model's +X side is the LEFT of the direction of travel (Minecraft's model axes are
+    // x = left, y = up, z = forward when facing +Z), so the model's x axis is up × forward, which
+    // is `-frame.right`. Using it keeps the matrix a proper rotation (no mirror).
+    let model_x = up.cross(forward);
     RailPose {
         pos: (a + b) / 2.0,
-        rotation: DQuat::from_mat3(&DMat3::from_cols(right, up, forward)),
+        rotation: DQuat::from_mat3(&DMat3::from_cols(model_x, up, forward)),
         scale: DVec3::new(RAIL_WIDTH, RAIL_HEIGHT, length),
     }
 }

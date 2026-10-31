@@ -8,7 +8,8 @@
 
 use glam::{DQuat, DVec3};
 
-/// Position and orientation at one point of the track. For +Z forward and +Y up, `right` is +X.
+/// Position and orientation at one point of the track. `right` is the rider's right hand:
+/// `forward × up`. Facing +Z (south) with +Y up, that is -X (west); facing +X it is +Z.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Frame {
     pub pos: DVec3,
@@ -23,7 +24,7 @@ impl Default for Frame {
             pos: DVec3::ZERO,
             forward: DVec3::Z,
             up: DVec3::Y,
-            right: DVec3::X,
+            right: DVec3::NEG_X,
         }
     }
 }
@@ -94,6 +95,19 @@ mod tests {
     }
 
     #[test]
+    fn right_is_the_riders_right_hand() {
+        use crate::coaster::demo::demo_nodes;
+        // Facing +Z (yaw 0): right is -X. Facing +X (yaw -90): right is +Z.
+        for (yaw, forward, right) in [(0.0, DVec3::Z, -DVec3::X), (-90.0, DVec3::X, DVec3::Z)] {
+            let t = Table::new(&Track::closed(&demo_nodes(DVec3::ZERO, yaw)));
+            let f = t.frame(0.0);
+            assert!(f.forward.dot(forward) > 0.99);
+            assert!(f.right.dot(right) > 0.99, "yaw {yaw}: right {:?}", f.right);
+            assert!(f.right.dot(f.up).abs() < 1e-9);
+        }
+    }
+
+    #[test]
     fn no_flip_through_an_s_bend() {
         let t = s_bend_loop();
         let mut prev = t.frame(0.0);
@@ -102,6 +116,8 @@ mod tests {
             let f = t.frame(s);
             // Up never turns upside down and never jumps between neighbouring points. (On a wild 3D
             // loop it may lean gradually: that is the carried-along twist, spread over the lap.)
+            // NOTE: `up·Y > 0` is right for M1's tracks only. Loops turn riders upside down, so the
+            // M5 plan replaces it with the continuity check (the jump test below) alone.
             assert!(f.up.dot(DVec3::Y) > 0.0, "up flipped at s = {s}");
             assert!(angle_deg(prev.up, f.up) < 1.5, "up jumped at s = {s}");
             assert!(f.up.dot(f.forward).abs() < 1e-9);
