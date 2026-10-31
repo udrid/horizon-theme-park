@@ -316,3 +316,27 @@ A stand-in is a fake part shaped like the real one, for example a pretend `Game`
 
 ## `$crate`
 A special word used inside a home-made macro, meaning "the project this macro was written in". Inside the game, that project is Horizon, so `$crate::` needs the same address change as `crate::` (to `$crate::game::htp_park::`). Like a return address printed on an envelope: if you move house, it has to change too.
+
+## Content mod (`.hmod`)
+A mod with no code, only data: new items, blocks, models and textures, packed in a zip file. Like a sticker sheet for the game. Our rail and car models live in one.
+
+## Namespace
+The part before the colon in `htp:rail` or `minecraft:stone`. It says whose item it is, like a surname, so two mods can both have a "rail" without mixing them up.
+
+## Item model (JSON)
+A text file describing an item's 3D shape as boxes, plus which pictures (textures) cover them. Minecraft and Horizon read the same format. Blockbench is a free program to draw them.
+
+## Registering a command
+Telling the game "the command `/coaster` exists" before anyone uses it, so the chat box can suggest it. Like putting a dish on the menu before customers can order it.
+
+## Queue (order queue)
+A waiting line of jobs, done in order. When you type `/coaster ride`, the mod can't act right then, so it puts the order in the queue and does it on the next tick. Like a ticket at a deli counter.
+
+## Yaw and pitch
+Two angles for which way something faces. Yaw is turning left or right (like a compass); pitch is looking up or down. Roll (tilting sideways) is the third, and displays can't change it after they appear.
+
+## Sag
+How far a straight line between two points on a curve strays from the curve itself, in the middle. A car gliding straight between updates sags inward on a bend, so tight bends need more frequent updates.
+
+## Guest vs local player (Horizon)
+Horizon's two ways of holding a player: the "local" player of a single-player game, and a "guest" who joined a hosted world. Some commands, like `/ride`, only handle one kind, which is why M1 tests mounting first.
