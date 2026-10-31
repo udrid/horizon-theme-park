@@ -994,10 +994,16 @@ pub const CAR_LIFT: f64 = 0.5;
 pub const CAR_SCALE: DVec3 = DVec3::new(1.6, 0.9, 3.0);
 /// Where each seat sits along the car, in blocks from the car's middle (front, back).
 pub const SEAT_OFFSETS: [f64; 2] = [0.7, -0.7];
-/// How far a seat (a minecart's bottom) sits above the track point. Tuned in the game (S5).
-pub const SEAT_LIFT: f64 = 0.1;
-/// A rider's position is this far above their seat's position (spike R7).
-pub const RIDER_LIFT: f64 = 0.71875;
+/// How far a seat (a minecart's bottom) is sent above the track point. Tuned in the game (S5).
+/// First try 0.1 left the rider's head inside the car shell (owner's test, 2026-10-31); a rider
+/// hangs 1.2125 blocks below the seat, so 1.5 puts their feet just above the car's floor.
+pub const SEAT_LIFT: f64 = 1.5;
+/// A rider's position relative to their seat's position: NEGATIVE, they hang below it.
+/// Measured in the game by the owner on 2026-10-31: seat y 80.3461, rider y 79.1336, same x and z
+/// (difference -1.2125). Horizon's own minecart offset is -0.4125; the rest (about -0.8) is
+/// probably the cart falling at its top speed between our moves, since we reset its position
+/// every tick but not its speed. Mobs (spike R7) were +0.71875.
+pub const RIDER_LIFT: f64 = -1.2125;
 
 /// The most a car's straight glide may stray from the track, in blocks (D44).
 pub const MAX_GLIDE_SAG: f64 = 0.05;
@@ -1239,9 +1245,9 @@ mod tests {
     }
 
     #[test]
-    fn the_riders_point_is_a_bit_above_the_seat() {
+    fn the_riders_point_hangs_below_the_seat() {
         let p = rider_point(DVec3::new(1.0, 2.0, 3.0));
-        assert_eq!(p, DVec3::new(1.0, 2.71875, 3.0));
+        assert!(p.distance(DVec3::new(1.0, 0.7875, 3.0)) < 1e-9);
     }
 }
 }
