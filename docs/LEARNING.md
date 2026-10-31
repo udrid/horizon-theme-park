@@ -380,3 +380,15 @@ The line of text above your hotbar in Minecraft. We use it for your speed in km/
 ## Clamp
 Forcing a number to stay between a smallest and a biggest value. `x.clamp(0.0, 1.0)` turns -3 into 0 and 7 into 1. We use it to keep a blend between 0 and 100 percent.
 
+
+## Track wand
+A special item that turns clicks into track points. Like a magic pen: wherever you click, it marks a dot, and the track is drawn through the dots.
+
+## Session (wand session)
+Everything the mod remembers about what you're building right now: your points, the wand's mode, and when you last clicked. It's like a draft you haven't saved yet; `/coaster create` saves it.
+
+## Scaffolding
+Temporary blocks you place only to stand on or click on, then remove. Builders use it to reach high places.
+
+## Leftover (stale) entity
+An entity the mod meant to remove, but that sat in an unloaded part of the world when it tried. It comes back when that area loads again. A session tag lets the mod recognise and remove it.
