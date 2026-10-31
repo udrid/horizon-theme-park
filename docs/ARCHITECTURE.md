@@ -351,9 +351,15 @@ scripted `players()`. Runtime tests assert on that list: order, count, and the e
 - **Budget [D19]:** count the displays within 160 blocks of each player. The limit is set by the spike
   (first guess 2,000–3,000). Past it, the mod warns in chat and won't unpark more rides near that player.
 - **Free view, fling-off dismount [D22]:** the rider's view is never turned by the car. A rider who
-  gets off mid-ride stays where they are and keeps the seat's velocity (`v · forward` of their car,
-  in blocks/s → blocks/tick for the game), then normal Minecraft gravity takes over. Done through
-  `Host::launch_player` (risk R9). In the station, getting off is a normal dismount.
+  gets off mid-ride stays where they are and keeps their seat's **true velocity**:
+  `seat_velocity = v · (seat_pos(s + 0.05) − seat_pos(s − 0.05)) / 0.1`, where `seat_pos(s)` is
+  the car frame at `s` plus the seat offset. With no track pushing on them any more, they carry
+  straight on while the track bends away: outward on a corner, up and over on a fast crest. Normal
+  Minecraft gravity takes over; no extra kick. Sent through `Host::launch_player` in blocks/s
+  (converted to blocks/tick for the game) (risk R9). In the station, getting off is a normal dismount.
+  Two things the spike must measure: Minecraft slows a flying player with its own air drag (about 9%
+  of sideways speed per tick), so throws are shorter than in real life; and the game caps a sent
+  velocity at about 3.9 blocks/tick (78 blocks/s).
 
 ## 7. Saving [D20]
 
