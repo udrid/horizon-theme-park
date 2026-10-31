@@ -1319,8 +1319,10 @@ pub const RIDER_ON_DISTANCE: f64 = 1.0;
 /// A rider is "off" when nobody is within this distance of the rider point (D49, spike R7).
 pub const RIDER_OFF_DISTANCE: f64 = 2.0;
 
-/// The demo oval's middle is this far ahead of the player (3 blocks of space + half its length).
-const DEMO_AHEAD: f64 = 3.0 + demo::STRAIGHT / 2.0 + demo::RADIUS;
+/// The demo oval's middle is this far east of the player (3 blocks of space + half its length).
+const DEMO_EAST: f64 = 3.0 + demo::STRAIGHT / 2.0 + demo::RADIUS;
+/// The oval's long side runs east-west: Minecraft's yaw -90 looks towards +X (D52).
+const DEMO_YAW: f64 = -90.0;
 /// The rails float this high above the player's feet (D47).
 const DEMO_HEIGHT: f64 = 3.0;
 /// Seats per car in the demo (D49).
@@ -1331,8 +1333,6 @@ const SEATS: usize = 2;
 pub struct Caller {
     pub uuid: u128,
     pub pos: DVec3,
-    /// Minecraft's yaw in degrees (0 looks towards +Z).
-    pub yaw: f64,
 }
 
 /// A job waiting for the next tick (commands can't run inside the command hook).
@@ -1409,7 +1409,7 @@ impl Runtime {
         let answer = match words.get(1).copied() {
             Some("demo") if words.len() == 2 => {
                 self.orders.push_back(Order::Demo(caller));
-                "Building the demo coaster in front of you."
+                "Building the demo coaster to your east."
             }
             Some("ride") if words.len() == 2 => {
                 if self.demo.is_some() {
@@ -1473,10 +1473,9 @@ impl Runtime {
         host.run(&commands::kill_ride(commands::DEMO));
         self.build_queue.clear();
 
-        let yaw = caller.yaw.to_radians();
-        let ahead = DVec3::new(-yaw.sin(), 0.0, yaw.cos()) * DEMO_AHEAD;
-        let center = caller.pos + ahead + DVec3::new(0.0, DEMO_HEIGHT, 0.0);
-        let table = Table::new(&Track::closed(&demo_nodes(center, caller.yaw)));
+        // East of the player (+X), so the mod never has to read which way they look (D52).
+        let center = caller.pos + DVec3::new(DEMO_EAST, DEMO_HEIGHT, 0.0);
+        let table = Table::new(&Track::closed(&demo_nodes(center, DEMO_YAW)));
         let k = render::teleport_ticks(&table, demo::SPEED);
 
         // Rails, then the car, then the seats.
@@ -1635,7 +1634,6 @@ mod tests {
         Caller {
             uuid: 1,
             pos: DVec3::new(0.0, 70.0, 0.0),
-            yaw: 0.0,
         }
     }
 
@@ -1698,7 +1696,7 @@ mod tests {
         let answer = rt.command("coaster demo", caller());
         assert_eq!(
             answer.as_deref(),
-            Some("Building the demo coaster in front of you.")
+            Some("Building the demo coaster to your east.")
         );
         assert!(
             host.commands.is_empty(),
@@ -1730,13 +1728,19 @@ mod tests {
     }
 
     #[test]
-    fn the_rails_are_placed_in_front_of_the_player_and_above_their_feet() {
+    fn the_rails_are_placed_to_the_east_of_the_player_and_above_their_feet() {
         let (rt, _) = built();
         let table = &rt.demo.as_ref().unwrap().table;
-        // Centre = 14.5 blocks ahead (+z for yaw 0) and 3 blocks up.
-        let start = table.position(0.0);
-        assert!((start.y - 73.0).abs() < 1e-9);
-        assert!(start.z > 3.0 && start.z < 26.0);
+        // The player stands at (0, 70, 0). The oval spans x from 3 to 26 (3 blocks of space, then
+        // 23 blocks long), is 12 wide in z, and floats 3 blocks up.
+        let mut s = 0.0;
+        while s < table.length() {
+            let p = table.position(s);
+            assert!((p.y - 73.0).abs() < 1e-9);
+            assert!(p.x > 2.9 && p.x < 26.1, "x {}", p.x);
+            assert!(p.z.abs() < 6.1, "z {}", p.z);
+            s += 0.5;
+        }
     }
 
     #[test]

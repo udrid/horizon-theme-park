@@ -107,17 +107,11 @@ pub(super) fn command(
     line: &str,
     ran: &mut bool,
 ) {
-    // Which way the player looks decides where the demo appears. The player's state is swapped
-    // in during this hook, so `game.player` is them.
-    let yaw = game
-        .player
-        .as_ref()
-        .map(|p| f64::from(p.yaw))
-        .unwrap_or(0.0);
+    // Who typed it and where they stand. (The demo is built to their east, so we never need
+    // to read which way they look: that would be a private Horizon field, D52.)
     let caller = Caller {
         uuid: player.uuid,
         pos: DVec3::new(player.position[0], player.position[1], player.position[2]),
-        yaw,
     };
     if let Some(answer) = runtime().command(line, caller) {
         *ran = true;
