@@ -300,7 +300,8 @@ mod tests {
         assert!(st.min_vertical >= -0.5, "airtime {} g", st.min_vertical);
         // Flat turns push sideways at most 1 g (no banking until M5).
         assert!(st.max_lateral <= 1.0, "sideways {} g", st.max_lateral);
-        // Vertical g changes by at most 3 g in any second.
+        // Vertical g changes by at most 3 g over any 1-second window (D58, ruled by the planner;
+        // over a quarter second the ride reaches about 4.2 g/s, which park-sim also prints).
         assert!(
             st.max_vertical_rate <= 3.0,
             "g changes {} g/s",

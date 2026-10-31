@@ -1,6 +1,11 @@
 //! Frames: at every point of the track, three arrows that say which way is forward, up and
 //! right. A car's rotation comes from them.
 //!
+//! Two kinds of frame exist. These rotation-minimising frames suit loops and inversions, but on a
+//! track that climbs while turning they slowly roll the car sideways. Unbanked track (M2) uses
+//! `Table::new_level` instead, where `right` always stays horizontal. M5 must choose between the two,
+//! or blend them, when banking arrives.
+//!
 //! The trick is "rotation-minimising" frames: walk along the track and turn the up arrow only as
 //! much as the track itself turns, never twisting it for no reason (like carrying a flag
 //! along a path without spinning it). On a closed loop the arrow may come back slightly

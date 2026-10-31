@@ -315,7 +315,8 @@ mod tests {
         assert!(st.min_vertical >= -0.5, "airtime {} g", st.min_vertical);
         // Flat turns push sideways at most 1 g (no banking until M5).
         assert!(st.max_lateral <= 1.0, "sideways {} g", st.max_lateral);
-        // Vertical g changes by at most 3 g in any second.
+        // Vertical g changes by at most 3 g over any 1-second window (D58, ruled by the planner;
+        // over a quarter second the ride reaches about 4.2 g/s, which park-sim also prints).
         assert!(
             st.max_vertical_rate <= 3.0,
             "g changes {} g/s",
@@ -681,6 +682,11 @@ mod tests {
 pub mod frame {
 // Frames: at every point of the track, three arrows that say which way is forward, up and
 // right. A car's rotation comes from them.
+//
+// Two kinds of frame exist. These rotation-minimising frames suit loops and inversions, but on a
+// track that climbs while turning they slowly roll the car sideways. Unbanked track (M2) uses
+// `Table::new_level` instead, where `right` always stays horizontal. M5 must choose between the two,
+// or blend them, when banking arrives.
 //
 // The trick is "rotation-minimising" frames: walk along the track and turn the up arrow only as
 // much as the track itself turns, never twisting it for no reason (like carrying a flag
