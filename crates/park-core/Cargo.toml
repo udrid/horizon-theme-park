@@ -6,3 +6,5 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Same exact version as Horizon (D9). No extra features (rule 10).
+glam = "=0.30.10"
