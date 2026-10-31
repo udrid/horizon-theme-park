@@ -97,3 +97,7 @@ CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on every push. It's t
 A milestone runs: Opus plans → the free reader answers big reading questions → the owner approves
 choices → Sonnet builds with tests → second opinion on the diff → Opus review if physics or
 architecture changed → the owner builds, plays and records.
+
+**Sessions talk to each other directly.** Send status, questions and review requests with `SendMessage` to the
+other session's id (the planner that started you, or the builder it started). Never write a paste-ready note for
+the owner to carry between sessions. Design choices still go to the owner, asked in your own session.

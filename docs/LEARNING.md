@@ -313,3 +313,6 @@ If code panics while holding a `Mutex` (the talking stick), Rust marks the lock 
 
 ## Stand-in (stub) and dry run
 A stand-in is a fake part shaped like the real one, for example a pretend `Game` that records chat lines. A dry run uses stand-ins to try our real mod files in seconds, like a rehearsal with cardboard props before the real play. We did one for M0 outside the repo, before asking you to start the 6-minute game build.
+
+## `$crate`
+A special word used inside a home-made macro, meaning "the project this macro was written in". Inside the game, that project is Horizon, so `$crate::` needs the same address change as `crate::` (to `$crate::game::htp_park::`). Like a return address printed on an envelope: if you move house, it has to change too.
