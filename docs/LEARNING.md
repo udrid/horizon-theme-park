@@ -401,3 +401,18 @@ A counter on each group of rail pieces. Every time the group is drawn again, the
 
 ## Realism report
 The chat summary after `/coaster create`: top speed, g-forces, drops and lift height, with anything past the realism limits (D58) shown in red. It comes from one pretend lap run on paper (a "dry lap") before anyone rides.
+
+## Coding agent
+An AI program that can read files, change code and run commands such as `cargo test` by itself, step by step. Claude Code is one; OpenCode is a free, open-source one.
+
+## Local model
+An AI that runs on your own computer's graphics card instead of on a company's servers. Free and private, but usually weaker and slower than the big cloud models.
+
+## Model routing
+Giving each job to the cheapest AI that can do it well: a big model plans and reviews, a cheap one writes code, the tests check it. Like a head chef who plans the menu while the line cooks cook.
+
+## Fork and pull request
+A fork is someone's own copy of your repo on GitHub. A pull request is them asking "please bring my changes into your copy"; nothing changes until you click Merge.
+
+## Ruleset (GitHub)
+A list of rules GitHub enforces on a branch, such as "changes need a pull request and green tests". Like a lock on the front door that only you have the key to.
