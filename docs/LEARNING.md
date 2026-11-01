@@ -443,3 +443,10 @@ A see-through preview of the next piece of track, showing where it will go befor
 
 ## Auto-complete (finish helper)
 A tool that draws the last part of the track for you, smoothly back into the station. Ours shows its path as a ghost first and tells you plainly when it can't do it.
+
+## M3b terms
+
+- **HUD** (heads-up display): text and boxes the game draws over the world every frame, like the hotbar. Our builder panel is a HUD, so you can still walk around while it shows.
+- **Client and server**: the *client* is the part that draws the screen and hears your keys. The *server* is the part that runs the world. In single-player both run inside one program.
+- **Static (shared state)**: one value that lives for the whole program, like a noticeboard on a wall. Client code writes a note on it, server code reads it. T0 checks that this really works in single-player.
+- **Claiming the wheel**: when our code says "I'll take this scroll", the hotbar does not also scroll.

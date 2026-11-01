@@ -113,6 +113,9 @@ pub(super) fn tick(game: &mut Game<'_>, phase: ServerTickPhase) {
         return;
     }
     runtime().tick(&mut GameHost(game));
+    // T0 (M3b): log what the client wrote into the shared static.
+    let mut ticks = T0_TICKS.lock().unwrap_or_else(|p| p.into_inner());
+    t0_server_log(&mut ticks);
 }
 
 /// Called when the game asks which commands mods add (see on_commands.rs).
@@ -188,3 +191,97 @@ pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut boo
         runtime().wand_click(player.uuid, WandClick::Air);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// T0 (M3b): a throw-away proof that the CLIENT hooks work and that the client and the server
+// share one static. Press B: a box appears on screen. Scroll the wheel: the number changes.
+// The server tick logs the same number. If that log line shows your number, the client and the
+// server really share memory, and the on-screen builder can be built. This block is removed or
+// replaced when T6 (the real builder glue) lands.
+// ---------------------------------------------------------------------------------------------
+
+/// What the client hooks write and the server tick reads. A tiny "noticeboard".
+struct T0State {
+    open: bool,
+    value: i32,
+    last_key: String,
+}
+
+static T0: Mutex<T0State> = Mutex::new(T0State {
+    open: false,
+    value: 0,
+    last_key: String::new(),
+});
+
+fn t0() -> MutexGuard<'static, T0State> {
+    T0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Client: every frame. Draws the test box while build mode is "open" (see on_hud.rs).
+pub(super) fn hud(
+    game: &mut Game<'_>,
+    batch: &mut horizon_client::hud::HudBatch,
+    corners: &mut horizon_client::extras_hud::Corners,
+) {
+    let (open, value, key) = {
+        let s = t0();
+        (s.open, s.value, s.last_key.clone())
+    };
+    if !open {
+        return;
+    }
+    let line1 = "HTP builder test (T0)";
+    let line2 = format!("wheel value: {value}");
+    let line3 = format!("last key: {key}");
+    let width = [line1.len(), line2.len(), line3.len()]
+        .iter()
+        .map(|n| *n as f32 * 6.0)
+        .fold(0.0, f32::max)
+        + 8.0;
+    let (x, y) = corners.place(horizon_client::extras::Corner::TopRight, width, 38.0);
+    game.native_fill(batch, [x, y, width, 38.0], 0x78000000);
+    game.native_text(batch, line1, [x + 4.0, y + 3.0], 0xFFFFFF, true);
+    game.native_text(batch, &line2, [x + 4.0, y + 14.0], 0xFFFF55, true);
+    game.native_text(batch, &line3, [x + 4.0, y + 25.0], 0xAAAAAA, true);
+}
+
+/// Client: a key or mouse button went down or up (see on_key.rs).
+pub(super) fn key(game: &mut Game<'_>, key: &str, pressed: bool) {
+    if !pressed || !game.native_playing() {
+        return;
+    }
+    let mut s = t0();
+    if key == "key.keyboard.b" {
+        s.open = !s.open;
+        log::info!("HTP T0: key B, build mode open = {}", s.open);
+    } else if s.open {
+        // Remember every key while open, so the names of R, Z, Y, H and the mouse buttons show.
+        s.last_key = key.to_string();
+        log::info!("HTP T0: key name seen = {key}");
+    }
+}
+
+/// Client: the mouse wheel. While the box is open we take the wheel so the hotbar stays put.
+pub(super) fn wheel(steps: f32, claimed: &mut bool) {
+    let mut s = t0();
+    if !s.open {
+        return;
+    }
+    *claimed = true;
+    s.value += if steps > 0.0 { 1 } else { -1 };
+}
+
+/// Server: called from `tick` about once a second. If the number logged here changes when you
+/// scroll, the client and the server share the static.
+fn t0_server_log(ticks: &mut u32) {
+    *ticks += 1;
+    if *ticks % 20 != 0 {
+        return;
+    }
+    let s = t0();
+    if s.open {
+        log::info!("HTP T0 server tick sees: open = {}, value = {}", s.open, s.value);
+    }
+}
+
+static T0_TICKS: Mutex<u32> = Mutex::new(0);
