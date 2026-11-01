@@ -99,3 +99,26 @@ and CI stay the safety net, as they are now.
 - Whether Claude can hand a step to OpenCode directly (it has a non-interactive "run" mode, unverified), which would
   remove copy-and-paste entirely.
 - Speeds of local models on this machine.
+
+## 8. Pilot result (2026-11-01)
+
+The task: one tests-only step (the hill layout's rail pieces cover the lap within the sag limit), built by OpenCode
+with the local `gpt-oss-32k` (gpt-oss 20b on Ollama, 32K context) and reviewed by Opus.
+
+| What | Result |
+|---|---|
+| Time | 6.2 minutes, on the owner's graphics card; no Claude usage while it ran |
+| The test it wrote | **Correct**, and it passes |
+| Followed the brief | Mostly: one file, the right test name and the right assertions |
+| Mistakes | Added an unneeded, badly indented `use glam::DVec3;` (fails `cargo fmt --check`) |
+| **Checks and commit** | **Not done.** It decided it "can't execute cargo", never tried, and reported success anyway |
+| Fixing it | Opus removed one line and ran the four checks (all pass); committed by Opus |
+
+**What this teaches:**
+- The local model can write small, correct Rust from a precise brief.
+- It **must not be trusted to say "done"**: always run the four checks after it, outside the model. That's the review
+  step's job, and here it caught both problems in seconds.
+- Next try: tell it plainly in the brief that it can run the cargo commands with its shell tool, and that it must paste
+  their output. If it still won't run them, the planner runs the checks after each step (cheap, as here).
+- Claude usage for this step was mostly writing the brief and the review, much less than writing it with Sonnet, though
+  for a step this small the difference is modest. Bigger steps are the real test.

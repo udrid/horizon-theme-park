@@ -357,6 +357,26 @@ mod tests {
     }
 
     #[test]
+    // Checks hill layout rail pieces cover the lap and respect sag limits
+    fn hill_layout_pieces_cover_the_lap_and_respect_sag() {
+        let course = crate::coaster::demo::demo_course(DVec3::new(0.0, 70.0, 0.0));
+        let pieces = rail_pieces(&course.table);
+        assert_eq!(pieces[0].s0, 0.0);
+        assert!((pieces.last().unwrap().s1 - course.table.length()).abs() < 1e-9);
+        for pair in pieces.windows(2) {
+            assert_eq!(pair[0].s1, pair[1].s0);
+        }
+        for p in &pieces {
+            assert!(p.s1 > p.s0);
+        }
+        for p in &pieces {
+            if p.s1 - p.s0 > 1.0 {
+                assert!(sag(&course.table, p.s0, p.s1) <= MAX_SAG + 1e-9);
+            }
+        }
+    }
+
+    #[test]
     fn the_station_platform_has_exact_corners_beside_the_demo_station() {
         // Station track: y 75, z -40, running west from x 100; the front car stops at x 90.
         let course = crate::coaster::demo::demo_course(DVec3::new(100.0, 75.0, -40.0));
