@@ -163,6 +163,21 @@ pub(super) fn use_item_on(
     }
 }
 
+/// Called when a player breaks a block (see on_destroy_block.rs). With the track wand in hand the
+/// break is cancelled and counts as "undo the last node" (D67); anything else is left alone.
+pub(super) fn destroy_block(game: &mut Game<'_>, canceled: &mut bool) {
+    let holds_wand = game
+        .native_held()
+        .is_some_and(|(item, _, _)| item == WAND_ITEM);
+    if !holds_wand {
+        return;
+    }
+    *canceled = true;
+    if let Some(player) = game.native_acting_player() {
+        runtime().wand_undo(player.uuid);
+    }
+}
+
 /// Called when a player right-clicks the AIR with an item (see on_use_item.rs). Same rules as above.
 pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut bool) {
     if stack.item.to_string() != WAND_ITEM {

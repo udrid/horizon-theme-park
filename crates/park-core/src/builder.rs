@@ -14,6 +14,7 @@ use crate::coaster::elements::{Course, Element, Placed};
 use crate::coaster::physics::{CAR_SPACING, MAX_CARS, Physics, Train};
 use crate::coaster::spline::Track;
 use crate::coaster::table::Table;
+use crate::report::{self, Blocker};
 use crate::save::{Kind, NodeFile, RideFile};
 use glam::DVec3;
 
@@ -255,7 +256,29 @@ impl Builder {
             },
             _ => RideFile::new(name, session.nodes.clone()),
         };
-        course_from(&ride)?;
+        let course = course_from(&ride)?;
+        // D68: a track whose train can't stop in the station, or stalls, does not open.
+        let found = report::blocker(
+            &course,
+            cars_of(&ride),
+            spacing_of(&ride),
+            &physics_of(&ride),
+        );
+        match found {
+            Some(Blocker::Overshoot { s }) => {
+                let node = nearest_node(&ride, &course, s);
+                return Err(format!(
+                    "The train comes into the station too fast and would roll past its stop point (the approach is near node {node}). Add brake nodes before the station: right-click the air until the wand says \"brake\" and place nodes there, or lower the hill before it."
+                ));
+            }
+            Some(Blocker::Stall { s }) => {
+                let node = nearest_node(&ride, &course, s);
+                return Err(format!(
+                    "The train runs out of speed and stalls near node {node}. Lower the hill near node {node}, or put lift nodes before it."
+                ));
+            }
+            None => {}
+        }
         Ok(ride)
     }
 }
@@ -308,6 +331,24 @@ fn node_distances(track: &Track, table: &Table) -> Vec<f64> {
         0.0
     };
     sums.iter().map(|s| s * scale).collect()
+}
+
+/// The number (1 is the first) of the node nearest to the point `s` along the lap.
+pub fn nearest_node(ride: &RideFile, course: &Course, s: f64) -> usize {
+    let points: Vec<DVec3> = ride.nodes.iter().map(|node| vec(node.pos)).collect();
+    let track = Track::closed(&points);
+    let node_s = node_distances(&track, &course.table);
+    let length = course.table.length();
+    let s = course.table.wrap(s);
+    (0..ride.nodes.len())
+        .min_by(|&a, &b| {
+            let gap = |i: usize| {
+                let d = (node_s[i] - s).abs();
+                d.min(length - d)
+            };
+            gap(a).total_cmp(&gap(b))
+        })
+        .map_or(1, |i| i + 1)
 }
 
 /// The physics numbers saved with a ride.
@@ -471,11 +512,11 @@ pub(crate) mod tests {
         vec![
             node([0.0, 70.0, 0.0], Kind::Station),
             node([10.0, 70.0, 0.0], Kind::Station),
-            node([20.0, 70.0, 0.0], Kind::Track),
+            node([20.0, 70.0, 0.0], Kind::Lift),
             node([30.0, 72.0, 5.0], Kind::Lift),
-            node([35.0, 74.0, 15.0], Kind::Track),
-            node([25.0, 74.0, 25.0], Kind::Track),
-            node([10.0, 72.0, 25.0], Kind::Track),
+            node([35.0, 74.0, 15.0], Kind::Lift),
+            node([25.0, 74.0, 25.0], Kind::Lift),
+            node([10.0, 72.0, 25.0], Kind::Brake),
             node([0.0, 70.0, 15.0], Kind::Track),
         ]
     }
@@ -648,6 +689,58 @@ pub(crate) mod tests {
         // A different name starts from defaults.
         let other = b.create(1, "other", |_| false).unwrap();
         assert_eq!(other.trains[0].cars, 3);
+    }
+
+    // D68.
+    #[test]
+    fn the_little_loop_may_open_but_a_hill_with_no_lift_is_refused_with_the_node() {
+        let mut b = Builder::new();
+        let load = |b: &mut Builder, nodes: Vec<NodeFile>| {
+            b.click_block(1, [0, 0, 0], 0);
+            b.sessions_mut()[0].nodes = nodes;
+        };
+        load(&mut b, loop_nodes());
+        assert!(b.create(1, "ok", |_| false).is_ok());
+        // Take the lift away: the 4-block hill is too high for the station's push.
+        let mut flat = loop_nodes();
+        for node in &mut flat[3..=5] {
+            node.kind = Kind::Track;
+        }
+        load(&mut b, flat);
+        let error = b.create(1, "nope", |_| false).unwrap_err();
+        assert!(error.contains("stalls near node"), "{error}");
+        assert!(error.contains("Lower the hill near node"), "{error}");
+    }
+
+    #[test]
+    fn a_fast_station_approach_is_refused_and_names_the_brake_fix() {
+        // A tall drop straight into the station, with a lift to get up and no brakes.
+        let node = |pos: [f64; 3], kind| NodeFile {
+            pos,
+            roll: 0.0,
+            kind,
+        };
+        let nodes = vec![
+            node([0.0, 70.0, 0.0], Kind::Station),
+            node([10.0, 70.0, 0.0], Kind::Station),
+            node([22.0, 70.0, 0.0], Kind::Lift),
+            node([36.0, 80.0, 6.0], Kind::Lift),
+            node([48.0, 92.0, 16.0], Kind::Lift),
+            node([44.0, 96.0, 30.0], Kind::Lift),
+            node([30.0, 88.0, 38.0], Kind::Track),
+            node([18.0, 76.0, 34.0], Kind::Track),
+            node([6.0, 71.0, 24.0], Kind::Track),
+            node([-8.0, 70.0, 12.0], Kind::Track),
+        ];
+        let mut b = Builder::new();
+        b.click_block(1, [0, 0, 0], 0);
+        b.sessions_mut()[0].nodes = nodes;
+        let error = b.create(1, "fast", |_| false).unwrap_err();
+        assert!(
+            error.contains("too fast") && error.contains("brake nodes"),
+            "{error}"
+        );
+        assert!(error.contains("near node"), "{error}");
     }
 
     #[test]

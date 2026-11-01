@@ -94,3 +94,14 @@ bindings = [
   { name = "stack", ty = "&horizon_client::items::ItemStack", value = "stack" },
   { name = "claimed", ty = "&mut bool", value = "&mut *claimed" },
 ]
+
+# A left-click that breaks a block, with the track wand in hand (API 14): cancelled, and it undoes the last node.
+[[injection]]
+id = "destroy_block"
+kind = "HEAD"
+target = "horizon_client::game::native_hooks::Game<'_>::native_destroy_block"
+helper = "on_destroy_block.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "canceled", ty = "&mut bool", value = "&mut *canceled" },
+]

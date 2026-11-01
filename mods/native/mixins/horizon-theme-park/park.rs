@@ -26,6 +26,7 @@ use crate::game::htp_park::coaster::elements::{Course, Element, Placed};
 use crate::game::htp_park::coaster::physics::{CAR_SPACING, MAX_CARS, Physics, Train};
 use crate::game::htp_park::coaster::spline::Track;
 use crate::game::htp_park::coaster::table::Table;
+use crate::game::htp_park::report::{self, Blocker};
 use crate::game::htp_park::save::{Kind, NodeFile, RideFile};
 use glam::DVec3;
 
@@ -267,7 +268,29 @@ impl Builder {
             },
             _ => RideFile::new(name, session.nodes.clone()),
         };
-        course_from(&ride)?;
+        let course = course_from(&ride)?;
+        // D68: a track whose train can't stop in the station, or stalls, does not open.
+        let found = report::blocker(
+            &course,
+            cars_of(&ride),
+            spacing_of(&ride),
+            &physics_of(&ride),
+        );
+        match found {
+            Some(Blocker::Overshoot { s }) => {
+                let node = nearest_node(&ride, &course, s);
+                return Err(format!(
+                    "The train comes into the station too fast and would roll past its stop point (the approach is near node {node}). Add brake nodes before the station: right-click the air until the wand says \"brake\" and place nodes there, or lower the hill before it."
+                ));
+            }
+            Some(Blocker::Stall { s }) => {
+                let node = nearest_node(&ride, &course, s);
+                return Err(format!(
+                    "The train runs out of speed and stalls near node {node}. Lower the hill near node {node}, or put lift nodes before it."
+                ));
+            }
+            None => {}
+        }
         Ok(ride)
     }
 }
@@ -320,6 +343,24 @@ fn node_distances(track: &Track, table: &Table) -> Vec<f64> {
         0.0
     };
     sums.iter().map(|s| s * scale).collect()
+}
+
+/// The number (1 is the first) of the node nearest to the point `s` along the lap.
+pub fn nearest_node(ride: &RideFile, course: &Course, s: f64) -> usize {
+    let points: Vec<DVec3> = ride.nodes.iter().map(|node| vec(node.pos)).collect();
+    let track = Track::closed(&points);
+    let node_s = node_distances(&track, &course.table);
+    let length = course.table.length();
+    let s = course.table.wrap(s);
+    (0..ride.nodes.len())
+        .min_by(|&a, &b| {
+            let gap = |i: usize| {
+                let d = (node_s[i] - s).abs();
+                d.min(length - d)
+            };
+            gap(a).total_cmp(&gap(b))
+        })
+        .map_or(1, |i| i + 1)
 }
 
 /// The physics numbers saved with a ride.
@@ -483,11 +524,11 @@ pub(crate) mod tests {
         vec![
             node([0.0, 70.0, 0.0], Kind::Station),
             node([10.0, 70.0, 0.0], Kind::Station),
-            node([20.0, 70.0, 0.0], Kind::Track),
+            node([20.0, 70.0, 0.0], Kind::Lift),
             node([30.0, 72.0, 5.0], Kind::Lift),
-            node([35.0, 74.0, 15.0], Kind::Track),
-            node([25.0, 74.0, 25.0], Kind::Track),
-            node([10.0, 72.0, 25.0], Kind::Track),
+            node([35.0, 74.0, 15.0], Kind::Lift),
+            node([25.0, 74.0, 25.0], Kind::Lift),
+            node([10.0, 72.0, 25.0], Kind::Brake),
             node([0.0, 70.0, 15.0], Kind::Track),
         ]
     }
@@ -660,6 +701,58 @@ pub(crate) mod tests {
         // A different name starts from defaults.
         let other = b.create(1, "other", |_| false).unwrap();
         assert_eq!(other.trains[0].cars, 3);
+    }
+
+    // D68.
+    #[test]
+    fn the_little_loop_may_open_but_a_hill_with_no_lift_is_refused_with_the_node() {
+        let mut b = Builder::new();
+        let load = |b: &mut Builder, nodes: Vec<NodeFile>| {
+            b.click_block(1, [0, 0, 0], 0);
+            b.sessions_mut()[0].nodes = nodes;
+        };
+        load(&mut b, loop_nodes());
+        assert!(b.create(1, "ok", |_| false).is_ok());
+        // Take the lift away: the 4-block hill is too high for the station's push.
+        let mut flat = loop_nodes();
+        for node in &mut flat[3..=5] {
+            node.kind = Kind::Track;
+        }
+        load(&mut b, flat);
+        let error = b.create(1, "nope", |_| false).unwrap_err();
+        assert!(error.contains("stalls near node"), "{error}");
+        assert!(error.contains("Lower the hill near node"), "{error}");
+    }
+
+    #[test]
+    fn a_fast_station_approach_is_refused_and_names_the_brake_fix() {
+        // A tall drop straight into the station, with a lift to get up and no brakes.
+        let node = |pos: [f64; 3], kind| NodeFile {
+            pos,
+            roll: 0.0,
+            kind,
+        };
+        let nodes = vec![
+            node([0.0, 70.0, 0.0], Kind::Station),
+            node([10.0, 70.0, 0.0], Kind::Station),
+            node([22.0, 70.0, 0.0], Kind::Lift),
+            node([36.0, 80.0, 6.0], Kind::Lift),
+            node([48.0, 92.0, 16.0], Kind::Lift),
+            node([44.0, 96.0, 30.0], Kind::Lift),
+            node([30.0, 88.0, 38.0], Kind::Track),
+            node([18.0, 76.0, 34.0], Kind::Track),
+            node([6.0, 71.0, 24.0], Kind::Track),
+            node([-8.0, 70.0, 12.0], Kind::Track),
+        ];
+        let mut b = Builder::new();
+        b.click_block(1, [0, 0, 0], 0);
+        b.sessions_mut()[0].nodes = nodes;
+        let error = b.create(1, "fast", |_| false).unwrap_err();
+        assert!(
+            error.contains("too fast") && error.contains("brake nodes"),
+            "{error}"
+        );
+        assert!(error.contains("near node"), "{error}");
     }
 
     #[test]
@@ -3990,7 +4083,7 @@ pub mod report {
 // a limit becomes an `Issue` that says what, how far, and where on the track (block numbers),
 // and the ride still opens: it is the builder's own coaster.
 
-use crate::game::htp_park::coaster::elements::{Course, Element};
+use crate::game::htp_park::coaster::elements::{BRAKE_DECEL, Course, Element};
 use crate::game::htp_park::coaster::forces::Felt;
 use crate::game::htp_park::coaster::physics::{Physics, Train};
 use crate::game::htp_park::coaster::sim::{self, Sample};
@@ -4065,6 +4158,79 @@ fn find_extreme(
         }
     }
     course.table.position(best.1)
+}
+
+/// Why a track must not open (D68).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Blocker {
+    /// The train comes into the station too fast and rolls past the stop point. `s` is the
+    /// start of the station.
+    Overshoot { s: f64 },
+    /// The train runs out of speed outside the station and the lift. `s` is where.
+    Stall { s: f64 },
+}
+
+/// A stall: the train crawls slower than this...
+const STALL_SPEED: f64 = 0.1;
+/// ...for this many ticks in a row (2 seconds).
+const STALL_TICKS: usize = 40;
+
+/// Run one dry lap and say whether the train cannot stop in the station (it overshoots the stop
+/// point) or stalls outside the station and the lift (D68). `None` means the track may open.
+pub fn blocker(course: &Course, cars: usize, spacing: f64, physics: &Physics) -> Option<Blocker> {
+    let (station, stop, _) = course.station()?;
+    let (s0, s1) = (station.s0, station.s1);
+    let train = Train {
+        spacing,
+        ..Train::held(cars, stop)
+    };
+    let samples = sim::run_lap(course, train, physics, MAX_LAP_SECONDS);
+    let in_station = |s: f64| s >= s0 && s < s1;
+    let on_lift = |s: f64| {
+        course
+            .placed
+            .iter()
+            .any(|p| matches!(p.element, Element::Lift { .. }) && s >= p.s0 && s < p.s1)
+    };
+    // The fastest the train may enter the station: braking at BRAKE_DECEL it must stop before the
+    // stop point. Faster than that and it would be stopped by force (or roll on past the stop).
+    let safe_entry = (2.0 * BRAKE_DECEL * (stop - s0)).sqrt() + 0.25;
+    let mut lapped = false;
+    let mut slow = 0;
+    for (k, sample) in samples.iter().enumerate() {
+        let s = course.table.wrap(sample.s);
+        if !in_station(s) {
+            lapped = true;
+        } else if lapped {
+            if sample.v > safe_entry {
+                return Some(Blocker::Overshoot { s: s0 });
+            }
+            lapped = false; // only the speed of entering counts
+        }
+        if k > 20 && !in_station(s) && !on_lift(s) && sample.v.abs() < STALL_SPEED {
+            slow += 1;
+            if slow >= STALL_TICKS {
+                return Some(Blocker::Stall { s });
+            }
+        } else {
+            slow = 0;
+        }
+    }
+    let completed = samples.last().is_some_and(|s| s.t < MAX_LAP_SECONDS - 0.1);
+    if completed {
+        return None;
+    }
+    // It never got back: find where it first crawled to a stop.
+    let stuck = samples
+        .iter()
+        .enumerate()
+        .find(|(k, s)| {
+            *k > 20 && s.v < STALL_SPEED && !in_station(s.s) && !on_lift(course.table.wrap(s.s))
+        })
+        .map_or(0.0, |(_, s)| s.s);
+    Some(Blocker::Stall {
+        s: course.table.wrap(stuck),
+    })
 }
 
 /// Run one dry lap of `course` with `cars` cars and compare it with D58's limits.
@@ -4324,6 +4490,40 @@ mod tests {
         assert!(lines.last().unwrap().contains("still opens"));
     }
 
+    // D68: the demo may open; a fast station approach and a hill too high are refused.
+    #[test]
+    fn the_demo_has_no_blocker() {
+        let (course, _) = report_for(&Shape::demo());
+        let spacing = crate::game::htp_park::coaster::physics::CAR_SPACING;
+        assert_eq!(blocker(&course, 3, spacing, &Physics::default()), None);
+    }
+
+    #[test]
+    fn without_the_brakes_the_train_overshoots_the_station() {
+        let (mut course, _) = report_for(&Shape::demo());
+        course
+            .placed
+            .retain(|p| !matches!(p.element, Element::Brake { .. }));
+        let spacing = crate::game::htp_park::coaster::physics::CAR_SPACING;
+        // Frictionless, so the train arrives fast enough to roll past the stop point.
+        let found = blocker(&course, 3, spacing, &Physics::frictionless());
+        let station_start = course.station().unwrap().0.s0;
+        assert_eq!(found, Some(Blocker::Overshoot { s: station_start }));
+    }
+
+    #[test]
+    fn without_the_lift_the_train_stalls_and_the_place_is_reported() {
+        let (mut course, _) = report_for(&Shape::demo());
+        course
+            .placed
+            .retain(|p| !matches!(p.element, Element::Lift { .. }));
+        let spacing = crate::game::htp_park::coaster::physics::CAR_SPACING;
+        match blocker(&course, 3, spacing, &Physics::default()) {
+            Some(Blocker::Stall { s }) => assert!(s > 0.0 && s < course.table.length()),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn a_train_that_cannot_climb_is_reported_as_stalling() {
         // Without a lift, the flat demo-like loop has nothing to push the train round.
@@ -4461,6 +4661,7 @@ enum Order {
     RemoveDemo,
     Give(Caller),
     Wand { uuid: u128, click: WandClick },
+    Undo { uuid: u128 },
     Create { uuid: u128, ride: RideFile },
     Delete { uuid: u128, id: String },
     SetCars { uuid: u128, id: String, cars: usize },
@@ -4919,6 +5120,11 @@ impl Runtime {
         self.orders.push_back(Order::Wand { uuid, click });
     }
 
+    /// The wand was left-clicked on a block (the hook cancels the break): take the last node away.
+    pub fn wand_undo(&mut self, uuid: u128) {
+        self.orders.push_back(Order::Undo { uuid });
+    }
+
     fn ride_index(&self, id: &str) -> Option<usize> {
         self.rides.iter().position(|r| r.id == id)
     }
@@ -4953,7 +5159,7 @@ impl Runtime {
             }
             (Some("wand"), 2) => {
                 self.orders.push_back(Order::Give(caller));
-                "Here is the track wand. Right-click a block to place a node. Right-click the air to switch between track, lift, brake and station. /coaster undo removes the last node. /coaster create <name> makes the ride.".to_string()
+                "Here is the track wand. Right-click a block to place a node. Right-click the air to switch between track, lift, brake and station. Left-click a block (or type /coaster undo) to remove the last node. /coaster create <name> makes the ride.".to_string()
             }
             (Some("undo"), 2) => match self.builder.undo(uuid, self.now) {
                 Some(n) => format!("Removed node {n}."),
@@ -5241,6 +5447,13 @@ impl Runtime {
                             let mode = self.builder.click_air(uuid, self.now);
                             format!("Wand mode: {}", builder::mode_name(mode))
                         }
+                    };
+                    show(host, players, uuid, &text);
+                }
+                Order::Undo { uuid } => {
+                    let text = match self.builder.undo(uuid, self.now) {
+                        Some(n) => format!("Removed node {n}"),
+                        None => "No nodes to remove".to_string(),
                     };
                     show(host, players, uuid, &text);
                 }

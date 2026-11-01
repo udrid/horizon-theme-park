@@ -4,7 +4,7 @@
 //! a limit becomes an `Issue` that says what, how far, and where on the track (block numbers),
 //! and the ride still opens: it is the builder's own coaster.
 
-use crate::coaster::elements::{Course, Element};
+use crate::coaster::elements::{BRAKE_DECEL, Course, Element};
 use crate::coaster::forces::Felt;
 use crate::coaster::physics::{Physics, Train};
 use crate::coaster::sim::{self, Sample};
@@ -79,6 +79,79 @@ fn find_extreme(
         }
     }
     course.table.position(best.1)
+}
+
+/// Why a track must not open (D68).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Blocker {
+    /// The train comes into the station too fast and rolls past the stop point. `s` is the
+    /// start of the station.
+    Overshoot { s: f64 },
+    /// The train runs out of speed outside the station and the lift. `s` is where.
+    Stall { s: f64 },
+}
+
+/// A stall: the train crawls slower than this...
+const STALL_SPEED: f64 = 0.1;
+/// ...for this many ticks in a row (2 seconds).
+const STALL_TICKS: usize = 40;
+
+/// Run one dry lap and say whether the train cannot stop in the station (it overshoots the stop
+/// point) or stalls outside the station and the lift (D68). `None` means the track may open.
+pub fn blocker(course: &Course, cars: usize, spacing: f64, physics: &Physics) -> Option<Blocker> {
+    let (station, stop, _) = course.station()?;
+    let (s0, s1) = (station.s0, station.s1);
+    let train = Train {
+        spacing,
+        ..Train::held(cars, stop)
+    };
+    let samples = sim::run_lap(course, train, physics, MAX_LAP_SECONDS);
+    let in_station = |s: f64| s >= s0 && s < s1;
+    let on_lift = |s: f64| {
+        course
+            .placed
+            .iter()
+            .any(|p| matches!(p.element, Element::Lift { .. }) && s >= p.s0 && s < p.s1)
+    };
+    // The fastest the train may enter the station: braking at BRAKE_DECEL it must stop before the
+    // stop point. Faster than that and it would be stopped by force (or roll on past the stop).
+    let safe_entry = (2.0 * BRAKE_DECEL * (stop - s0)).sqrt() + 0.25;
+    let mut lapped = false;
+    let mut slow = 0;
+    for (k, sample) in samples.iter().enumerate() {
+        let s = course.table.wrap(sample.s);
+        if !in_station(s) {
+            lapped = true;
+        } else if lapped {
+            if sample.v > safe_entry {
+                return Some(Blocker::Overshoot { s: s0 });
+            }
+            lapped = false; // only the speed of entering counts
+        }
+        if k > 20 && !in_station(s) && !on_lift(s) && sample.v.abs() < STALL_SPEED {
+            slow += 1;
+            if slow >= STALL_TICKS {
+                return Some(Blocker::Stall { s });
+            }
+        } else {
+            slow = 0;
+        }
+    }
+    let completed = samples.last().is_some_and(|s| s.t < MAX_LAP_SECONDS - 0.1);
+    if completed {
+        return None;
+    }
+    // It never got back: find where it first crawled to a stop.
+    let stuck = samples
+        .iter()
+        .enumerate()
+        .find(|(k, s)| {
+            *k > 20 && s.v < STALL_SPEED && !in_station(s.s) && !on_lift(course.table.wrap(s.s))
+        })
+        .map_or(0.0, |(_, s)| s.s);
+    Some(Blocker::Stall {
+        s: course.table.wrap(stuck),
+    })
 }
 
 /// Run one dry lap of `course` with `cars` cars and compare it with D58's limits.
@@ -336,6 +409,40 @@ mod tests {
                 .any(|l| l.starts_with("§c") && l.contains("sideways") && l.contains("near "))
         );
         assert!(lines.last().unwrap().contains("still opens"));
+    }
+
+    // D68: the demo may open; a fast station approach and a hill too high are refused.
+    #[test]
+    fn the_demo_has_no_blocker() {
+        let (course, _) = report_for(&Shape::demo());
+        let spacing = crate::coaster::physics::CAR_SPACING;
+        assert_eq!(blocker(&course, 3, spacing, &Physics::default()), None);
+    }
+
+    #[test]
+    fn without_the_brakes_the_train_overshoots_the_station() {
+        let (mut course, _) = report_for(&Shape::demo());
+        course
+            .placed
+            .retain(|p| !matches!(p.element, Element::Brake { .. }));
+        let spacing = crate::coaster::physics::CAR_SPACING;
+        // Frictionless, so the train arrives fast enough to roll past the stop point.
+        let found = blocker(&course, 3, spacing, &Physics::frictionless());
+        let station_start = course.station().unwrap().0.s0;
+        assert_eq!(found, Some(Blocker::Overshoot { s: station_start }));
+    }
+
+    #[test]
+    fn without_the_lift_the_train_stalls_and_the_place_is_reported() {
+        let (mut course, _) = report_for(&Shape::demo());
+        course
+            .placed
+            .retain(|p| !matches!(p.element, Element::Lift { .. }));
+        let spacing = crate::coaster::physics::CAR_SPACING;
+        match blocker(&course, 3, spacing, &Physics::default()) {
+            Some(Blocker::Stall { s }) => assert!(s > 0.0 && s < course.table.length()),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

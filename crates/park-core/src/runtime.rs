@@ -115,6 +115,7 @@ enum Order {
     RemoveDemo,
     Give(Caller),
     Wand { uuid: u128, click: WandClick },
+    Undo { uuid: u128 },
     Create { uuid: u128, ride: RideFile },
     Delete { uuid: u128, id: String },
     SetCars { uuid: u128, id: String, cars: usize },
@@ -573,6 +574,11 @@ impl Runtime {
         self.orders.push_back(Order::Wand { uuid, click });
     }
 
+    /// The wand was left-clicked on a block (the hook cancels the break): take the last node away.
+    pub fn wand_undo(&mut self, uuid: u128) {
+        self.orders.push_back(Order::Undo { uuid });
+    }
+
     fn ride_index(&self, id: &str) -> Option<usize> {
         self.rides.iter().position(|r| r.id == id)
     }
@@ -607,7 +613,7 @@ impl Runtime {
             }
             (Some("wand"), 2) => {
                 self.orders.push_back(Order::Give(caller));
-                "Here is the track wand. Right-click a block to place a node. Right-click the air to switch between track, lift, brake and station. /coaster undo removes the last node. /coaster create <name> makes the ride.".to_string()
+                "Here is the track wand. Right-click a block to place a node. Right-click the air to switch between track, lift, brake and station. Left-click a block (or type /coaster undo) to remove the last node. /coaster create <name> makes the ride.".to_string()
             }
             (Some("undo"), 2) => match self.builder.undo(uuid, self.now) {
                 Some(n) => format!("Removed node {n}."),
@@ -895,6 +901,13 @@ impl Runtime {
                             let mode = self.builder.click_air(uuid, self.now);
                             format!("Wand mode: {}", builder::mode_name(mode))
                         }
+                    };
+                    show(host, players, uuid, &text);
+                }
+                Order::Undo { uuid } => {
+                    let text = match self.builder.undo(uuid, self.now) {
+                        Some(n) => format!("Removed node {n}"),
+                        None => "No nodes to remove".to_string(),
                     };
                     show(host, players, uuid, &text);
                 }
