@@ -428,3 +428,9 @@ The control box by a real ride's station where the operator presses "dispatch" t
 
 ## Private Horizon code
 Code that reaches into Horizon's own insides instead of using the stable hooks. Powerful, but it can break when Horizon changes, so we pin it to one Horizon version and keep it in one file (`host_mixin.rs`).
+
+## Piece builder
+Building a coaster by choosing the next piece, such as straight, turn or climb, and adding it to the end of the track, like laying model train track. It's how RollerCoaster Tycoon and Planet Coaster work.
+
+## Track head
+The open end of a track you're building, with the direction it points and its slope. Each new piece starts there, like the tip of a pencil drawing a line.
