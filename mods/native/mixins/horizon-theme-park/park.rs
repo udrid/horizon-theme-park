@@ -285,6 +285,14 @@ impl Builder {
             }
             Some(Blocker::Stall { s }) => {
                 let node = nearest_node(&ride, &course, s);
+                let after_station = course
+                    .station()
+                    .is_some_and(|(p, _, _)| (0.0..20.0).contains(&(course.table.wrap(s) - p.s1)));
+                if after_station {
+                    return Err(format!(
+                        "The train runs out of speed right after the station (near node {node}). Start the lift right where the station ends."
+                    ));
+                }
                 return Err(format!(
                     "The train runs out of speed and stalls near node {node}. Lower the hill near node {node}, or put lift nodes before it."
                 ));
@@ -720,8 +728,11 @@ pub(crate) mod tests {
         }
         load(&mut b, flat);
         let error = b.create(1, "nope", |_| false).unwrap_err();
-        assert!(error.contains("stalls near node"), "{error}");
-        assert!(error.contains("Lower the hill near node"), "{error}");
+        assert!(error.contains("right after the station"), "{error}");
+        assert!(
+            error.contains("Start the lift right where the station ends"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1814,6 +1825,8 @@ const SNAP_SPEED: f64 = 0.05;
 const STATION_COMFORT_DECEL: f64 = 1.0;
 /// ...but never creeps slower than this, so a train always reaches the stop point.
 const STATION_CREEP: f64 = 0.05;
+/// A train must be slower than this (blocks per second) to be stopped at the stop point.
+pub const ARRIVE_MAX_SPEED: f64 = 0.5;
 /// A train this close to the stop point counts as arrived.
 const STATION_ARRIVE: f64 = 0.02;
 /// How hard the chain, the station wheels and the push-out accelerate the train, blocks per
@@ -2110,7 +2123,13 @@ impl Train {
         // Arrived at the stop point? Stop exactly there and wait.
         if let Some((p, stop, _)) = arriving {
             let now = table.wrap(self.s);
-            if now >= stop - STATION_ARRIVE && now < stop + 1.0 && now >= p.s0 {
+            // Only a slow train is stopped on the spot; a faster one runs on past the stop point
+            // (stopping it instantly would be a jolt, D58). D68 refuses such tracks at `create`.
+            if now >= stop - STATION_ARRIVE
+                && now < stop + 1.0
+                && now >= p.s0
+                && self.v.abs() <= ARRIVE_MAX_SPEED
+            {
                 self.s = stop;
                 self.v = 0.0;
                 self.a = 0.0;
@@ -2431,6 +2450,23 @@ mod tests {
             assert!(guard < 2000);
         }
         assert!((train.v - 3.0).abs() < 0.1, "left at {}", train.v);
+    }
+
+    #[test]
+    fn a_fast_train_is_not_stopped_on_the_spot_by_the_station() {
+        let course = course_with(Element::station(40.0), 28.0, 44.0);
+        // 10 blocks/s through the stop point: it runs on past it instead of an instant halt.
+        let mut train = Train::free(3, 39.9, 10.0);
+        for _ in 0..3 {
+            train.step(&course, &Physics::frictionless());
+            assert!(!train.is_held(), "stopped at {} going {}", train.s, train.v);
+        }
+        assert!(
+            train.s > 41.0 && train.v > 1.0,
+            "s {} v {}",
+            train.s,
+            train.v
+        );
     }
 
     // Test 10: the station.

@@ -273,6 +273,14 @@ impl Builder {
             }
             Some(Blocker::Stall { s }) => {
                 let node = nearest_node(&ride, &course, s);
+                let after_station = course
+                    .station()
+                    .is_some_and(|(p, _, _)| (0.0..20.0).contains(&(course.table.wrap(s) - p.s1)));
+                if after_station {
+                    return Err(format!(
+                        "The train runs out of speed right after the station (near node {node}). Start the lift right where the station ends."
+                    ));
+                }
                 return Err(format!(
                     "The train runs out of speed and stalls near node {node}. Lower the hill near node {node}, or put lift nodes before it."
                 ));
@@ -708,8 +716,11 @@ pub(crate) mod tests {
         }
         load(&mut b, flat);
         let error = b.create(1, "nope", |_| false).unwrap_err();
-        assert!(error.contains("stalls near node"), "{error}");
-        assert!(error.contains("Lower the hill near node"), "{error}");
+        assert!(error.contains("right after the station"), "{error}");
+        assert!(
+            error.contains("Start the lift right where the station ends"),
+            "{error}"
+        );
     }
 
     #[test]
