@@ -434,3 +434,12 @@ Building a coaster by choosing the next piece, such as straight, turn or climb, 
 
 ## Track head
 The open end of a track you're building, with the direction it points and its slope. Each new piece starts there, like the tip of a pencil drawing a line.
+
+## HUD (heads-up display)
+The information drawn over the game while you play, like the hearts and hotbar. Our builder panel is drawn the same way, so you can still move and look around.
+
+## Ghost piece
+A see-through preview of the next piece of track, showing where it will go before you build it. Like tracing paper laid over a drawing.
+
+## Auto-complete (finish helper)
+A tool that draws the last part of the track for you, smoothly back into the station. Ours shows its path as a ghost first and tells you plainly when it can't do it.

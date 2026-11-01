@@ -1,86 +1,117 @@
-# M3b plan: Piece builder
+# M3b plan: Coaster builder (on screen)
 
-**Status:** plan by **Claude Opus 5.5**, 2026-11-01. **Nothing is built.** The owner answers section 5 first.
-Why: the owner found the wand confusing: **placing points** (clicking blocks, scaffolding for height, not seeing
-where points are) and **no live track** (only particles until `create`). The owner chose a piece builder (D74).
-The wand (D62–D67) stays as an advanced, free-form tool.
+**Status:** plan by **Claude Opus 5.5**, 2026-11-01, rewritten after the owner's feedback. **Nothing is built.** The
+owner answers section 6 first; then it's built before M4 (owner's C4 = A).
 
-## 1. Goal, in plain words
+**What the owner asked for:** more options; builder-friendly, with **less typing and more on screen**; a **powerful,
+realistic building simulator**, inspired by Planet Coaster and RollerCoaster Tycoon; and **help finishing the
+coaster**, with a smooth helper, within reason. The wand (D62–D67) stays as an advanced tool.
 
-Build a coaster the way RollerCoaster Tycoon or Planet Coaster do it: pick the next piece (straight, turn left, go up,
-lift, brake, station…) and the track grows from its end, **drawn for real** as you go, at any height, with no
-scaffolding. When the track comes back to its start, **Finish** joins it and the ride opens, with the realism report
-(D64) and the safety checks (D68).
+## 1. What it feels like (recommended answers)
 
-## 2. How it works (recommended answers)
+1. Press **B** anywhere: **build mode** opens. A panel appears at the side of the screen; you can still walk, fly and look
+   around. Pick "New coaster" (or an existing one) on the panel. A new coaster starts **in front of you, facing where you
+   look**, with its station.
+2. The panel shows the **next piece** and its settings: type, length, turn, slope, element (lift, brake, block brake).
+   **Scroll the mouse wheel** to change the highlighted setting, **R** to move to the next setting.
+3. A **ghost piece** (see-through rails) shows exactly where the next piece will go, and moves as you change settings.
+4. **Right-click** builds it: real rails appear at once. **Z** undoes and **Y** redoes, piece by piece.
+5. A **live stats line** shows the train's speed when it reaches the end of the track, the height, and the g-forces of
+   the ghost piece at that speed. Anything past the realism limits (D58) turns **red** and says why ("lateral 1.4 g:
+   widen the turn"). Settings that would break a limit are greyed out, with the reason.
+6. Press **H** for the **finish helper**: it draws a smooth ghost path from your track's end back into the station,
+   with a brake run before it. Right-click accepts it; anything else cancels. If it can't make a smooth, realistic path,
+   it says why in plain words ("too high above the station: build down about 12 blocks first").
+7. Accepting the finish saves and opens the ride, with the realism report (D64) and the safety checks (D68).
 
-```
- /coaster new thunder      → a "track head" appears 3 blocks east of you (D52), facing east, level,
-                             with a 12-block station already placed (every ride needs one)
- hotbar kit (C1):          Straight · Left · Right · Up · Down · Lift · Brake · Block brake · Undo · Finish
- right-click a piece item  → that piece is added at the head; its rails appear at once; the head moves on
- the action bar shows      → piece count, height, and where the start is ("start: 14 blocks ahead, 30° right")
- Finish                    → if the head is close to the start and pointing roughly back at it, the gap is
-                             joined smoothly, the ride is checked and saved (D20, D64, D68)
-```
+## 2. Facts that shape it
 
-- Under the hood, each piece adds track **nodes** (D42's Catmull-Rom passes through them), so rides stay the same
-  kind of file as now (D20): the wand can still edit them.
-- The head keeps a direction (heading, in 15° steps) and a slope. Pieces change them smoothly, so the track never
-  kinks, and transitions are rounded (D58).
+Read at Horizon `b5b451de` by a Sonnet helper (file:line in its report). Inspiration from a web helper's report
+(Planet Coaster, RollerCoaster Tycoon, NoLimits, TC-Coasters).
 
-## 3. Facts and limits
+| # | Fact | How sure |
+|---|---|---|
+| F1 | `native_hud` draws on the screen every frame **without** opening a screen, so the world stays visible and you can move. Text, filled boxes, sprites and item icons can be drawn anywhere | read |
+| F2 | `native_key` hears key presses; `native_wheel` hears the mouse wheel and can **claim** it (so the hotbar doesn't scroll) | read |
+| F3 | The client's hooks and the server's hooks run in one program for the **host** (single-player, or the player who hosts a LAN world), so they can share the mod's own state. **LAN guests don't run our client code**, so they can't use the panel (they keep the wand and commands) | read (shared state is an inference; T0 tests it) |
+| F4 | The client knows where you look (`native_player`: position, yaw, pitch), so a new coaster can start facing your view | read |
+| F5 | No hook draws lines in the 3D world, but our ghost piece can be **display entities** with a see-through model, like the rails | read |
+| F6 | Planet Coaster's auto-complete only works when the end is very close and level; players find it clumsy. A smooth helper that explains its refusals beats it | web, forum-level |
 
-- The tick can't see what a player holds (M3 F3), but **using** an item is heard (`native_use_item`, API 13), so each
-  piece is an item in the hotbar, used by right-click.
-- Rails are drawn with the same displays as now (D29); each piece adds a few. The budget (D27) applies.
-- The game can't tell which way a player faces (D52), so a new track starts facing east; the first pieces turn it.
+## 3. The pieces and settings (C2)
+
+| Setting | Values | Notes |
+|---|---|---|
+| Type | Straight · Turn · Slope change · Turn + slope | one piece = one smooth stretch |
+| Length | 1–32 blocks | |
+| Turn | −180° to +180° in 15° steps | the radius follows from length and angle, shown on the panel |
+| Slope | −70° to +70° in 5° steps (the slope at the piece's end) | climbs and drops ease in and out smoothly |
+| Element | Track · Lift · Brake · Block brake (M4) · Station (only by "New coaster") | |
+| Banking | shown, greyed: "comes with M5" | |
+
+Under the hood each piece adds track nodes (D42), so a ride stays the same kind of file (D20) and the wand can still
+edit it.
 
 ## 4. Tasks (builder steps; Opus reviews and runs the checks)
 
 | # | Task |
 |---|---|
-| T1 | `pieces.rs`: the piece set (C2) as node generators from a head (position, heading, slope); tests that every piece joins smoothly and that a sample layout of pieces passes D58 |
-| T2 | `head.rs` / builder sessions: add, undo, the head's state, "where is the start" text, Finish's join rule (C3) |
-| T3 | Live drawing: rails for each new piece at once; removed again on undo |
-| T4 | Content mod: the piece items (one model each, vanilla textures) and `/coaster kit` to get them |
-| T5 | Glue: `native_use_item` for the kit items; commands `new`, `kit`, `finish` |
-| T6 | Opus review; then **you**: one rebuild, build a coaster with pieces |
+| T0 | Check, small rebuild: the client and server share a static in single-player; `native_wheel` claim; `native_key` names (`key.keyboard.b`, `r`, `z`, `y`, `h`) |
+| T1 | `pieces.rs`: a piece from a head pose (position, heading, slope) and its settings → nodes; smooth joins; tests that every piece joins with matching direction and slope |
+| T2 | `preview.rs`: an open-track dry run from the station to the head, giving speed at the end; g-forces of a ghost piece at that speed; limit checks and greyed-out reasons (D58) |
+| T3 | `finish.rs`: the finish helper: a smooth path (a Hermite curve, tuned) from the head into the station's approach, with a brake run; checks D58 and D68; plain-words refusals |
+| T4 | Build sessions: build / undo / redo stacks; save and open through the same path as `create` |
+| T5 | Ghost drawing: see-through rail displays for the next piece and the finish path, redrawn when settings change |
+| T6 | Glue (client): HUD panel drawing, keys, wheel, and the shared state; glue (server): reads it on the tick |
+| T7 | Content mod: the see-through ghost rail model |
+| T8 | Opus review (`pieces.rs`, `finish.rs`: maths); then **you**: one rebuild, build a coaster on screen |
 
-## 5. Choices for you
+## 5. Later (M3c, after M4, unless you want it sooner)
 
-**C1. How you pick pieces.**
-- **A. A hotbar kit: each piece is an item. Hold it and right-click to add that piece.** Feels like Minecraft, quick,
-  no menus. **Recommended.**
-- B. A build screen (like the dispatch panel, D72) with a button per piece. Looks like Planet Coaster, but every piece
-  means opening a screen.
+Test run with a ghost train and a "where it stalled" report; selecting a piece in the middle and rebuilding from there;
+templates (lift hill, drop, helix, starter layouts); ratings (RCT's excitement, intensity, nausea: M5).
 
-**C2. The piece set.**
-- **A. A small, fixed set:** Straight (4 blocks); Left / Right turns of 45° in three sizes (tight, medium, wide; a
-  "Size" kit item switches between them, since the mod can't tell when you sneak); Up / Down that step the
-  slope through level → gentle (20°) → steep (45°) → drop (60°); Lift, Brake, Block brake (D71), and the station
-  placed by `new`. **Recommended.**
-- B. The same, plus a "free" piece whose length and angle you type in a command.
+## 6. Choices for you
 
-**C3. Closing the loop.**
-- **A. You steer back to the start; Finish joins the last gap** if the head is within 16 blocks of the start and
-  pointing within 45° of it. Otherwise it tells you which way to go. **Recommended.**
-- B. Finish draws the whole way back by itself (much harder to make smooth and realistic).
+**C1. How you control the builder.**
+- **A. An on-screen panel (B to open), changed with the mouse wheel and a few keys; right-click builds; you keep moving
+  and looking around.** Closest to Planet Coaster. **Recommended.**
+- B. A build-table block that opens a full screen with buttons (like the dispatch panel, D72). You can't move while it's
+  open, and you must stand at the table.
 
-**C4. Order.**
-- **A. Build this before M4**, since building is what you do most. **Recommended.**
-- B. After M4.
+**C2. Piece settings.**
+- **A. Free settings in steps (section 3): length, turn and slope you set yourself, previewed live.** Powerful and still
+  easy, since the ghost shows the result. **Recommended.**
+- B. Fixed pieces (RollerCoaster Tycoon style: small, medium, large turns; set slopes). Simpler, less freedom.
+
+**C3. The finish helper.**
+- **A. A smooth path back into the station with a brake run, shown as a ghost first; refuses with a plain reason
+  when it can't stay smooth and realistic.** **Recommended.**
+- B. Planet Coaster style: only joins when you're already very close and level.
+
+**C4. LAN guests.**
+- **A. The on-screen builder is for the world's host; guests use the wand and commands for now** (F3). **Recommended**
+  (it's what Horizon allows today).
+- B. Hold the builder until guests can use it too (would need a Horizon change).
+
+**C5. Scope.**
+- **A. M3b as in section 4 now; test runs, editing from the middle and templates in M3c (section 5).** **Recommended.**
+- B. Everything at once: a much bigger step before you can try it.
 
 ### Small choices (I'll use these unless you say otherwise)
 
-- **S1.** Headings in 15° steps; piece lengths in whole blocks; one undo per piece, all the way back to the station.
-- **S2.** Turn sizes: tight radius 8, medium 16, wide 24 blocks. The realism report says when a turn is too tight for
-  its speed (flat turns until banking, M5).
-- **S3.** The action bar shows `Piece 12 · height 18 · start: 14 ahead, 30° right · size: medium`.
-- **S4.** The wand stays for moving single points (advanced); rides from either tool are the same kind of file.
+- **S1.** Keys: **B** build mode on/off, **wheel** change value, **R** next setting, **right-click** build, **Z** undo,
+  **Y** redo, **H** finish helper. All can be changed in Horizon's mod key settings (`native_mod_key`).
+- **S2.** The panel sits at the right edge, about a quarter of the screen wide, hidden with F1 like the HUD.
+- **S3.** The ghost model is the rail model in light-blue glass; the finish path is drawn the same way.
+- **S4.** The station placed by "New coaster" is 3 cars long (D55), flat, with the platform (D60).
 
-## 6. Cost and risks
+## 7. Cost and risks
 
-- No downloads. One rebuild by you. OpenCode builds the steps; Opus reviews.
-- **Risk:** joining the last gap smoothly (C3) is the hardest part; tests check the join stays within D58.
-- **Risk:** many pieces mean many rail displays while building; the head only draws near the builder (D30 parking).
+- No downloads. One small rebuild for T0, one for the end. OpenCode builds the steps; Opus writes briefs and reviews the
+  maths (pieces, finish helper).
+- **Risk:** the shared client/server state (F3) is an inference; T0 checks it before anything else is built. If it fails,
+  C1-B (the build-table screen) is the fallback.
+- **Risk:** the finish helper is the hardest part. It may refuse often at first; tests check that what it accepts stays
+  within D58.
+- **Risk:** ghost redraws cost commands (D21's 400 a tick); ghosts redraw at most 4 times a second.
