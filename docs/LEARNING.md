@@ -416,3 +416,15 @@ A fork is someone's own copy of your repo on GitHub. A pull request is them aski
 
 ## Ruleset (GitHub)
 A list of rules GitHub enforces on a branch, such as "changes need a pull request and green tests". Like a lock on the front door that only you have the key to.
+
+## Block section (in practice)
+On our coasters, the station, the lift top and every block-brake node end a section. A train only enters a section when it's empty, so two trains can never meet.
+
+## Deadlock
+Two things each waiting for the other, so neither ever moves, like two cars stuck at a one-lane bridge, each waiting for the other to back up. Having more sections than trains prevents it.
+
+## Dispatch panel
+The control box by a real ride's station where the operator presses "dispatch" to send the train. Ours is a block you right-click.
+
+## Private Horizon code
+Code that reaches into Horizon's own insides instead of using the stable hooks. Powerful, but it can break when Horizon changes, so we pin it to one Horizon version and keep it in one file (`host_mixin.rs`).
