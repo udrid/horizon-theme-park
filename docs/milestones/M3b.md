@@ -1,6 +1,6 @@
 # M3b plan: Coaster builder (on screen)
 
-**Status:** plan by **Claude Opus 5.5**, 2026-11-01, rewritten after the owner's feedback. **Nothing is built.** The
+**Status:** plan by **Claude Opus 5.5**, 2026-11-01. **Approved 2026-11-01: every recommended answer, recorded as D75.** Nothing is built yet. The
 owner answers section 6 first; then it's built before M4 (owner's C4 = A).
 
 **What the owner asked for:** more options; builder-friendly, with **less typing and more on screen**; a **powerful,
