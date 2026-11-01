@@ -56,8 +56,8 @@ scaffolding. When the track comes back to its start, **Finish** joins it and the
   means opening a screen.
 
 **C2. The piece set.**
-- **A. A small, fixed set:** Straight (4 blocks); Left / Right turns of 45° in three sizes (tight, medium, wide; you
-  cycle the size by using the item while sneaking is impossible (M3), so by a "Size" kit item); Up / Down that step the
+- **A. A small, fixed set:** Straight (4 blocks); Left / Right turns of 45° in three sizes (tight, medium, wide; a
+  "Size" kit item switches between them, since the mod can't tell when you sneak); Up / Down that step the
   slope through level → gentle (20°) → steep (45°) → drop (60°); Lift, Brake, Block brake (D71), and the station
   placed by `new`. **Recommended.**
 - B. The same, plus a "free" piece whose length and angle you type in a command.
