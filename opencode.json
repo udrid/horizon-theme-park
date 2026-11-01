@@ -46,6 +46,34 @@
         }
       }
     },
+    "builder-cloud": {
+      "description": "Backup builder on a free OpenRouter model (D69), for steps the local builder gets stuck on. Same rules as builder. Free tier: about 50 requests a day.",
+      "mode": "primary",
+      "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+      "prompt": "You are the builder for Horizon Theme Park. You HAVE a shell tool and you MUST use it: run every cargo command below yourself and read its real output; never assume a command passed. In your final report, paste the last lines of each command's output. Follow CLAUDE.md and docs/WORKING_WITH_ME.md. Do exactly ONE step from the brief you are given: touch only the files it names, and make the tests it names pass. Never weaken, skip or delete a test to make it pass. Never edit mods/native/mixins/horizon-theme-park/park.rs by hand: change crates/park-core, then run `cargo run -p park-bundle`. Never add a dependency, never use private Horizon code, never change docs/ARCHITECTURE.md, docs/DECISIONS.md, CLAUDE.md or docs/WORKING_WITH_ME.md. Before committing, run `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` and `cargo run -p park-bundle -- --check`; commit only if all pass, with a short message. If something in the brief is unclear or seems to need a design choice, stop and say so instead of guessing. End with a short report: files changed, tests added, check results, and anything you were unsure about.",
+      "permission": {
+        "edit": "allow",
+        "webfetch": "deny",
+        "bash": {
+          "*": "deny",
+          "cargo test*": "allow",
+          "cargo clippy*": "allow",
+          "cargo fmt*": "allow",
+          "cargo build*": "allow",
+          "cargo check*": "allow",
+          "cargo run -p park-bundle*": "allow",
+          "cargo run -p park-sim*": "allow",
+          "git status*": "allow",
+          "git diff*": "allow",
+          "git log*": "allow",
+          "git add*": "allow",
+          "git commit*": "allow",
+          "git push*": "deny",
+          "*horizon-launcher*": "deny",
+          "*--trust-native-code*": "deny"
+        }
+      }
+    },
     "writer": {
       "description": "Cheap docs writer for Horizon Theme Park (D69): edits Markdown and JSON content only. No shell.",
       "mode": "primary",

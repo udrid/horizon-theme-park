@@ -129,7 +129,7 @@ with the local `gpt-oss-32k` (gpt-oss 20b on Ollama, 32K context) and reviewed b
 |---|---|---|
 | Plan milestones, design choices, review every diff, run the four checks after each step | Claude Opus | paid (kept small) |
 | Write code, one planned step at a time | OpenCode `builder` agent on **local Devstral Small 2 24B** (trained as a coding agent; 15 GB; [ollama.com/library/devstral-small-2](https://ollama.com/library/devstral-small-2)) | free |
-| Write code when the local model gets stuck | OpenCode `builder-cloud` agent on an **OpenRouter free model** (20 requests a minute; 50 a day, 1,000 a day after buying 10 credits once; [limits](https://openrouter.ai/docs/api/reference/limits)) | free |
+| Write code when the local model gets stuck | OpenCode `builder-cloud` agent on **NVIDIA Nemotron 3 Ultra (free, via OpenRouter)** (20 requests a minute; 50 a day, 1,000 a day after buying 10 credits once; [limits](https://openrouter.ai/docs/api/reference/limits)) | free |
 | Docs, JSON, glossary entries, dev logs | OpenCode `writer` agent on local `gpt-oss-32k` (fast) | free |
 | Big reading of Horizon's code | `agy` (weekly allowance) | free |
 | Checking everything on every push | GitHub CI | free |
