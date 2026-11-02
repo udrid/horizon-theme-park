@@ -320,7 +320,7 @@ pub fn preview_points(nodes: &[NodeFile], step: f64, max_points: usize) -> Vec<D
 
 /// The distance along the lap of every node, plus the lap's length at the end (so `n + 1` numbers).
 /// Each curve between two nodes is measured with 64 little steps, then scaled to the table's length.
-fn node_distances(track: &Track, table: &Table) -> Vec<f64> {
+pub(crate) fn node_distances(track: &Track, table: &Table) -> Vec<f64> {
     let mut sums = vec![0.0];
     for segment in track.segments() {
         let mut length = 0.0;
@@ -392,6 +392,18 @@ pub fn train_of(ride: &RideFile, course: &Course) -> Train {
 
 /// Turn a ride's nodes into a course a train can run on, or say plainly why not (D65).
 pub fn course_from(ride: &RideFile) -> Result<Course, String> {
+    course_checked(ride, 0, ride.nodes.len())
+}
+
+/// Like `course_from`, but the "no vertical track" check (D59) only looks at the track between
+/// node index `steep_from` and node index `steep_to` (counting from 0; the whole lap is 0 to the
+/// node count). The builder's preview (M3b) adds invisible nodes that close the loop with a steep
+/// return; those must not be judged.
+pub(crate) fn course_checked(
+    ride: &RideFile,
+    steep_from: usize,
+    steep_to: usize,
+) -> Result<Course, String> {
     let n = ride.nodes.len();
     if n < MIN_NODES {
         return Err(format!(
@@ -487,8 +499,9 @@ pub fn course_from(ride: &RideFile) -> Result<Course, String> {
     }
 
     // Vertical track would break the level frames (D59): refuse it with the place.
-    let mut s = 0.0;
-    while s < table.length() {
+    let steep_end = node_s[steep_to.min(n)];
+    let mut s = node_s[steep_from.min(n)];
+    while s < steep_end.min(table.length()) {
         if table.frame(s).forward.y.abs() > MAX_STEEP {
             let node = node_s.partition_point(|&x| x <= s).clamp(1, n);
             return Err(format!(

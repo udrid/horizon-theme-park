@@ -453,3 +453,5 @@ A tool that draws the last part of the track for you, smoothly back into the sta
 - **Head (the pen)**: where the track ends right now, which way it points and how steep it is. Each new piece starts from the head, so joins are smooth.
 - **Heading / yaw**: the compass direction in degrees. In Minecraft 0 is south and 90 is west. Turning right adds degrees.
 - **Easing**: starting and ending a change gently (like a car pulling away), so a slope never changes in a sudden kink.
+- **Invisible nodes (phantoms)**: the physics wants a closed loop, but a half-built track is open. For each preview we add two helper nodes straight ahead of the end and two behind the station. They are never drawn or saved; they only close the loop on paper.
+- **Dry run**: driving the train over the track in the computer, with no game, to read its speed and g-forces.
