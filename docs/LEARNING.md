@@ -459,3 +459,5 @@ A tool that draws the last part of the track for you, smoothly back into the sta
 - **Brake run**: the straight stretch of brake track just before the station that slows the train so it can stop.
 - **Build session / undo and redo stacks**: two lists of what you built. Undo takes the newest piece off the first list and puts it on the second; redo moves it back. Building something new empties the second list.
 - **Cache**: remembering an answer so we don't work it out again every frame. The HUD redraws 60 times a second, but the dry run only reruns when you change a setting.
+- **Claiming a click**: telling the game "I handled this one", so it does not also place a block or open a chest. While the builder is open we claim right-clicks.
+- **Throttle**: a speed limit on how often something may happen. The ghost is redrawn at most 4 times a second so it never floods the game with commands.

@@ -14,11 +14,15 @@
 
 use crate::game::Game;
 use crate::game::htp_park::commands::WAND_ITEM;
+use crate::game::htp_park::buildmode::Tone;
 use crate::game::htp_park::host::{Host, PlayerInfo};
 use crate::game::htp_park::runtime::{COMMAND_USAGES, Caller, Runtime, WandClick};
 use crate::game::native_lifecycle::{ServerTickPhase, WorldPhase};
 use crate::game::native_server::{NativeCommand, NativeServerPlayer};
 use glam::DVec3;
+use horizon_client::extras::Corner;
+use horizon_client::extras_hud::Corners;
+use horizon_client::hud::HudBatch;
 use horizon_client::items::ItemStack;
 use horizon_client::text::Text;
 use std::path::PathBuf;
@@ -113,9 +117,6 @@ pub(super) fn tick(game: &mut Game<'_>, phase: ServerTickPhase) {
         return;
     }
     runtime().tick(&mut GameHost(game));
-    // T0 (M3b): log what the client wrote into the shared static.
-    let mut ticks = T0_TICKS.lock().unwrap_or_else(|p| p.into_inner());
-    t0_server_log(&mut ticks);
 }
 
 /// Called when the game asks which commands mods add (see on_commands.rs).
@@ -157,6 +158,12 @@ pub(super) fn use_item_on(
     pos: [i32; 3],
     claimed: &mut bool,
 ) {
+    // While the on-screen builder is open every right-click belongs to it (it hears the click
+    // itself, in `key`), so no block is placed and nothing is opened.
+    if runtime().build_open() {
+        *claimed = true;
+        return;
+    }
     if stack.item.to_string() != WAND_ITEM {
         return;
     }
@@ -183,6 +190,10 @@ pub(super) fn destroy_block(game: &mut Game<'_>, canceled: &mut bool) {
 
 /// Called when a player right-clicks the AIR with an item (see on_use_item.rs). Same rules as above.
 pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut bool) {
+    if runtime().build_open() {
+        *claimed = true;
+        return;
+    }
     if stack.item.to_string() != WAND_ITEM {
         return;
     }
@@ -193,95 +204,110 @@ pub(super) fn use_item(game: &mut Game<'_>, stack: &ItemStack, claimed: &mut boo
 }
 
 // ---------------------------------------------------------------------------------------------
-// T0 (M3b): a throw-away proof that the CLIENT hooks work and that the client and the server
-// share one static. Press B: a box appears on screen. Scroll the wheel: the number changes.
-// The server tick logs the same number. If that log line shows your number, the client and the
-// server really share memory, and the on-screen builder can be built. This block is removed or
-// replaced when T6 (the real builder glue) lands.
+// M3b: the on-screen coaster builder. The keys, the wheel and the HUD are heard on the CLIENT;
+// in single-player (and for the host of a LAN world) the client and the server are one program,
+// so these functions just talk to the same `Runtime` (T0 proved that). All the thinking is in
+// park-core (`buildmode.rs`); here we only pass keys in and draw the text that comes out.
 // ---------------------------------------------------------------------------------------------
 
-/// What the client hooks write and the server tick reads. A tiny "noticeboard".
-struct T0State {
-    open: bool,
-    value: i32,
-    last_key: String,
+/// The panel is at most this wide, in GUI pixels; longer lines are wrapped.
+const PANEL_WIDTH: f32 = 190.0;
+
+/// Colours of the panel lines (0xRRGGBB).
+fn tone_colour(tone: Tone) -> u32 {
+    match tone {
+        Tone::Normal => 0xFFFFFF,
+        Tone::Selected => 0xFFFF55,
+        Tone::Grey => 0x999999,
+        Tone::Red => 0xFF5555,
+        Tone::Good => 0x55FF55,
+    }
 }
 
-static T0: Mutex<T0State> = Mutex::new(T0State {
-    open: false,
-    value: 0,
-    last_key: String::new(),
-});
-
-fn t0() -> MutexGuard<'static, T0State> {
-    T0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Split `text` into lines that are no wider than `max` pixels, at spaces.
+fn wrap(game: &Game<'_>, text: &str, max: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split(' ') {
+        let attempt = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{current} {word}")
+        };
+        if !current.is_empty() && game.native_text_width(&attempt) > max {
+            lines.push(std::mem::take(&mut current));
+            current = word.to_string();
+        } else {
+            current = attempt;
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
-/// Client: every frame. Draws the test box while build mode is "open" (see on_hud.rs).
-pub(super) fn hud(
-    game: &mut Game<'_>,
-    batch: &mut horizon_client::hud::HudBatch,
-    corners: &mut horizon_client::extras_hud::Corners,
-) {
-    let (open, value, key) = {
-        let s = t0();
-        (s.open, s.value, s.last_key.clone())
+/// Client, every frame (see on_hud.rs): draw the builder panel at the right edge.
+pub(super) fn hud(game: &mut Game<'_>, batch: &mut HudBatch, corners: &mut Corners) {
+    let Some(panel) = runtime().build_panel() else {
+        return;
     };
-    if !open {
+    if !game.native_corner_shown(Corner::TopRight) {
         return;
     }
-    let line1 = "HTP builder test (T0)";
-    let line2 = format!("wheel value: {value}");
-    let line3 = format!("last key: {key}");
-    let width = [line1.len(), line2.len(), line3.len()]
-        .iter()
-        .map(|n| *n as f32 * 6.0)
-        .fold(0.0, f32::max)
-        + 8.0;
-    let (x, y) = corners.place(horizon_client::extras::Corner::TopRight, width, 38.0);
-    game.native_fill(batch, [x, y, width, 38.0], 0x78000000);
-    game.native_text(batch, line1, [x + 4.0, y + 3.0], 0xFFFFFF, true);
-    game.native_text(batch, &line2, [x + 4.0, y + 14.0], 0xFFFF55, true);
-    game.native_text(batch, &line3, [x + 4.0, y + 25.0], 0xAAAAAA, true);
+    // Wrap every line, remembering its colour.
+    let mut rows: Vec<(String, u32)> = vec![(panel.title.clone(), 0x55FFFF)];
+    for line in &panel.lines {
+        for part in wrap(game, &line.text, PANEL_WIDTH - 8.0) {
+            rows.push((part, tone_colour(line.tone)));
+        }
+    }
+    let row_height = 10.0;
+    let height = rows.len() as f32 * row_height + 6.0;
+    let (x, y) = corners.place(Corner::TopRight, PANEL_WIDTH, height);
+    game.native_fill(batch, [x, y, PANEL_WIDTH, height], 0x78000000);
+    for (i, (text, colour)) in rows.iter().enumerate() {
+        game.native_text(
+            batch,
+            text,
+            [x + 4.0, y + 3.0 + i as f32 * row_height],
+            *colour,
+            true,
+        );
+    }
 }
 
-/// Client: a key or mouse button went down or up (see on_key.rs).
+/// Client, a key or mouse button went down or up (see on_key.rs).
 pub(super) fn key(game: &mut Game<'_>, key: &str, pressed: bool) {
+    // Only presses, and only while playing (not in chat, the inventory or a menu).
     if !pressed || !game.native_playing() {
         return;
     }
-    let mut s = t0();
-    if key == "key.keyboard.b" {
-        s.open = !s.open;
-        log::info!("HTP T0: key B, build mode open = {}", s.open);
-    } else if s.open {
-        // Remember every key while open, so the names of R, Z, Y, H and the mouse buttons show.
-        s.last_key = key.to_string();
-        log::info!("HTP T0: key name seen = {key}");
+    let mut rt = runtime();
+    rt.build_key(key);
+    // Right-click is how you build. "New coaster" needs to know where you stand and look.
+    if key == "key.mouse.right" && rt.build_open() {
+        if let Some(player) = game.native_player() {
+            rt.build_click(
+                DVec3::new(player.x, player.y, player.z),
+                f64::from(player.yaw),
+            );
+        }
     }
 }
 
-/// Client: the mouse wheel. While the box is open we take the wheel so the hotbar stays put.
+/// Client, the mouse wheel (see on_wheel.rs): while the builder is open it takes the wheel, so
+/// the hotbar stays where it is.
 pub(super) fn wheel(steps: f32, claimed: &mut bool) {
-    let mut s = t0();
-    if !s.open {
-        return;
-    }
-    *claimed = true;
-    s.value += if steps > 0.0 { 1 } else { -1 };
-}
-
-/// Server: called from `tick` about once a second. If the number logged here changes when you
-/// scroll, the client and the server share the static.
-fn t0_server_log(ticks: &mut u32) {
-    *ticks += 1;
-    if *ticks % 20 != 0 {
-        return;
-    }
-    let s = t0();
-    if s.open {
-        log::info!("HTP T0 server tick sees: open = {}, value = {}", s.open, s.value);
+    if runtime().build_wheel(steps) {
+        *claimed = true;
     }
 }
 
-static T0_TICKS: Mutex<u32> = Mutex::new(0);
+/// Server, a player right-clicks a block (see on_right_click_block.rs): while the builder is
+/// open the click belongs to it, so doors, chests and levers stay still.
+pub(super) fn right_click_block(canceled: &mut bool) {
+    if runtime().build_open() {
+        *canceled = true;
+    }
+}
