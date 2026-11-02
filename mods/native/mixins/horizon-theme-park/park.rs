@@ -821,7 +821,9 @@ pub mod buildmode {
 //   4. **H** asks the finish helper for a path back to the station; right-click accepts it and
 //      the ride is complete; any other key cancels it.
 
-use crate::game::htp_park::builder::{cars_of, course_from, physics_of, spacing_of};
+use crate::game::htp_park::builder::{cars_of, course_from, node_distances, physics_of, spacing_of};
+use crate::game::htp_park::coaster::spline::Track;
+use crate::game::htp_park::coaster::table::Table;
 use crate::game::htp_park::finish::{self, Finish};
 use crate::game::htp_park::pieces::{
     Head, MAX_LENGTH, MAX_SLOPE, MAX_TURN, MIN_LENGTH, Piece, PieceSettings, PieceType, SLOPE_STEP,
@@ -940,6 +942,38 @@ pub struct Ghost {
 }
 
 /// The preview for one state of the builder.
+impl Ghost {
+    /// The rail pieces to draw for this ghost: only the new stretch, from the old end of the
+    /// track to the new one. The curve is worked out through the last real nodes, the new
+    /// nodes and two invisible ones straight ahead, so it joins the real track smoothly.
+    pub fn poses(&self) -> Vec<crate::game::htp_park::render::RailPose> {
+        let v = |p: [f64; 3]| DVec3::new(p[0], p[1], p[2]);
+        let mut points: Vec<DVec3> = self.lead_in.iter().copied().map(v).collect();
+        let head_index = points.len().saturating_sub(1);
+        points.extend(self.new.iter().copied().map(v));
+        let end_index = points.len() - 1;
+        let n = points.len();
+        if n < 4 || head_index == 0 {
+            return Vec::new();
+        }
+        let ahead = (points[n - 1] - points[n - 2]).normalize_or_zero();
+        for k in 1..=2 {
+            points.push(points[end_index] + ahead * (3.0 * k as f64));
+        }
+        // The loop closes through the phantoms; only the new stretch is read.
+        let track = Track::closed(&points);
+        let table = Table::new_level(&track);
+        if table.is_empty() {
+            return Vec::new();
+        }
+        let node_s = node_distances(&track, &table);
+        crate::game::htp_park::render::rail_pieces_between(&table, node_s[head_index], node_s[end_index])
+            .into_iter()
+            .map(|p| crate::game::htp_park::render::rail_pose(&table, p))
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Cached {
     version: u64,
@@ -1524,7 +1558,7 @@ impl BuildMode {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn started() -> BuildMode {
@@ -1712,6 +1746,21 @@ mod tests {
     }
 
     #[test]
+    fn the_ghost_poses_cover_exactly_the_new_stretch() {
+        let b = started();
+        let ghost = b.ghost().unwrap();
+        let poses = ghost.poses();
+        // An 8-block straight is two 4-block rails, end to end.
+        let total: f64 = poses.iter().map(|p| p.scale.z).sum();
+        assert!((total - 8.0).abs() < 0.05, "{total}");
+        assert!(poses.len() <= 4);
+        // They start at the old end of the track.
+        let head = b.head.pos;
+        let first = poses[0].pos;
+        assert!(first.distance(head) < 4.5);
+    }
+
+    #[test]
     fn closing_keeps_the_unfinished_coaster() {
         let mut b = started();
         b.confirm(no_rides);
@@ -1723,7 +1772,7 @@ mod tests {
     }
 
     /// Build a lift hill, a drop, turns round to a head that points at the station's approach.
-    fn built_round_the_station() -> BuildMode {
+    pub(crate) fn built_round_the_station() -> BuildMode {
         let mut b = started();
         let build = |b: &mut BuildMode, piece, length, turn, slope, element| {
             b.settings = PieceSettings {
@@ -4166,6 +4215,10 @@ pub const DEMO: &str = "demo";
 
 /// The model items of the content mod (D47).
 pub const RAIL_ITEM: &str = "htp:rail";
+/// The see-through rail of the builder's ghost piece (M3b S3).
+pub const GHOST_ITEM: &str = "htp:ghost_rail";
+/// The ghost's "ride" name. An underscore can't be in a real ride name, so it never clashes.
+pub const GHOST_RIDE: &str = "_ghost";
 pub const CAR_ITEM: &str = "htp:car";
 
 /// What a seat is made of (D49). To switch the seats to saddled invisible pigs, change this one
@@ -4275,6 +4328,23 @@ pub fn summon_rail(
         tags(ride, extra, None),
         transformation(rotation, scale)
     )
+}
+
+/// Put one piece of the builder's ghost rail in the world. It carries the session tag (so old
+/// ghosts are swept up like everything else) and the ghost's own tag (so they can be removed
+/// together).
+pub fn summon_ghost_rail(session: u64, pos: DVec3, rotation: DQuat, scale: DVec3) -> String {
+    format!(
+        "summon minecraft:item_display {} {{{},item:{{id:\"{GHOST_ITEM}\",count:1}},{}}}",
+        xyz(pos),
+        tags(GHOST_RIDE, &[tag_session(session)], None),
+        transformation(rotation, scale)
+    )
+}
+
+/// Remove every ghost piece.
+pub fn kill_ghost() -> String {
+    kill_ride(GHOST_RIDE)
 }
 
 /// Put a car on the track. `teleport_ticks` is how long the display glides to each new spot
@@ -6170,9 +6240,15 @@ pub fn sag(table: &Table, s0: f64, s1: f64) -> f64 {
 /// Cut the whole lap into rail pieces: each as long as possible (4, 3, 2 or 1 block) while its
 /// sag stays within `MAX_SAG`. The pieces touch end to end and cover the lap exactly.
 pub fn rail_pieces(table: &Table) -> Vec<Piece> {
-    let total = table.length();
+    rail_pieces_between(table, 0.0, table.length())
+}
+
+/// The same cutting, but only for the stretch from `from` to `to` blocks along (the builder's
+/// ghost draws just the new piece).
+pub fn rail_pieces_between(table: &Table, from: f64, to: f64) -> Vec<Piece> {
+    let total = to.min(table.length());
     let mut pieces = Vec::new();
-    let mut s = 0.0;
+    let mut s = from;
     while s < total - 1e-9 {
         let mut chosen = None;
         for &len in &PIECE_LENGTHS {
@@ -6970,6 +7046,7 @@ pub mod runtime {
 // from `commands.rs`. So all of this is checked by `cargo test` with a `FakeHost`.
 
 use crate::game::htp_park::builder::{self, Builder, PREVIEW_TICKS};
+use crate::game::htp_park::buildmode::{BuildMode, Outcome, Panel};
 use crate::game::htp_park::coaster::demo;
 use crate::game::htp_park::coaster::elements::{Course, DWELL};
 use crate::game::htp_park::coaster::physics::{MAX_CARS, Physics, Train};
@@ -7044,6 +7121,8 @@ const PREVIEW_EVERY: u64 = 10;
 const PREVIEW_MAX_POINTS: usize = 400;
 /// Wand node markers summoned in one tick at most.
 const MARKERS_PER_TICK: usize = 50;
+/// The ghost is redrawn at most every this many ticks (4 times a second, M3b).
+const GHOST_EVERY: u64 = 5;
 
 /// Who typed a command, and where they stand.
 #[derive(Clone, Debug, PartialEq)]
@@ -7068,11 +7147,30 @@ enum Order {
     Demo(Caller),
     RemoveDemo,
     Give(Caller),
-    Wand { uuid: u128, click: WandClick },
-    Undo { uuid: u128 },
-    Create { uuid: u128, ride: RideFile },
-    Delete { uuid: u128, id: String },
-    SetCars { uuid: u128, id: String, cars: usize },
+    Wand {
+        uuid: u128,
+        click: WandClick,
+    },
+    Undo {
+        uuid: u128,
+    },
+    Create {
+        uuid: u128,
+        ride: RideFile,
+    },
+    /// A ride finished with the on-screen builder (M3b): saved and opened like `create`.
+    BuiltRide {
+        ride: RideFile,
+    },
+    Delete {
+        uuid: u128,
+        id: String,
+    },
+    SetCars {
+        uuid: u128,
+        id: String,
+        cars: usize,
+    },
 }
 
 /// One seat of a train.
@@ -7453,6 +7551,13 @@ pub struct Runtime {
     /// Ride files that exist but could not be used (newer, broken): never overwritten.
     locked: Vec<String>,
     builder: Builder,
+    /// The on-screen builder (M3b), for the host player.
+    build: BuildMode,
+    /// The version of the builder that the ghost in the world shows, and the tick it was drawn.
+    ghost_version: u64,
+    ghost_drawn_at: u64,
+    /// Are there ghost pieces in the world right now?
+    ghost_present: bool,
     /// Ticks since the world opened.
     now: u64,
     /// The last `delete` that is waiting to be repeated: player, ride, tick (S3).
@@ -7486,6 +7591,10 @@ impl Runtime {
             rides: Vec::new(),
             locked: Vec::new(),
             builder: Builder::new(),
+            build: BuildMode::new(),
+            ghost_version: u64::MAX,
+            ghost_drawn_at: 0,
+            ghost_present: false,
             now: 0,
             pending_delete: None,
             park_dirty: false,
@@ -7502,6 +7611,9 @@ impl Runtime {
         self.rides.clear();
         self.locked.clear();
         self.builder.clear_all();
+        self.build.reset();
+        self.ghost_version = u64::MAX;
+        self.ghost_present = false;
         self.pending_delete = None;
         self.cleanup_pending = true;
         self.loaded = false;
@@ -7531,6 +7643,114 @@ impl Runtime {
     /// The wand was left-clicked on a block (the hook cancels the break): take the last node away.
     pub fn wand_undo(&mut self, uuid: u128) {
         self.orders.push_back(Order::Undo { uuid });
+    }
+
+    // ---- the on-screen builder (M3b) ----
+    //
+    // The keys, the wheel and the HUD are heard on the client; in single-player (and for the host
+    // of a LAN world) that is the same program as this runtime, so the glue calls these directly.
+    // They only change the builder's own state (no commands), so they are safe in any hook.
+
+    /// Is the builder panel showing? (The glue claims the wheel and right-clicks while it is.)
+    pub fn build_open(&self) -> bool {
+        self.build.is_open()
+    }
+
+    /// A key went down (`key.keyboard.b`). B opens and closes the panel; while it is open R, Z,
+    /// Y and H do their jobs and any other key cancels the finish ghost.
+    pub fn build_key(&mut self, key: &str) {
+        match key {
+            "key.keyboard.b" => self.build.toggle(),
+            _ if !self.build.is_open() => {}
+            "key.keyboard.r" => self.build.next_field(),
+            "key.keyboard.z" => self.build.undo(),
+            "key.keyboard.y" => self.build.redo(),
+            "key.keyboard.h" => self.build.finish(),
+            // Walking, looking and the right-click itself must not cancel the ghost.
+            "key.mouse.right" | "key.mouse.left" => {}
+            // Walking, sneaking and jumping must not cancel the ghost either.
+            "key.keyboard.w"
+            | "key.keyboard.a"
+            | "key.keyboard.s"
+            | "key.keyboard.d"
+            | "key.keyboard.space"
+            | "key.keyboard.left.shift" => {}
+            k if k.starts_with("key.keyboard.") => self.build.cancel_finish(),
+            _ => {}
+        }
+    }
+
+    /// The mouse wheel: true if the builder took it (so the hotbar stays put).
+    pub fn build_wheel(&mut self, steps: f32) -> bool {
+        if !self.build.is_open() {
+            return false;
+        }
+        self.build.wheel(steps);
+        true
+    }
+
+    /// Right-click: starts "New coaster" from the menu (`feet` and `yaw` are where the player
+    /// stands and looks), builds a piece, or accepts the finish ghost.
+    pub fn build_click(&mut self, feet: DVec3, yaw: f64) {
+        if !self.build.is_open() {
+            return;
+        }
+        if self.build.in_menu() {
+            let mut n = 1;
+            while self.name_taken(&format!("coaster-{n}")) {
+                n += 1;
+            }
+            self.build.new_coaster(&format!("coaster-{n}"), feet, yaw);
+            return;
+        }
+        let rides = &self.rides;
+        let locked = &self.locked;
+        let outcome = self
+            .build
+            .confirm(|id| rides.iter().any(|r| r.id == id) || locked.iter().any(|l| l == id));
+        if let Outcome::Finished(ride) = outcome {
+            self.orders.push_back(Order::BuiltRide { ride });
+        }
+    }
+
+    /// The panel text for the HUD (None when closed). Works the preview out only when something
+    /// changed, so calling it every frame is cheap.
+    pub fn build_panel(&mut self) -> Option<Panel> {
+        self.build.panel()
+    }
+
+    /// Draw, move or remove the ghost piece (at most 4 times a second, D21's command budget).
+    fn ghost_display(&mut self) {
+        let version = self.build.version;
+        let wanted = self.build.ghost();
+        if version == self.ghost_version && (wanted.is_some() == self.ghost_present) {
+            return;
+        }
+        if wanted.is_none() && !self.ghost_present {
+            // Nothing to show and nothing to remove: just note that we are up to date.
+            self.ghost_version = version;
+            return;
+        }
+        if self.now.saturating_sub(self.ghost_drawn_at) < GHOST_EVERY {
+            return;
+        }
+        self.ghost_version = version;
+        self.ghost_drawn_at = self.now;
+        if self.ghost_present {
+            self.build_queue.push_back(commands::kill_ghost());
+            self.ghost_present = false;
+        }
+        if let Some(ghost) = wanted {
+            for pose in ghost.poses() {
+                self.build_queue.push_back(commands::summon_ghost_rail(
+                    self.session,
+                    pose.pos,
+                    pose.rotation,
+                    pose.scale,
+                ));
+                self.ghost_present = true;
+            }
+        }
     }
 
     fn ride_index(&self, id: &str) -> Option<usize> {
@@ -7743,6 +7963,7 @@ impl Runtime {
             ride.emit_moves(host);
         }
         self.wand_display(host, &players);
+        self.ghost_display();
         self.sweep(host, &players);
         self.save_dirty(host);
     }
@@ -7829,7 +8050,10 @@ impl Runtime {
             // wand do not need them). Order is kept.
             let needs_world = matches!(
                 order,
-                Order::Create { .. } | Order::Delete { .. } | Order::SetCars { .. }
+                Order::Create { .. }
+                    | Order::BuiltRide { .. }
+                    | Order::Delete { .. }
+                    | Order::SetCars { .. }
             );
             if needs_world && !self.loaded {
                 self.orders.push_front(order);
@@ -7866,6 +8090,12 @@ impl Runtime {
                     show(host, players, uuid, &text);
                 }
                 Order::Create { uuid, ride } => self.finish_create(host, uuid, ride),
+                Order::BuiltRide { ride } => {
+                    // The builder belongs to the host, who is the first player; tell them.
+                    if let Some(p) = players.first() {
+                        self.finish_create(host, p.uuid, ride);
+                    }
+                }
                 Order::Delete { uuid, id } => self.finish_delete(host, uuid, &id),
                 Order::SetCars { uuid, id, cars } => self.finish_set_cars(host, uuid, &id, cars),
             }
@@ -8993,6 +9223,111 @@ mod tests {
         let before = host.commands.len();
         rt.tick(&mut host);
         assert_eq!(host.commands.len(), before, "nothing more is sent");
+    }
+
+    // ---- the on-screen builder (M3b) ----
+
+    fn click(rt: &mut Runtime) {
+        rt.build_click(DVec3::new(0.0, 70.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn the_builder_opens_with_b_claims_the_wheel_and_draws_and_removes_the_ghost() {
+        let (mut rt, mut host, _) = world_with("builder-ghost", &[], bystander());
+        rt.tick(&mut host);
+        host.take_commands();
+        // Closed: the wheel belongs to the hotbar and nothing is drawn.
+        assert!(!rt.build_wheel(1.0));
+        assert!(rt.build_panel().is_none());
+        rt.build_key("key.keyboard.b");
+        assert!(rt.build_open());
+        assert!(
+            rt.build_wheel(1.0),
+            "the builder takes the wheel while open"
+        );
+        // Start the coaster; the ghost of the first piece is drawn within a few ticks.
+        click(&mut rt);
+        for _ in 0..8 {
+            rt.tick(&mut host);
+        }
+        let drawn = host.take_commands();
+        let ghosts: Vec<&String> = drawn
+            .iter()
+            .filter(|c| c.starts_with("summon") && c.contains("htp:ghost_rail"))
+            .collect();
+        assert!(!ghosts.is_empty(), "{drawn:?}");
+        assert!(
+            ghosts
+                .iter()
+                .all(|c| c.contains("\"htp__ghost\"") && c.contains("\"htp_s1\""))
+        );
+        // Changing a setting redraws it (kill first, then summon) but at most every 5 ticks.
+        for _ in 0..5 {
+            rt.tick(&mut host);
+        }
+        host.take_commands();
+        rt.build_key("key.keyboard.r");
+        rt.build_wheel(1.0);
+        rt.tick(&mut host); // the redraw is queued...
+        rt.tick(&mut host); // ...and sent on the next tick
+        host.take_commands();
+        rt.build_wheel(1.0);
+        for _ in 0..2 {
+            rt.tick(&mut host);
+        }
+        let extra = host.take_commands();
+        assert!(extra.is_empty(), "throttled to 4 a second: {extra:?}");
+        for _ in 0..6 {
+            rt.tick(&mut host);
+        }
+        let again = host.take_commands();
+        assert_eq!(again[0], "kill @e[tag=htp__ghost]");
+        assert!(again.iter().any(|c| c.contains("htp:ghost_rail")));
+        // Closing the panel removes the ghost.
+        rt.build_key("key.keyboard.b");
+        for _ in 0..6 {
+            rt.tick(&mut host);
+        }
+        let gone = host.take_commands();
+        assert!(gone.iter().any(|c| c == "kill @e[tag=htp__ghost]"));
+        assert!(!gone.iter().any(|c| c.starts_with("summon")));
+    }
+
+    #[test]
+    fn building_on_screen_and_accepting_the_finish_saves_a_real_ride() {
+        let (mut rt, mut host, dir) = world_with("builder-finish", &[], bystander());
+        rt.tick(&mut host);
+        host.take_commands();
+        // A coaster built piece by piece with BuildMode's own test helper, then the keys the
+        // player would press: H shows the finish ghost, right-click accepts it.
+        rt.build = crate::game::htp_park::buildmode::tests::built_round_the_station();
+        rt.build_key("key.keyboard.h");
+        for _ in 0..8 {
+            rt.tick(&mut host);
+        }
+        let drawn = host.take_commands();
+        assert!(
+            drawn.iter().any(|c| c.contains("htp:ghost_rail")),
+            "the finish path is drawn as ghost rails"
+        );
+        click(&mut rt);
+        for _ in 0..3 {
+            rt.tick(&mut host);
+        }
+        assert_eq!(rt.rides.len(), 1, "the ride is installed");
+        assert!(
+            dir.join("horizon-theme-park")
+                .join("rides")
+                .join("coaster-1.json")
+                .exists(),
+            "and saved"
+        );
+        assert!(!rt.build_open(), "the panel closes when the ride opens");
+        let told: Vec<String> = host.tells.iter().map(|(_, t)| t.clone()).collect();
+        assert!(
+            told.iter().any(|t| t.contains("Ride coaster-1 is built")),
+            "{told:?}"
+        );
     }
 
     #[test]

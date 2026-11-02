@@ -2,5 +2,6 @@
   "item.htp.rail": "Coaster Rail",
   "item.htp.car": "Coaster Car",
   "item.htp.wand": "Track Wand",
-  "item.htp.node": "Track Node Marker"
+  "item.htp.node": "Track Node Marker",
+  "item.htp.ghost_rail": "Ghost Rail (builder preview)"
 }

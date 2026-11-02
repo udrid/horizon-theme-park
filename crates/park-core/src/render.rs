@@ -85,9 +85,15 @@ pub fn sag(table: &Table, s0: f64, s1: f64) -> f64 {
 /// Cut the whole lap into rail pieces: each as long as possible (4, 3, 2 or 1 block) while its
 /// sag stays within `MAX_SAG`. The pieces touch end to end and cover the lap exactly.
 pub fn rail_pieces(table: &Table) -> Vec<Piece> {
-    let total = table.length();
+    rail_pieces_between(table, 0.0, table.length())
+}
+
+/// The same cutting, but only for the stretch from `from` to `to` blocks along (the builder's
+/// ghost draws just the new piece).
+pub fn rail_pieces_between(table: &Table, from: f64, to: f64) -> Vec<Piece> {
+    let total = to.min(table.length());
     let mut pieces = Vec::new();
-    let mut s = 0.0;
+    let mut s = from;
     while s < total - 1e-9 {
         let mut chosen = None;
         for &len in &PIECE_LENGTHS {

@@ -13,6 +13,10 @@ pub const DEMO: &str = "demo";
 
 /// The model items of the content mod (D47).
 pub const RAIL_ITEM: &str = "htp:rail";
+/// The see-through rail of the builder's ghost piece (M3b S3).
+pub const GHOST_ITEM: &str = "htp:ghost_rail";
+/// The ghost's "ride" name. An underscore can't be in a real ride name, so it never clashes.
+pub const GHOST_RIDE: &str = "_ghost";
 pub const CAR_ITEM: &str = "htp:car";
 
 /// What a seat is made of (D49). To switch the seats to saddled invisible pigs, change this one
@@ -122,6 +126,23 @@ pub fn summon_rail(
         tags(ride, extra, None),
         transformation(rotation, scale)
     )
+}
+
+/// Put one piece of the builder's ghost rail in the world. It carries the session tag (so old
+/// ghosts are swept up like everything else) and the ghost's own tag (so they can be removed
+/// together).
+pub fn summon_ghost_rail(session: u64, pos: DVec3, rotation: DQuat, scale: DVec3) -> String {
+    format!(
+        "summon minecraft:item_display {} {{{},item:{{id:\"{GHOST_ITEM}\",count:1}},{}}}",
+        xyz(pos),
+        tags(GHOST_RIDE, &[tag_session(session)], None),
+        transformation(rotation, scale)
+    )
+}
+
+/// Remove every ghost piece.
+pub fn kill_ghost() -> String {
+    kill_ride(GHOST_RIDE)
 }
 
 /// Put a car on the track. `teleport_ticks` is how long the display glides to each new spot

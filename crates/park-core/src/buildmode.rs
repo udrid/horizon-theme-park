@@ -13,7 +13,9 @@
 //!   4. **H** asks the finish helper for a path back to the station; right-click accepts it and
 //!      the ride is complete; any other key cancels it.
 
-use crate::builder::{cars_of, course_from, physics_of, spacing_of};
+use crate::builder::{cars_of, course_from, node_distances, physics_of, spacing_of};
+use crate::coaster::spline::Track;
+use crate::coaster::table::Table;
 use crate::finish::{self, Finish};
 use crate::pieces::{
     Head, MAX_LENGTH, MAX_SLOPE, MAX_TURN, MIN_LENGTH, Piece, PieceSettings, PieceType, SLOPE_STEP,
@@ -132,6 +134,38 @@ pub struct Ghost {
 }
 
 /// The preview for one state of the builder.
+impl Ghost {
+    /// The rail pieces to draw for this ghost: only the new stretch, from the old end of the
+    /// track to the new one. The curve is worked out through the last real nodes, the new
+    /// nodes and two invisible ones straight ahead, so it joins the real track smoothly.
+    pub fn poses(&self) -> Vec<crate::render::RailPose> {
+        let v = |p: [f64; 3]| DVec3::new(p[0], p[1], p[2]);
+        let mut points: Vec<DVec3> = self.lead_in.iter().copied().map(v).collect();
+        let head_index = points.len().saturating_sub(1);
+        points.extend(self.new.iter().copied().map(v));
+        let end_index = points.len() - 1;
+        let n = points.len();
+        if n < 4 || head_index == 0 {
+            return Vec::new();
+        }
+        let ahead = (points[n - 1] - points[n - 2]).normalize_or_zero();
+        for k in 1..=2 {
+            points.push(points[end_index] + ahead * (3.0 * k as f64));
+        }
+        // The loop closes through the phantoms; only the new stretch is read.
+        let track = Track::closed(&points);
+        let table = Table::new_level(&track);
+        if table.is_empty() {
+            return Vec::new();
+        }
+        let node_s = node_distances(&track, &table);
+        crate::render::rail_pieces_between(&table, node_s[head_index], node_s[end_index])
+            .into_iter()
+            .map(|p| crate::render::rail_pose(&table, p))
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Cached {
     version: u64,
@@ -716,7 +750,7 @@ impl BuildMode {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn started() -> BuildMode {
@@ -904,6 +938,21 @@ mod tests {
     }
 
     #[test]
+    fn the_ghost_poses_cover_exactly_the_new_stretch() {
+        let b = started();
+        let ghost = b.ghost().unwrap();
+        let poses = ghost.poses();
+        // An 8-block straight is two 4-block rails, end to end.
+        let total: f64 = poses.iter().map(|p| p.scale.z).sum();
+        assert!((total - 8.0).abs() < 0.05, "{total}");
+        assert!(poses.len() <= 4);
+        // They start at the old end of the track.
+        let head = b.head.pos;
+        let first = poses[0].pos;
+        assert!(first.distance(head) < 4.5);
+    }
+
+    #[test]
     fn closing_keeps_the_unfinished_coaster() {
         let mut b = started();
         b.confirm(no_rides);
@@ -915,7 +964,7 @@ mod tests {
     }
 
     /// Build a lift hill, a drop, turns round to a head that points at the station's approach.
-    fn built_round_the_station() -> BuildMode {
+    pub(crate) fn built_round_the_station() -> BuildMode {
         let mut b = started();
         let build = |b: &mut BuildMode, piece, length, turn, slope, element| {
             b.settings = PieceSettings {
