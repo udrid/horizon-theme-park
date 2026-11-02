@@ -457,3 +457,5 @@ A tool that draws the last part of the track for you, smoothly back into the sta
 - **Dry run**: driving the train over the track in the computer, with no game, to read its speed and g-forces.
 - **Hermite curve**: a smooth curve defined by its two end points and the direction (and "stiffness") to leave and arrive with. The finish helper uses it to join your track's end to the station.
 - **Brake run**: the straight stretch of brake track just before the station that slows the train so it can stop.
+- **Build session / undo and redo stacks**: two lists of what you built. Undo takes the newest piece off the first list and puts it on the second; redo moves it back. Building something new empties the second list.
+- **Cache**: remembering an answer so we don't work it out again every frame. The HUD redraws 60 times a second, but the dry run only reruns when you change a setting.

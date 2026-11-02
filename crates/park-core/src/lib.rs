@@ -6,6 +6,7 @@
 //! and the per-tick loop in `runtime`.
 
 pub mod builder;
+pub mod buildmode;
 pub mod coaster;
 pub mod commands;
 pub mod finish;
