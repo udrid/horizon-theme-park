@@ -821,7 +821,9 @@ pub mod buildmode {
 //   4. **H** asks the finish helper for a path back to the station; right-click accepts it and
 //      the ride is complete; any other key cancels it.
 
-use crate::game::htp_park::builder::{cars_of, course_from, node_distances, physics_of, spacing_of};
+use crate::game::htp_park::builder::{
+    STOP_MARGIN, cars_of, check_name, course_from, node_distances, physics_of, spacing_of,
+};
 use crate::game::htp_park::coaster::spline::Track;
 use crate::game::htp_park::coaster::table::Table;
 use crate::game::htp_park::finish::{self, Finish};
@@ -830,8 +832,9 @@ use crate::game::htp_park::pieces::{
     TURN_STEP, build_piece, hits_track,
 };
 use crate::game::htp_park::preview::{self, Preview, Setting};
+use crate::game::htp_park::render::{self, Platform};
 use crate::game::htp_park::report::{self, Blocker};
-use crate::game::htp_park::save::{Kind, NodeFile, RideFile};
+use crate::game::htp_park::save::{DraftFile, FORMAT, HeadFile, Kind, NodeFile, RideFile, StepFile};
 use glam::DVec3;
 
 /// The session's owner: the host player.
@@ -877,6 +880,14 @@ enum Screen {
     Building,
     /// The finish helper's ghost is on show.
     Finishing(Finish),
+    /// The path was accepted; the player is typing the ride's name (D76). `done` is the whole
+    /// checked ride.
+    Naming {
+        plan: Finish,
+        done: Box<RideFile>,
+        text: String,
+        error: Option<String>,
+    },
 }
 
 /// What a panel line looks like.
@@ -995,6 +1006,9 @@ pub struct BuildMode {
     redo: Vec<Step>,
     /// Count of changes to the track or the ghost; the runtime redraws the ghost when it moves on.
     pub version: u64,
+    /// Count of changes that belong in the saved draft (a build, undo, redo, a new or finished
+    /// coaster): the runtime writes the draft when it moves on (D76).
+    pub draft_rev: u64,
     /// A short message shown on the panel (a refusal, or "Built").
     message: Option<(String, Tone)>,
     /// The last preview and what it was for, so the HUD (every frame) does not re-run it.
@@ -1030,6 +1044,7 @@ impl BuildMode {
             undo: Vec::new(),
             redo: Vec::new(),
             version: 0,
+            draft_rev: 0,
             message: None,
             cache: None,
         }
@@ -1052,6 +1067,9 @@ impl BuildMode {
 
     /// **B**: open or close the panel. Closing keeps the unfinished coaster for next time.
     pub fn toggle(&mut self) {
+        if self.is_naming() {
+            return;
+        }
         self.open = !self.open;
         self.message = None;
         if let Screen::Finishing(_) = self.screen {
@@ -1155,6 +1173,7 @@ impl BuildMode {
             "Station placed. Scroll to choose a piece, right-click to build it.".to_string(),
             Tone::Good,
         ));
+        self.draft_rev += 1;
         self.changed();
     }
 
@@ -1165,14 +1184,15 @@ impl BuildMode {
 
     /// Right-click while in the menu needs the player's place; the runtime calls `new_coaster`
     /// for that. Everything else is here: build a piece, or accept the finish.
-    pub fn confirm(&mut self, exists: impl Fn(&str) -> bool) -> Outcome {
+    pub fn confirm(&mut self) -> Outcome {
         match self.screen.clone() {
             Screen::Menu => Outcome::Nothing,
             Screen::Building => {
                 self.build();
                 Outcome::Nothing
             }
-            Screen::Finishing(plan) => self.accept_finish(&plan, exists),
+            Screen::Finishing(plan) => self.accept_finish(&plan),
+            Screen::Naming { .. } => Outcome::Nothing,
         }
     }
 
@@ -1213,6 +1233,7 @@ impl BuildMode {
         self.undo.push(step);
         self.redo.clear();
         self.message = Some(("Built.".to_string(), Tone::Good));
+        self.draft_rev += 1;
         self.changed();
     }
 
@@ -1234,6 +1255,7 @@ impl BuildMode {
         self.head = step.head;
         self.redo.push(step);
         self.message = Some(("Undone.".to_string(), Tone::Normal));
+        self.draft_rev += 1;
         self.changed();
     }
 
@@ -1255,6 +1277,7 @@ impl BuildMode {
         self.head = step.piece.end;
         self.undo.push(step);
         self.message = Some(("Redone.".to_string(), Tone::Normal));
+        self.draft_rev += 1;
         self.changed();
     }
 
@@ -1279,25 +1302,17 @@ impl BuildMode {
                 }
                 self.changed();
             }
-            Screen::Menu => {}
+            Screen::Menu | Screen::Naming { .. } => {}
         }
     }
 
     /// Right-click on the finish ghost: add it, close the loop, and check the ride like `create`.
-    fn accept_finish(&mut self, plan: &Finish, exists: impl Fn(&str) -> bool) -> Outcome {
+    fn accept_finish(&mut self, plan: &Finish) -> Outcome {
         let Some(ride) = self.ride.as_ref() else {
             return Outcome::Nothing;
         };
         let mut done = ride.clone();
         done.nodes.extend(plan.nodes.iter().cloned());
-        if exists(&done.id) {
-            self.message = Some((
-                format!("A ride called {} already exists.", done.id),
-                Tone::Red,
-            ));
-            self.changed();
-            return Outcome::Nothing;
-        }
         // The same checks as `/coaster create` (D65, D68), so the screen never promises more.
         let course = match course_from(&done) {
             Ok(c) => c,
@@ -1321,15 +1336,95 @@ impl BuildMode {
             self.changed();
             return Outcome::Nothing;
         }
-        // The coaster is complete: the next B starts a fresh menu.
-        self.ride = None;
-        self.screen = Screen::Menu;
-        self.undo.clear();
-        self.redo.clear();
-        self.open = false;
+        // The path is good: ask for the name, with the suggested one already typed in (D76).
         self.message = None;
+        let text = done.id.clone();
+        self.screen = Screen::Naming {
+            plan: plan.clone(),
+            text,
+            done: Box::new(done),
+            error: None,
+        };
         self.changed();
-        Outcome::Finished(done)
+        Outcome::Nothing
+    }
+
+    /// Is the panel asking for the ride's name?
+    pub fn is_naming(&self) -> bool {
+        matches!(self.screen, Screen::Naming { .. })
+    }
+
+    /// A key while naming (D76): letters, digits and `-` type, Backspace deletes, Enter confirms,
+    /// Escape goes back to the finish ghost. Returns the finished ride on Enter.
+    pub fn name_key(&mut self, key: &str, exists: impl Fn(&str) -> bool) -> Outcome {
+        let Screen::Naming {
+            plan,
+            done,
+            text,
+            error,
+        } = &mut self.screen
+        else {
+            return Outcome::Nothing;
+        };
+        let name = key.strip_prefix("key.keyboard.").unwrap_or("");
+        match name {
+            "escape" => {
+                let plan = plan.clone();
+                self.screen = Screen::Finishing(plan);
+                self.message = Some((
+                    "Finish path ready. Right-click to accept, any other key to cancel."
+                        .to_string(),
+                    Tone::Good,
+                ));
+                self.changed();
+            }
+            "backspace" => {
+                text.pop();
+                *error = None;
+                self.changed();
+            }
+            "enter" | "keypad.enter" => {
+                if let Err(why) = check_name(text) {
+                    *error = Some(why);
+                } else if exists(text) {
+                    *error = Some(format!("A ride called {text} already exists."));
+                } else {
+                    let mut ride = (**done).clone();
+                    ride.id = text.clone();
+                    // The coaster is complete: the next B starts a fresh menu.
+                    self.ride = None;
+                    self.screen = Screen::Menu;
+                    self.undo.clear();
+                    self.redo.clear();
+                    self.open = false;
+                    self.message = None;
+                    self.draft_rev += 1;
+                    self.changed();
+                    return Outcome::Finished(ride);
+                }
+                self.changed();
+            }
+            other => {
+                let typed = match other {
+                    "minus" => Some('-'),
+                    s if s.len() == 1
+                        && s.chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) =>
+                    {
+                        s.chars().next()
+                    }
+                    _ => None,
+                };
+                if let Some(c) = typed {
+                    if text.chars().count() < crate::game::htp_park::builder::MAX_NAME {
+                        text.push(c);
+                    }
+                    *error = None;
+                    self.changed();
+                }
+            }
+        }
+        Outcome::Nothing
     }
 
     /// The preview for the current settings, computed only when something changed.
@@ -1376,6 +1471,106 @@ impl BuildMode {
         });
     }
 
+    /// The unfinished coaster as a draft file (D76), or `None` when there is no coaster.
+    pub fn to_draft(&self) -> Option<DraftFile> {
+        let ride = self.ride.as_ref()?;
+        let head_file = |h: &Head| HeadFile {
+            pos: [h.pos.x, h.pos.y, h.pos.z],
+            heading: h.heading,
+            slope: h.slope,
+        };
+        Some(DraftFile {
+            format: FORMAT,
+            id: ride.id.clone(),
+            nodes: ride.nodes.clone(),
+            head: head_file(&self.head),
+            steps: self
+                .undo
+                .iter()
+                .map(|s| StepFile {
+                    added: s.piece.nodes.len(),
+                    start_kind: s.piece.start_kind,
+                    previous_kind: s.previous_kind,
+                    before: head_file(&s.head),
+                    after: head_file(&s.piece.end),
+                    radius: s.piece.radius,
+                })
+                .collect(),
+        })
+    }
+
+    /// Bring a saved draft back: the panel stays closed until the player presses B. The redo list
+    /// starts empty.
+    pub fn restore(&mut self, draft: DraftFile) {
+        let head = |h: &HeadFile| Head {
+            pos: DVec3::new(h.pos[0], h.pos[1], h.pos[2]),
+            heading: h.heading,
+            slope: h.slope,
+        };
+        let total: usize = draft.steps.iter().map(|s| s.added).sum();
+        let mut offset = draft.nodes.len() - total;
+        let mut undo = Vec::new();
+        for s in &draft.steps {
+            undo.push(Step {
+                piece: Piece {
+                    nodes: draft.nodes[offset..offset + s.added].to_vec(),
+                    start_kind: s.start_kind,
+                    end: head(&s.after),
+                    radius: s.radius,
+                },
+                head: head(&s.before),
+                previous_kind: s.previous_kind,
+            });
+            offset += s.added;
+        }
+        self.head = head(&draft.head);
+        self.ride = Some(RideFile::new(&draft.id, draft.nodes));
+        self.undo = undo;
+        self.redo.clear();
+        self.screen = Screen::Building;
+        self.open = false;
+        self.message = Some(("Your unfinished coaster is back.".to_string(), Tone::Good));
+        self.changed();
+    }
+
+    /// The station platform for the coaster being built (D60, S4): where its blocks go, or `None`
+    /// when there is no coaster.
+    pub fn platform(&self) -> Option<Platform> {
+        let ride = self.ride.as_ref()?;
+        let station = ride.nodes.get(..=STATION_NODES)?;
+        let at = |n: &NodeFile| DVec3::new(n.pos[0], n.pos[1], n.pos[2]);
+        let first = at(&station[0]);
+        let along = (at(&station[STATION_NODES]) - first).normalize_or_zero();
+        if along == DVec3::ZERO {
+            return None;
+        }
+        // The station is a straight run, so any loop through it has the same frames in the
+        // middle: lead-in and run-out nodes (never drawn) close one on paper.
+        let mut points = Vec::new();
+        for k in (1..=2).rev() {
+            points.push(first - along * (3.0 * f64::from(k)));
+        }
+        points.extend(station.iter().map(at));
+        let last = at(&station[STATION_NODES]);
+        for k in 1..=2 {
+            points.push(last + along * (3.0 * f64::from(k)));
+        }
+        let track = Track::closed(&points);
+        let table = Table::new_level(&track);
+        if table.is_empty() {
+            return None;
+        }
+        let node_s = node_distances(&track, &table);
+        let length = STATION_GAP * STATION_NODES as f64;
+        let stop = node_s[2] + length - STOP_MARGIN;
+        Some(render::station_platform(
+            &table,
+            stop,
+            cars_of(ride),
+            spacing_of(ride),
+        ))
+    }
+
     /// What the ghost looks like, for the runtime to draw (None when nothing is on show).
     pub fn ghost(&self) -> Option<Ghost> {
         if !self.open {
@@ -1399,7 +1594,7 @@ impl BuildMode {
                     is_finish: false,
                 })
             }
-            Screen::Finishing(plan) => Some(Ghost {
+            Screen::Finishing(plan) | Screen::Naming { plan, .. } => Some(Ghost {
                 lead_in,
                 new: plan.nodes.iter().map(|n| n.pos).collect(),
                 is_finish: true,
@@ -1440,6 +1635,20 @@ impl BuildMode {
                 }
                 return Some(Panel {
                     title: "Finish helper".to_string(),
+                    lines,
+                });
+            }
+            Screen::Naming { text, error, .. } => {
+                lines.push(line("Name your coaster:", Tone::Normal));
+                lines.push(line(format!("> {text}_"), Tone::Selected));
+                if let Some(why) = error {
+                    lines.push(line(why, Tone::Red));
+                }
+                lines.push(line("Letters, digits and - (up to 32)", Tone::Grey));
+                lines.push(line("Enter: open the ride", Tone::Normal));
+                lines.push(line("Backspace: delete  Esc: back", Tone::Grey));
+                return Some(Panel {
+                    title: "Name".to_string(),
                     lines,
                 });
             }
@@ -1645,10 +1854,10 @@ pub(crate) mod tests {
         let mut b = started();
         let start_nodes = b.ride().unwrap().nodes.clone();
         let head0 = b.head;
-        b.confirm(no_rides);
+        b.confirm();
         let after_one = b.ride().unwrap().nodes.clone();
         assert!(after_one.len() > start_nodes.len());
-        b.confirm(no_rides);
+        b.confirm();
         let after_two = b.ride().unwrap().nodes.clone();
         b.undo();
         assert_eq!(b.ride().unwrap().nodes, after_one);
@@ -1671,7 +1880,7 @@ pub(crate) mod tests {
         b.redo();
         // A new build clears the redo list.
         b.undo();
-        b.confirm(no_rides);
+        b.confirm();
         b.redo();
         assert!(
             b.panel()
@@ -1691,7 +1900,7 @@ pub(crate) mod tests {
         b.next_field(); // Element
         b.wheel(1.0); // Lift
         let before = b.ride().unwrap().nodes.clone();
-        b.confirm(no_rides);
+        b.confirm();
         let last_before = before.len() - 1;
         assert_eq!(b.ride().unwrap().nodes[last_before].kind, Kind::Lift);
         b.undo();
@@ -1707,7 +1916,7 @@ pub(crate) mod tests {
         b.next_field();
         b.wheel(1.0); // Turn 15
         let nodes = b.ride().unwrap().nodes.len();
-        b.confirm(no_rides);
+        b.confirm();
         assert_eq!(b.ride().unwrap().nodes.len(), nodes, "nothing built");
         let panel = b.panel().unwrap();
         assert!(
@@ -1771,7 +1980,7 @@ pub(crate) mod tests {
     #[test]
     fn closing_keeps_the_unfinished_coaster() {
         let mut b = started();
-        b.confirm(no_rides);
+        b.confirm();
         let n = b.ride().unwrap().nodes.len();
         b.toggle();
         b.toggle();
@@ -1790,7 +1999,7 @@ pub(crate) mod tests {
                 slope,
                 element,
             };
-            b.confirm(no_rides);
+            b.confirm();
         };
         let t = PieceType::SlopeChange;
         build(&mut b, t, 24, 0, 25, Kind::Lift);
@@ -1809,7 +2018,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn h_shows_the_finish_ghost_any_key_cancels_and_right_click_completes_the_ride() {
+    fn h_shows_the_finish_ghost_any_key_cancels_and_right_click_leads_to_naming() {
         let mut b = built_round_the_station();
         b.finish();
         if !b.is_finishing() {
@@ -1827,15 +2036,181 @@ pub(crate) mod tests {
         assert!(!b.is_finishing());
         b.finish();
         assert!(b.is_finishing());
-        // Accepting a name that already exists is refused.
-        assert_eq!(b.confirm(|_| true), Outcome::Nothing);
-        assert!(b.is_finishing());
-        let Outcome::Finished(ride) = b.confirm(no_rides) else {
-            panic!("the ride did not finish");
+        // Accepting does not finish yet: the panel asks for the name, with coaster-1 typed in.
+        assert_eq!(b.confirm(), Outcome::Nothing);
+        assert!(b.is_naming());
+        let text: Vec<String> = b
+            .panel()
+            .unwrap()
+            .lines
+            .iter()
+            .map(|l| l.text.clone())
+            .collect();
+        assert!(text.iter().any(|t| t == "> coaster-1_"), "{text:?}");
+        assert!(b.ghost().unwrap().is_finish, "the path stays on show");
+    }
+
+    fn typed(b: &mut BuildMode, keys: &[&str]) -> Outcome {
+        let mut out = Outcome::Nothing;
+        for k in keys {
+            out = b.name_key(&format!("key.keyboard.{k}"), no_rides);
+        }
+        out
+    }
+
+    #[test]
+    fn naming_types_letters_digits_and_dashes_backspace_deletes_enter_finishes() {
+        let mut b = built_round_the_station();
+        b.finish();
+        b.confirm();
+        // Clear the suggestion (9 characters), then type a new name.
+        typed(&mut b, &["backspace"; 9]);
+        typed(
+            &mut b,
+            &[
+                "t", "h", "u", "n", "d", "e", "r", "minus", "2", "shift", "f1",
+            ],
+        );
+        let text: Vec<String> = b
+            .panel()
+            .unwrap()
+            .lines
+            .iter()
+            .map(|l| l.text.clone())
+            .collect();
+        assert!(text.iter().any(|t| t == "> thunder-2_"), "{text:?}");
+        let Outcome::Finished(ride) = typed(&mut b, &["enter"]) else {
+            panic!("did not finish");
         };
-        assert_eq!(ride.id, "coaster-1");
+        assert_eq!(ride.id, "thunder-2");
         assert!(course_from(&ride).is_ok());
-        assert!(b.in_menu() && b.ride().is_none());
+        assert!(b.in_menu() && b.ride().is_none() && !b.is_open());
+    }
+
+    #[test]
+    fn a_refused_name_shows_a_red_reason_and_a_taken_name_too() {
+        let mut b = built_round_the_station();
+        b.finish();
+        b.confirm();
+        typed(&mut b, &["backspace"; 9]);
+        // Empty name.
+        assert_eq!(typed(&mut b, &["enter"]), Outcome::Nothing);
+        let panel = b.panel().unwrap();
+        assert!(panel.lines.iter().any(|l| l.tone == Tone::Red), "{panel:?}");
+        // "demo" is reserved (S1 rules).
+        typed(&mut b, &["d", "e", "m", "o", "enter"]);
+        assert!(b.is_naming());
+        // A name already used by another ride.
+        typed(&mut b, &["backspace"; 4]);
+        typed(&mut b, &["a", "b"]);
+        assert_eq!(
+            b.name_key("key.keyboard.enter", |n| n == "ab"),
+            Outcome::Nothing
+        );
+        let red: Vec<String> = b
+            .panel()
+            .unwrap()
+            .lines
+            .iter()
+            .filter(|l| l.tone == Tone::Red)
+            .map(|l| l.text.clone())
+            .collect();
+        assert!(red.iter().any(|t| t.contains("already exists")), "{red:?}");
+        // Typing clears the red line; the length stops at 32.
+        typed(&mut b, &["x"; 40]);
+        let text: Vec<String> = b
+            .panel()
+            .unwrap()
+            .lines
+            .iter()
+            .map(|l| l.text.clone())
+            .collect();
+        assert!(
+            text.iter().any(|t| t.chars().count() == 2 + 32 + 1),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn escape_goes_back_to_the_finish_ghost_and_b_is_just_a_letter_while_naming() {
+        let mut b = built_round_the_station();
+        b.finish();
+        b.confirm();
+        b.toggle(); // ignored while naming
+        assert!(b.is_open() && b.is_naming());
+        typed(&mut b, &["b"]);
+        let text: Vec<String> = b
+            .panel()
+            .unwrap()
+            .lines
+            .iter()
+            .map(|l| l.text.clone())
+            .collect();
+        assert!(text.iter().any(|t| t == "> coaster-1b_"), "{text:?}");
+        typed(&mut b, &["escape"]);
+        assert!(b.is_finishing() && !b.is_naming());
+    }
+
+    #[test]
+    fn a_draft_restores_the_coaster_and_z_still_undoes_the_pieces() {
+        let mut b = started();
+        b.confirm();
+        b.confirm();
+        let rev = b.draft_rev;
+        let before = b.ride().unwrap().nodes.clone();
+        let draft = b.to_draft().unwrap();
+        assert_eq!(draft.steps.len(), 2);
+        let mut c = BuildMode::new();
+        c.restore(draft);
+        assert!(!c.is_open(), "the panel waits for B");
+        assert_eq!(c.ride().unwrap().nodes, before);
+        assert_eq!(c.head, b.head);
+        c.toggle();
+        c.undo();
+        c.undo();
+        let station: Vec<NodeFile> = before[..4].to_vec();
+        assert_eq!(c.ride().unwrap().nodes, station);
+        assert_eq!(c.ride().unwrap().id, "coaster-1");
+        // Undo is a change to the draft, so it gets saved again.
+        assert!(c.draft_rev > 0 && rev > 0);
+    }
+
+    #[test]
+    fn the_draft_revision_moves_on_for_build_undo_redo_and_new_but_not_for_the_wheel() {
+        let mut b = started();
+        let r0 = b.draft_rev;
+        b.wheel(1.0);
+        b.next_field();
+        assert_eq!(b.draft_rev, r0);
+        b.confirm();
+        let r1 = b.draft_rev;
+        assert!(r1 > r0);
+        b.undo();
+        let r2 = b.draft_rev;
+        assert!(r2 > r1);
+        b.redo();
+        assert!(b.draft_rev > r2);
+        assert!(BuildMode::new().to_draft().is_none());
+    }
+
+    #[test]
+    fn the_station_platform_is_two_blocks_wide_beside_the_station_and_below_the_rails() {
+        let b = started(); // facing south from (100.3, 64, 200.7)
+        let p = b.platform().unwrap();
+        // Facing south (+Z) the left side is east (+X): the platform is 2 blocks wide on that side.
+        let rail_x = b.ride().unwrap().nodes[0].pos[0];
+        assert_eq!(p.max[0] - p.min[0] + 1, 2);
+        assert!(f64::from(p.min[0]) > rail_x, "{p:?} vs {rail_x}");
+        assert_eq!(p.min[1], p.max[1]);
+        let rail_y = b.ride().unwrap().nodes[0].pos[1];
+        assert!(
+            f64::from(p.max[1]) + 1.0 < rail_y,
+            "the top is below the rails"
+        );
+        // It runs along the station, about as long as three cars.
+        let length = p.max[2] - p.min[2] + 1;
+        assert!((8..=12).contains(&length), "{length}");
+        assert!(BuildMode::new().platform().is_none());
     }
 
     #[test]
@@ -7525,14 +7900,12 @@ impl Ride {
         let physics = builder::physics_of(&file);
         let train = builder::train_of(&file, &course);
         let dwell = file.settings.dwell;
-        Ok(Ride::new(
-            file.id.clone(),
-            Some(file),
-            course,
-            physics,
-            train,
-            dwell,
-        ))
+        let platform = file
+            .platform
+            .map(|[min, max]| render::Platform { min, max });
+        let mut ride = Ride::new(file.id.clone(), Some(file), course, physics, train, dwell);
+        ride.platform = platform;
+        Ok(ride)
     }
 
     /// The pose of seat `index` when the front car is at `front`.
@@ -7782,6 +8155,13 @@ pub struct Runtime {
     ghost_drawn_at: u64,
     /// Are there ghost pieces in the world right now?
     ghost_present: bool,
+    /// The host player (the first player seen), whose draft this is (D76).
+    draft_owner: Option<u128>,
+    /// Has the draft file been looked for yet? And the `draft_rev` that is on disk.
+    draft_checked: bool,
+    draft_saved_rev: u64,
+    /// The station platform of the coaster being built, as placed in the world (S4).
+    placed_platform: Option<render::Platform>,
     /// Ticks since the world opened.
     now: u64,
     /// The last `delete` that is waiting to be repeated: player, ride, tick (S3).
@@ -7819,6 +8199,10 @@ impl Runtime {
             ghost_version: u64::MAX,
             ghost_drawn_at: 0,
             ghost_present: false,
+            draft_owner: None,
+            draft_checked: false,
+            draft_saved_rev: 0,
+            placed_platform: None,
             now: 0,
             pending_delete: None,
             park_dirty: false,
@@ -7838,6 +8222,10 @@ impl Runtime {
         self.build.reset();
         self.ghost_version = u64::MAX;
         self.ghost_present = false;
+        self.draft_owner = None;
+        self.draft_checked = false;
+        self.draft_saved_rev = 0;
+        self.placed_platform = None;
         self.pending_delete = None;
         self.cleanup_pending = true;
         self.loaded = false;
@@ -7856,6 +8244,11 @@ impl Runtime {
             host.world_dir()
         ));
         self.save_dirty(host);
+        if let (Some(dir), Some(owner)) = (self.world.clone(), self.draft_owner)
+            && self.draft_checked
+        {
+            self.write_draft(host, &dir, owner);
+        }
     }
 
     /// The track wand was used (a hook heard it). The work is queued for the next tick: commands
@@ -7883,6 +8276,17 @@ impl Runtime {
     /// A key went down (`key.keyboard.b`). B opens and closes the panel; while it is open R, Z,
     /// Y and H do their jobs and any other key cancels the finish ghost.
     pub fn build_key(&mut self, key: &str) {
+        // While the panel asks for a name, every key is typing (D76). The game cannot be told to
+        // ignore them, so W/A/S/D still walk and E still opens the inventory.
+        if self.build.is_naming() {
+            let rides = &self.rides;
+            let locked = &self.locked;
+            let outcome = self.build.name_key(key, |id| {
+                rides.iter().any(|r| r.id == id) || locked.iter().any(|l| l == id)
+            });
+            self.finished(outcome);
+            return;
+        }
         match key {
             "key.keyboard.b" => self.build.toggle(),
             _ if !self.build.is_open() => {}
@@ -7927,14 +8331,83 @@ impl Runtime {
             self.build.new_coaster(&format!("coaster-{n}"), feet, yaw);
             return;
         }
-        let rides = &self.rides;
-        let locked = &self.locked;
-        let outcome = self
-            .build
-            .confirm(|id| rides.iter().any(|r| r.id == id) || locked.iter().any(|l| l == id));
-        if let Outcome::Finished(ride) = outcome {
+        let outcome = self.build.confirm();
+        self.finished(outcome);
+    }
+
+    /// A ride was finished on screen: it takes the station platform that was placed for it, and
+    /// is queued to be saved and opened like `create`.
+    fn finished(&mut self, outcome: Outcome) {
+        if let Outcome::Finished(mut ride) = outcome {
+            ride.platform = self.placed_platform.take().map(|p| [p.min, p.max]);
             self.orders.push_back(Order::BuiltRide { ride });
         }
+    }
+
+    /// Keep the draft file in step with the unfinished coaster (D76): load it once when the
+    /// world is ready, write it after every build, undo or redo, delete it when the coaster is
+    /// finished.
+    fn draft_sync<H: Host>(&mut self, host: &mut H, players: &[PlayerInfo]) {
+        let Some(dir) = self.world.clone() else {
+            return;
+        };
+        if self.draft_owner.is_none() {
+            self.draft_owner = players.first().map(|p| p.uuid);
+        }
+        let Some(owner) = self.draft_owner else {
+            return;
+        };
+        if !self.draft_checked {
+            self.draft_checked = true;
+            match save::load_draft(&dir, owner) {
+                Ok(Some(draft)) => {
+                    self.build.restore(draft);
+                    self.placed_platform = self.build.platform();
+                    host.tell(
+                        owner,
+                        "Your unfinished coaster is back. Press B to carry on building.",
+                    );
+                }
+                Ok(None) => {}
+                Err(why) => host.tell(owner, &why),
+            }
+            self.draft_saved_rev = self.build.draft_rev;
+            return;
+        }
+        self.write_draft(host, &dir, owner);
+    }
+
+    /// Write (or delete) the draft if it changed since the last time.
+    fn write_draft<H: Host>(&mut self, host: &mut H, dir: &std::path::Path, owner: u128) {
+        if self.build.draft_rev == self.draft_saved_rev {
+            return;
+        }
+        self.draft_saved_rev = self.build.draft_rev;
+        match self.build.to_draft() {
+            Some(draft) => {
+                if let Err(why) = save::save_draft(dir, owner, &draft) {
+                    host.broadcast(&format!("Horizon Theme Park: {why}"));
+                }
+            }
+            None => save::delete_draft(dir, owner),
+        }
+    }
+
+    /// Place, move or remove the station platform of the coaster being built (S4).
+    fn platform_display(&mut self) {
+        let wanted = self.build.platform();
+        if wanted == self.placed_platform {
+            return;
+        }
+        if let Some(old) = self.placed_platform {
+            self.build_queue
+                .push_back(commands::fill(old.min, old.max, "minecraft:air"));
+        }
+        if let Some(new) = wanted {
+            self.build_queue
+                .push_back(commands::fill(new.min, new.max, commands::PLATFORM_BLOCK));
+        }
+        self.placed_platform = wanted;
     }
 
     /// The panel text for the HUD (None when closed). Works the preview out only when something
@@ -8188,6 +8661,8 @@ impl Runtime {
         }
         self.wand_display(host, &players);
         self.ghost_display();
+        self.platform_display();
+        self.draft_sync(host, &players);
         self.sweep(host, &players);
         self.save_dirty(host);
     }
@@ -8394,6 +8869,9 @@ impl Runtime {
         {
             file.settings = old.settings.clone();
             file.trains = old.trains.clone();
+            if file.platform.is_none() {
+                file.platform = old.platform;
+            }
         }
         let id = file.id.clone();
         match self.install(host, file) {
@@ -8426,6 +8904,9 @@ impl Runtime {
             return;
         };
         host.run(&commands::kill_ride(id));
+        if let Some(platform) = self.rides[i].platform {
+            host.run(&commands::fill(platform.min, platform.max, "minecraft:air"));
+        }
         self.rides.remove(i);
         self.park_dirty = true;
         if let Some(dir) = &self.world
@@ -9534,7 +10015,14 @@ mod tests {
             drawn.iter().any(|c| c.contains("htp:ghost_rail")),
             "the finish path is drawn as ghost rails"
         );
-        click(&mut rt);
+        click(&mut rt); // accept the path: the panel asks for the name
+        assert!(rt.build.is_naming());
+        for key in ["backspace"; 9] {
+            rt.build_key(&format!("key.keyboard.{key}"));
+        }
+        for key in ["m", "a", "g", "i", "c", "minus", "1", "enter"] {
+            rt.build_key(&format!("key.keyboard.{key}"));
+        }
         for _ in 0..3 {
             rt.tick(&mut host);
         }
@@ -9542,16 +10030,134 @@ mod tests {
         assert!(
             dir.join("horizon-theme-park")
                 .join("rides")
-                .join("coaster-1.json")
+                .join("magic-1.json")
                 .exists(),
             "and saved"
         );
         assert!(!rt.build_open(), "the panel closes when the ride opens");
         let told: Vec<String> = host.tells.iter().map(|(_, t)| t.clone()).collect();
         assert!(
-            told.iter().any(|t| t.contains("Ride coaster-1 is built")),
+            told.iter().any(|t| t.contains("Ride magic-1 is built")),
             "{told:?}"
         );
+    }
+
+    #[test]
+    fn a_new_coaster_places_its_platform_and_the_draft_is_saved_restored_and_deleted() {
+        let (mut rt, mut host, dir) = world_with("builder-draft", &[], bystander());
+        rt.tick(&mut host);
+        host.take_commands();
+        let draft = save::draft_path(&dir, 1);
+        rt.build_key("key.keyboard.b");
+        click(&mut rt); // New coaster
+        click(&mut rt); // one piece
+        rt.tick(&mut host);
+        rt.tick(&mut host);
+        let sent = host.take_commands();
+        // The station platform: a fill of smooth stone, once.
+        let fills: Vec<&String> = sent.iter().filter(|c| c.starts_with("fill ")).collect();
+        assert_eq!(fills.len(), 1, "{fills:?}");
+        assert!(fills[0].ends_with(commands::PLATFORM_BLOCK), "{fills:?}");
+        // The draft is written after the build.
+        assert!(draft.exists(), "{draft:?}");
+        let nodes_on_disk = save::load_draft(&dir, 1).unwrap().unwrap().nodes.len();
+        assert_eq!(nodes_on_disk, rt.build.ride().unwrap().nodes.len());
+        // Undo is saved too.
+        rt.build_key("key.keyboard.z");
+        rt.tick(&mut host);
+        assert_eq!(save::load_draft(&dir, 1).unwrap().unwrap().nodes.len(), 4);
+        // Settings changes alone write nothing.
+        let modified = std::fs::metadata(&draft).unwrap().modified().unwrap();
+        rt.build_wheel(1.0);
+        rt.tick(&mut host);
+        assert_eq!(
+            std::fs::metadata(&draft).unwrap().modified().unwrap(),
+            modified
+        );
+
+        // A new session of the world: the draft comes back and the player is told.
+        let mut again = Runtime::new();
+        host.commands.retain(|c| !c.starts_with("fill "));
+        again.world_opened();
+        again.tick(&mut host);
+        again.tick(&mut host);
+        assert_eq!(again.build.ride().unwrap().nodes.len(), 4);
+        assert!(!again.build_open(), "it waits for B");
+        assert!(
+            host.tells
+                .iter()
+                .any(|(_, t)| t.contains("unfinished coaster is back"))
+        );
+        let fills_after = host
+            .commands
+            .iter()
+            .filter(|c| c.starts_with("fill "))
+            .count();
+        assert_eq!(
+            fills_after, 0,
+            "its platform is already in the world, so none is placed again"
+        );
+        again.build_key("key.keyboard.b");
+        assert!(again.build_open());
+    }
+
+    #[test]
+    fn a_broken_draft_does_not_crash_it_is_kept_aside_and_the_player_is_told() {
+        let (mut rt, mut host, dir) = world_with("builder-broken-draft", &[], bystander());
+        let draft = save::draft_path(&dir, 1);
+        std::fs::create_dir_all(draft.parent().unwrap()).unwrap();
+        std::fs::write(&draft, "{ not json").unwrap();
+        rt.world_opened();
+        rt.tick(&mut host);
+        rt.tick(&mut host);
+        assert!(rt.build.ride().is_none());
+        assert!(
+            host.tells.iter().any(|(_, t)| t.contains(".broken")),
+            "{:?}",
+            host.tells
+        );
+        assert!(!draft.exists());
+    }
+
+    #[test]
+    fn finishing_deletes_the_draft_and_the_ride_keeps_its_platform_until_it_is_deleted() {
+        let (mut rt, mut host, dir) = world_with("builder-platform", &[], bystander());
+        rt.tick(&mut host);
+        host.take_commands();
+        rt.build = crate::game::htp_park::buildmode::tests::built_round_the_station();
+        rt.platform_display();
+        let platform = rt
+            .placed_platform
+            .expect("the platform of the built station");
+        // Make the draft exist, as it would have after the builds.
+        rt.build.draft_rev += 1;
+        rt.tick(&mut host);
+        assert!(save::draft_path(&dir, 1).exists());
+        rt.build_key("key.keyboard.h");
+        click(&mut rt);
+        rt.build_key("key.keyboard.enter");
+        for _ in 0..4 {
+            rt.tick(&mut host);
+        }
+        assert_eq!(rt.rides.len(), 1);
+        assert!(!save::draft_path(&dir, 1).exists(), "the draft is gone");
+        assert_eq!(
+            rt.rides[0].platform,
+            Some(platform),
+            "the ride owns the platform"
+        );
+        let saved = save::load_all(&dir).rides;
+        assert_eq!(saved[0].platform, Some([platform.min, platform.max]));
+        // Deleting the ride (typed twice) clears exactly those blocks.
+        host.take_commands();
+        rt.command("coaster delete coaster-1", caller());
+        rt.command("coaster delete coaster-1", caller());
+        rt.tick(&mut host);
+        assert!(host.take_commands().contains(&commands::fill(
+            platform.min,
+            platform.max,
+            "minecraft:air"
+        )));
     }
 
     #[test]
@@ -10050,6 +10656,10 @@ pub struct RideFile {
     pub settings: SettingsFile,
     pub nodes: Vec<NodeFile>,
     pub trains: Vec<TrainFile>,
+    /// The station platform's two corner blocks (D60), when the on-screen builder placed one, so
+    /// deleting the ride can take exactly those blocks away again. Old files have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<[[i32; 3]; 2]>,
 }
 
 impl RideFile {
@@ -10065,6 +10675,7 @@ impl RideFile {
                 cars: 3,
                 spacing: CAR_SPACING,
             }],
+            platform: None,
         }
     }
 }
@@ -10122,6 +10733,15 @@ pub fn rides_dir(world: &Path) -> PathBuf {
 /// `<world>/horizon-theme-park/park.json`
 pub fn park_path(world: &Path) -> PathBuf {
     world.join(FOLDER).join("park.json")
+}
+
+/// `<world>/horizon-theme-park/drafts/<player-uuid-hex>.json` (D76): a coaster that is not
+/// finished yet.
+pub fn draft_path(world: &Path, player: u128) -> PathBuf {
+    world
+        .join(FOLDER)
+        .join("drafts")
+        .join(format!("{player:032x}.json"))
 }
 
 /// `<world>/horizon-theme-park/rides/<id>.json`
@@ -10568,6 +11188,212 @@ mod tests {
         assert_eq!(load_park(&world), Ok(park));
         fs::write(park_path(&world), r#"{"format":9}"#).unwrap();
         assert!(matches!(load_park(&world), Err(LoadError::Newer { .. })));
+    }
+}
+
+// ---- drafts (D76) ----
+
+/// Where the track's end is and which way it points, as saved.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct HeadFile {
+    pub pos: [f64; 3],
+    pub heading: f64,
+    pub slope: f64,
+}
+
+/// One built piece of a draft, so Z can still undo it after the world was closed. The piece's
+/// nodes are `added` consecutive nodes of the draft's list, in order of building.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct StepFile {
+    pub added: usize,
+    /// The kind the node before the piece took, and the kind it had before.
+    pub start_kind: Kind,
+    pub previous_kind: Kind,
+    pub before: HeadFile,
+    pub after: HeadFile,
+    pub radius: Option<f64>,
+}
+
+/// A coaster that is still being built with the on-screen builder.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DraftFile {
+    pub format: u32,
+    /// The name it would get, `coaster-3`.
+    pub id: String,
+    pub nodes: Vec<NodeFile>,
+    pub head: HeadFile,
+    /// Oldest first; the last can be undone first.
+    pub steps: Vec<StepFile>,
+}
+
+/// Write the draft of `player` (same careful write as a ride, D20).
+pub fn save_draft(world: &Path, player: u128, draft: &DraftFile) -> Result<(), String> {
+    let path = draft_path(world, player);
+    if let Ok(old) = fs::read_to_string(&path)
+        && let Err(LoadError::Newer { found, known }) = read_format(&old)
+    {
+        return Err(format!(
+            "your unfinished coaster was saved by a newer version of the mod (format {found}, this one knows {known}); it was not overwritten"
+        ));
+    }
+    let text = serde_json::to_string_pretty(draft).map_err(|e| e.to_string())?;
+    write_safely(&path, &text).map_err(|e| format!("could not save your unfinished coaster: {e}"))
+}
+
+/// Read one draft file and check it hangs together.
+fn parse_draft(path: &Path) -> Result<DraftFile, LoadError> {
+    let text = fs::read_to_string(path).map_err(|e| LoadError::Unreadable(e.to_string()))?;
+    let (value, _) = read_format(&text)?;
+    let draft: DraftFile =
+        serde_json::from_value(value).map_err(|e| LoadError::Broken(e.to_string()))?;
+    if draft
+        .nodes
+        .iter()
+        .any(|n| n.pos.iter().any(|c| !c.is_finite()))
+    {
+        return Err(LoadError::Broken("a node is not a number".to_string()));
+    }
+    let added: usize = draft.steps.iter().map(|s| s.added).sum();
+    if added >= draft.nodes.len() {
+        return Err(LoadError::Broken(
+            "the pieces do not fit the nodes".to_string(),
+        ));
+    }
+    Ok(draft)
+}
+
+/// Read the draft of `player`. `Ok(None)` when there is none. A broken file is moved aside to
+/// `<file>.broken` (and the backup tried) so the mod never crashes on it and never loses it.
+pub fn load_draft(world: &Path, player: u128) -> Result<Option<DraftFile>, String> {
+    let path = draft_path(world, player);
+    if !path.exists() {
+        return Ok(None);
+    }
+    match parse_draft(&path) {
+        Ok(draft) => Ok(Some(draft)),
+        Err(LoadError::Broken(why)) => {
+            let broken = with_suffix(&path, ".broken");
+            let _ = fs::rename(&path, &broken);
+            match parse_draft(&with_suffix(&path, ".bak")) {
+                Ok(draft) => Ok(Some(draft)),
+                Err(_) => Err(format!(
+                    "your unfinished coaster could not be read ({why}); the file was kept as {}",
+                    broken
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                )),
+            }
+        }
+        Err(other) => Err(format!(
+            "your unfinished coaster could not be read: {other}"
+        )),
+    }
+}
+
+/// Delete the draft of `player` and its backup (the coaster was finished).
+pub fn delete_draft(world: &Path, player: u128) {
+    let path = draft_path(world, player);
+    let _ = fs::remove_file(with_suffix(&path, ".bak"));
+    let _ = fs::remove_file(&path);
+}
+
+#[cfg(test)]
+mod draft_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("htp-test-draft-{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn node(z: f64, kind: Kind) -> NodeFile {
+        NodeFile {
+            pos: [0.0, 70.0, z],
+            roll: 0.0,
+            kind,
+        }
+    }
+
+    fn draft() -> DraftFile {
+        let head = HeadFile {
+            pos: [0.0, 70.0, 5.0],
+            heading: 90.0,
+            slope: 5.0,
+        };
+        DraftFile {
+            format: FORMAT,
+            id: "coaster-2".to_string(),
+            nodes: vec![node(0.0, Kind::Station), node(5.0, Kind::Track)],
+            head,
+            steps: vec![StepFile {
+                added: 1,
+                start_kind: Kind::Track,
+                previous_kind: Kind::Station,
+                before: head,
+                after: head,
+                radius: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_draft_round_trips_and_is_named_after_the_players_hex_uuid() {
+        let dir = scratch("round");
+        assert_eq!(load_draft(&dir, 0xAB).unwrap(), None);
+        save_draft(&dir, 0xAB, &draft()).unwrap();
+        let path = draft_path(&dir, 0xAB);
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name, "000000000000000000000000000000ab.json");
+        assert_eq!(load_draft(&dir, 0xAB).unwrap(), Some(draft()));
+        // A second save keeps a backup; deleting removes both.
+        save_draft(&dir, 0xAB, &draft()).unwrap();
+        assert!(with_suffix(&path, ".bak").exists());
+        delete_draft(&dir, 0xAB);
+        assert_eq!(load_draft(&dir, 0xAB).unwrap(), None);
+        assert!(!with_suffix(&path, ".bak").exists());
+    }
+
+    #[test]
+    fn a_broken_draft_is_kept_aside_and_the_backup_is_used_when_there_is_one() {
+        let dir = scratch("broken");
+        save_draft(&dir, 7, &draft()).unwrap();
+        save_draft(&dir, 7, &draft()).unwrap(); // now there is a .bak
+        let path = draft_path(&dir, 7);
+        fs::write(&path, "{ this is not json").unwrap();
+        assert_eq!(
+            load_draft(&dir, 7).unwrap(),
+            Some(draft()),
+            "the backup is used"
+        );
+        assert!(
+            with_suffix(&path, ".broken").exists(),
+            "the damaged file is kept"
+        );
+    }
+
+    #[test]
+    fn a_broken_draft_with_no_backup_is_an_error_that_says_where_it_went_not_a_crash() {
+        let dir = scratch("broken2");
+        let path = draft_path(&dir, 7);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{\"format\":1,\"id\":3}").unwrap();
+        let error = load_draft(&dir, 7).unwrap_err();
+        assert!(error.contains(".broken"), "{error}");
+        assert!(with_suffix(&path, ".broken").exists());
+        assert_eq!(load_draft(&dir, 7).unwrap(), None, "and the way is clear");
+    }
+
+    #[test]
+    fn a_newer_draft_is_not_overwritten() {
+        let dir = scratch("newer");
+        let path = draft_path(&dir, 9);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{\"format\":99}").unwrap();
+        assert!(save_draft(&dir, 9, &draft()).unwrap_err().contains("newer"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"format\":99}");
     }
 }
 }

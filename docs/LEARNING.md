@@ -461,3 +461,5 @@ A tool that draws the last part of the track for you, smoothly back into the sta
 - **Cache**: remembering an answer so we don't work it out again every frame. The HUD redraws 60 times a second, but the dry run only reruns when you change a setting.
 - **Claiming a click**: telling the game "I handled this one", so it does not also place a block or open a chest. While the builder is open we claim right-clicks.
 - **Throttle**: a speed limit on how often something may happen. The ghost is redrawn at most 4 times a second so it never floods the game with commands.
+- **Draft**: a coaster you have not finished. It is saved to its own small file after every build, undo and redo, so closing the game loses nothing. Finishing the coaster deletes the draft.
+- **`.broken` file**: when a save file is damaged we rename it (instead of deleting it or crashing), so you can still look inside it.

@@ -100,6 +100,10 @@ pub struct RideFile {
     pub settings: SettingsFile,
     pub nodes: Vec<NodeFile>,
     pub trains: Vec<TrainFile>,
+    /// The station platform's two corner blocks (D60), when the on-screen builder placed one, so
+    /// deleting the ride can take exactly those blocks away again. Old files have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<[[i32; 3]; 2]>,
 }
 
 impl RideFile {
@@ -115,6 +119,7 @@ impl RideFile {
                 cars: 3,
                 spacing: CAR_SPACING,
             }],
+            platform: None,
         }
     }
 }
@@ -172,6 +177,15 @@ pub fn rides_dir(world: &Path) -> PathBuf {
 /// `<world>/horizon-theme-park/park.json`
 pub fn park_path(world: &Path) -> PathBuf {
     world.join(FOLDER).join("park.json")
+}
+
+/// `<world>/horizon-theme-park/drafts/<player-uuid-hex>.json` (D76): a coaster that is not
+/// finished yet.
+pub fn draft_path(world: &Path, player: u128) -> PathBuf {
+    world
+        .join(FOLDER)
+        .join("drafts")
+        .join(format!("{player:032x}.json"))
 }
 
 /// `<world>/horizon-theme-park/rides/<id>.json`
@@ -618,5 +632,211 @@ mod tests {
         assert_eq!(load_park(&world), Ok(park));
         fs::write(park_path(&world), r#"{"format":9}"#).unwrap();
         assert!(matches!(load_park(&world), Err(LoadError::Newer { .. })));
+    }
+}
+
+// ---- drafts (D76) ----
+
+/// Where the track's end is and which way it points, as saved.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct HeadFile {
+    pub pos: [f64; 3],
+    pub heading: f64,
+    pub slope: f64,
+}
+
+/// One built piece of a draft, so Z can still undo it after the world was closed. The piece's
+/// nodes are `added` consecutive nodes of the draft's list, in order of building.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct StepFile {
+    pub added: usize,
+    /// The kind the node before the piece took, and the kind it had before.
+    pub start_kind: Kind,
+    pub previous_kind: Kind,
+    pub before: HeadFile,
+    pub after: HeadFile,
+    pub radius: Option<f64>,
+}
+
+/// A coaster that is still being built with the on-screen builder.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DraftFile {
+    pub format: u32,
+    /// The name it would get, `coaster-3`.
+    pub id: String,
+    pub nodes: Vec<NodeFile>,
+    pub head: HeadFile,
+    /// Oldest first; the last can be undone first.
+    pub steps: Vec<StepFile>,
+}
+
+/// Write the draft of `player` (same careful write as a ride, D20).
+pub fn save_draft(world: &Path, player: u128, draft: &DraftFile) -> Result<(), String> {
+    let path = draft_path(world, player);
+    if let Ok(old) = fs::read_to_string(&path)
+        && let Err(LoadError::Newer { found, known }) = read_format(&old)
+    {
+        return Err(format!(
+            "your unfinished coaster was saved by a newer version of the mod (format {found}, this one knows {known}); it was not overwritten"
+        ));
+    }
+    let text = serde_json::to_string_pretty(draft).map_err(|e| e.to_string())?;
+    write_safely(&path, &text).map_err(|e| format!("could not save your unfinished coaster: {e}"))
+}
+
+/// Read one draft file and check it hangs together.
+fn parse_draft(path: &Path) -> Result<DraftFile, LoadError> {
+    let text = fs::read_to_string(path).map_err(|e| LoadError::Unreadable(e.to_string()))?;
+    let (value, _) = read_format(&text)?;
+    let draft: DraftFile =
+        serde_json::from_value(value).map_err(|e| LoadError::Broken(e.to_string()))?;
+    if draft
+        .nodes
+        .iter()
+        .any(|n| n.pos.iter().any(|c| !c.is_finite()))
+    {
+        return Err(LoadError::Broken("a node is not a number".to_string()));
+    }
+    let added: usize = draft.steps.iter().map(|s| s.added).sum();
+    if added >= draft.nodes.len() {
+        return Err(LoadError::Broken(
+            "the pieces do not fit the nodes".to_string(),
+        ));
+    }
+    Ok(draft)
+}
+
+/// Read the draft of `player`. `Ok(None)` when there is none. A broken file is moved aside to
+/// `<file>.broken` (and the backup tried) so the mod never crashes on it and never loses it.
+pub fn load_draft(world: &Path, player: u128) -> Result<Option<DraftFile>, String> {
+    let path = draft_path(world, player);
+    if !path.exists() {
+        return Ok(None);
+    }
+    match parse_draft(&path) {
+        Ok(draft) => Ok(Some(draft)),
+        Err(LoadError::Broken(why)) => {
+            let broken = with_suffix(&path, ".broken");
+            let _ = fs::rename(&path, &broken);
+            match parse_draft(&with_suffix(&path, ".bak")) {
+                Ok(draft) => Ok(Some(draft)),
+                Err(_) => Err(format!(
+                    "your unfinished coaster could not be read ({why}); the file was kept as {}",
+                    broken
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                )),
+            }
+        }
+        Err(other) => Err(format!(
+            "your unfinished coaster could not be read: {other}"
+        )),
+    }
+}
+
+/// Delete the draft of `player` and its backup (the coaster was finished).
+pub fn delete_draft(world: &Path, player: u128) {
+    let path = draft_path(world, player);
+    let _ = fs::remove_file(with_suffix(&path, ".bak"));
+    let _ = fs::remove_file(&path);
+}
+
+#[cfg(test)]
+mod draft_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("htp-test-draft-{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn node(z: f64, kind: Kind) -> NodeFile {
+        NodeFile {
+            pos: [0.0, 70.0, z],
+            roll: 0.0,
+            kind,
+        }
+    }
+
+    fn draft() -> DraftFile {
+        let head = HeadFile {
+            pos: [0.0, 70.0, 5.0],
+            heading: 90.0,
+            slope: 5.0,
+        };
+        DraftFile {
+            format: FORMAT,
+            id: "coaster-2".to_string(),
+            nodes: vec![node(0.0, Kind::Station), node(5.0, Kind::Track)],
+            head,
+            steps: vec![StepFile {
+                added: 1,
+                start_kind: Kind::Track,
+                previous_kind: Kind::Station,
+                before: head,
+                after: head,
+                radius: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_draft_round_trips_and_is_named_after_the_players_hex_uuid() {
+        let dir = scratch("round");
+        assert_eq!(load_draft(&dir, 0xAB).unwrap(), None);
+        save_draft(&dir, 0xAB, &draft()).unwrap();
+        let path = draft_path(&dir, 0xAB);
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name, "000000000000000000000000000000ab.json");
+        assert_eq!(load_draft(&dir, 0xAB).unwrap(), Some(draft()));
+        // A second save keeps a backup; deleting removes both.
+        save_draft(&dir, 0xAB, &draft()).unwrap();
+        assert!(with_suffix(&path, ".bak").exists());
+        delete_draft(&dir, 0xAB);
+        assert_eq!(load_draft(&dir, 0xAB).unwrap(), None);
+        assert!(!with_suffix(&path, ".bak").exists());
+    }
+
+    #[test]
+    fn a_broken_draft_is_kept_aside_and_the_backup_is_used_when_there_is_one() {
+        let dir = scratch("broken");
+        save_draft(&dir, 7, &draft()).unwrap();
+        save_draft(&dir, 7, &draft()).unwrap(); // now there is a .bak
+        let path = draft_path(&dir, 7);
+        fs::write(&path, "{ this is not json").unwrap();
+        assert_eq!(
+            load_draft(&dir, 7).unwrap(),
+            Some(draft()),
+            "the backup is used"
+        );
+        assert!(
+            with_suffix(&path, ".broken").exists(),
+            "the damaged file is kept"
+        );
+    }
+
+    #[test]
+    fn a_broken_draft_with_no_backup_is_an_error_that_says_where_it_went_not_a_crash() {
+        let dir = scratch("broken2");
+        let path = draft_path(&dir, 7);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{\"format\":1,\"id\":3}").unwrap();
+        let error = load_draft(&dir, 7).unwrap_err();
+        assert!(error.contains(".broken"), "{error}");
+        assert!(with_suffix(&path, ".broken").exists());
+        assert_eq!(load_draft(&dir, 7).unwrap(), None, "and the way is clear");
+    }
+
+    #[test]
+    fn a_newer_draft_is_not_overwritten() {
+        let dir = scratch("newer");
+        let path = draft_path(&dir, 9);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "{\"format\":99}").unwrap();
+        assert!(save_draft(&dir, 9, &draft()).unwrap_err().contains("newer"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"format\":99}");
     }
 }

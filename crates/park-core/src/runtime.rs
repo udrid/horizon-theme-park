@@ -271,14 +271,12 @@ impl Ride {
         let physics = builder::physics_of(&file);
         let train = builder::train_of(&file, &course);
         let dwell = file.settings.dwell;
-        Ok(Ride::new(
-            file.id.clone(),
-            Some(file),
-            course,
-            physics,
-            train,
-            dwell,
-        ))
+        let platform = file
+            .platform
+            .map(|[min, max]| render::Platform { min, max });
+        let mut ride = Ride::new(file.id.clone(), Some(file), course, physics, train, dwell);
+        ride.platform = platform;
+        Ok(ride)
     }
 
     /// The pose of seat `index` when the front car is at `front`.
@@ -528,6 +526,13 @@ pub struct Runtime {
     ghost_drawn_at: u64,
     /// Are there ghost pieces in the world right now?
     ghost_present: bool,
+    /// The host player (the first player seen), whose draft this is (D76).
+    draft_owner: Option<u128>,
+    /// Has the draft file been looked for yet? And the `draft_rev` that is on disk.
+    draft_checked: bool,
+    draft_saved_rev: u64,
+    /// The station platform of the coaster being built, as placed in the world (S4).
+    placed_platform: Option<render::Platform>,
     /// Ticks since the world opened.
     now: u64,
     /// The last `delete` that is waiting to be repeated: player, ride, tick (S3).
@@ -565,6 +570,10 @@ impl Runtime {
             ghost_version: u64::MAX,
             ghost_drawn_at: 0,
             ghost_present: false,
+            draft_owner: None,
+            draft_checked: false,
+            draft_saved_rev: 0,
+            placed_platform: None,
             now: 0,
             pending_delete: None,
             park_dirty: false,
@@ -584,6 +593,10 @@ impl Runtime {
         self.build.reset();
         self.ghost_version = u64::MAX;
         self.ghost_present = false;
+        self.draft_owner = None;
+        self.draft_checked = false;
+        self.draft_saved_rev = 0;
+        self.placed_platform = None;
         self.pending_delete = None;
         self.cleanup_pending = true;
         self.loaded = false;
@@ -602,6 +615,11 @@ impl Runtime {
             host.world_dir()
         ));
         self.save_dirty(host);
+        if let (Some(dir), Some(owner)) = (self.world.clone(), self.draft_owner)
+            && self.draft_checked
+        {
+            self.write_draft(host, &dir, owner);
+        }
     }
 
     /// The track wand was used (a hook heard it). The work is queued for the next tick: commands
@@ -629,6 +647,17 @@ impl Runtime {
     /// A key went down (`key.keyboard.b`). B opens and closes the panel; while it is open R, Z,
     /// Y and H do their jobs and any other key cancels the finish ghost.
     pub fn build_key(&mut self, key: &str) {
+        // While the panel asks for a name, every key is typing (D76). The game cannot be told to
+        // ignore them, so W/A/S/D still walk and E still opens the inventory.
+        if self.build.is_naming() {
+            let rides = &self.rides;
+            let locked = &self.locked;
+            let outcome = self.build.name_key(key, |id| {
+                rides.iter().any(|r| r.id == id) || locked.iter().any(|l| l == id)
+            });
+            self.finished(outcome);
+            return;
+        }
         match key {
             "key.keyboard.b" => self.build.toggle(),
             _ if !self.build.is_open() => {}
@@ -673,14 +702,83 @@ impl Runtime {
             self.build.new_coaster(&format!("coaster-{n}"), feet, yaw);
             return;
         }
-        let rides = &self.rides;
-        let locked = &self.locked;
-        let outcome = self
-            .build
-            .confirm(|id| rides.iter().any(|r| r.id == id) || locked.iter().any(|l| l == id));
-        if let Outcome::Finished(ride) = outcome {
+        let outcome = self.build.confirm();
+        self.finished(outcome);
+    }
+
+    /// A ride was finished on screen: it takes the station platform that was placed for it, and
+    /// is queued to be saved and opened like `create`.
+    fn finished(&mut self, outcome: Outcome) {
+        if let Outcome::Finished(mut ride) = outcome {
+            ride.platform = self.placed_platform.take().map(|p| [p.min, p.max]);
             self.orders.push_back(Order::BuiltRide { ride });
         }
+    }
+
+    /// Keep the draft file in step with the unfinished coaster (D76): load it once when the
+    /// world is ready, write it after every build, undo or redo, delete it when the coaster is
+    /// finished.
+    fn draft_sync<H: Host>(&mut self, host: &mut H, players: &[PlayerInfo]) {
+        let Some(dir) = self.world.clone() else {
+            return;
+        };
+        if self.draft_owner.is_none() {
+            self.draft_owner = players.first().map(|p| p.uuid);
+        }
+        let Some(owner) = self.draft_owner else {
+            return;
+        };
+        if !self.draft_checked {
+            self.draft_checked = true;
+            match save::load_draft(&dir, owner) {
+                Ok(Some(draft)) => {
+                    self.build.restore(draft);
+                    self.placed_platform = self.build.platform();
+                    host.tell(
+                        owner,
+                        "Your unfinished coaster is back. Press B to carry on building.",
+                    );
+                }
+                Ok(None) => {}
+                Err(why) => host.tell(owner, &why),
+            }
+            self.draft_saved_rev = self.build.draft_rev;
+            return;
+        }
+        self.write_draft(host, &dir, owner);
+    }
+
+    /// Write (or delete) the draft if it changed since the last time.
+    fn write_draft<H: Host>(&mut self, host: &mut H, dir: &std::path::Path, owner: u128) {
+        if self.build.draft_rev == self.draft_saved_rev {
+            return;
+        }
+        self.draft_saved_rev = self.build.draft_rev;
+        match self.build.to_draft() {
+            Some(draft) => {
+                if let Err(why) = save::save_draft(dir, owner, &draft) {
+                    host.broadcast(&format!("Horizon Theme Park: {why}"));
+                }
+            }
+            None => save::delete_draft(dir, owner),
+        }
+    }
+
+    /// Place, move or remove the station platform of the coaster being built (S4).
+    fn platform_display(&mut self) {
+        let wanted = self.build.platform();
+        if wanted == self.placed_platform {
+            return;
+        }
+        if let Some(old) = self.placed_platform {
+            self.build_queue
+                .push_back(commands::fill(old.min, old.max, "minecraft:air"));
+        }
+        if let Some(new) = wanted {
+            self.build_queue
+                .push_back(commands::fill(new.min, new.max, commands::PLATFORM_BLOCK));
+        }
+        self.placed_platform = wanted;
     }
 
     /// The panel text for the HUD (None when closed). Works the preview out only when something
@@ -934,6 +1032,8 @@ impl Runtime {
         }
         self.wand_display(host, &players);
         self.ghost_display();
+        self.platform_display();
+        self.draft_sync(host, &players);
         self.sweep(host, &players);
         self.save_dirty(host);
     }
@@ -1140,6 +1240,9 @@ impl Runtime {
         {
             file.settings = old.settings.clone();
             file.trains = old.trains.clone();
+            if file.platform.is_none() {
+                file.platform = old.platform;
+            }
         }
         let id = file.id.clone();
         match self.install(host, file) {
@@ -1172,6 +1275,9 @@ impl Runtime {
             return;
         };
         host.run(&commands::kill_ride(id));
+        if let Some(platform) = self.rides[i].platform {
+            host.run(&commands::fill(platform.min, platform.max, "minecraft:air"));
+        }
         self.rides.remove(i);
         self.park_dirty = true;
         if let Some(dir) = &self.world
@@ -2280,7 +2386,14 @@ mod tests {
             drawn.iter().any(|c| c.contains("htp:ghost_rail")),
             "the finish path is drawn as ghost rails"
         );
-        click(&mut rt);
+        click(&mut rt); // accept the path: the panel asks for the name
+        assert!(rt.build.is_naming());
+        for key in ["backspace"; 9] {
+            rt.build_key(&format!("key.keyboard.{key}"));
+        }
+        for key in ["m", "a", "g", "i", "c", "minus", "1", "enter"] {
+            rt.build_key(&format!("key.keyboard.{key}"));
+        }
         for _ in 0..3 {
             rt.tick(&mut host);
         }
@@ -2288,16 +2401,134 @@ mod tests {
         assert!(
             dir.join("horizon-theme-park")
                 .join("rides")
-                .join("coaster-1.json")
+                .join("magic-1.json")
                 .exists(),
             "and saved"
         );
         assert!(!rt.build_open(), "the panel closes when the ride opens");
         let told: Vec<String> = host.tells.iter().map(|(_, t)| t.clone()).collect();
         assert!(
-            told.iter().any(|t| t.contains("Ride coaster-1 is built")),
+            told.iter().any(|t| t.contains("Ride magic-1 is built")),
             "{told:?}"
         );
+    }
+
+    #[test]
+    fn a_new_coaster_places_its_platform_and_the_draft_is_saved_restored_and_deleted() {
+        let (mut rt, mut host, dir) = world_with("builder-draft", &[], bystander());
+        rt.tick(&mut host);
+        host.take_commands();
+        let draft = save::draft_path(&dir, 1);
+        rt.build_key("key.keyboard.b");
+        click(&mut rt); // New coaster
+        click(&mut rt); // one piece
+        rt.tick(&mut host);
+        rt.tick(&mut host);
+        let sent = host.take_commands();
+        // The station platform: a fill of smooth stone, once.
+        let fills: Vec<&String> = sent.iter().filter(|c| c.starts_with("fill ")).collect();
+        assert_eq!(fills.len(), 1, "{fills:?}");
+        assert!(fills[0].ends_with(commands::PLATFORM_BLOCK), "{fills:?}");
+        // The draft is written after the build.
+        assert!(draft.exists(), "{draft:?}");
+        let nodes_on_disk = save::load_draft(&dir, 1).unwrap().unwrap().nodes.len();
+        assert_eq!(nodes_on_disk, rt.build.ride().unwrap().nodes.len());
+        // Undo is saved too.
+        rt.build_key("key.keyboard.z");
+        rt.tick(&mut host);
+        assert_eq!(save::load_draft(&dir, 1).unwrap().unwrap().nodes.len(), 4);
+        // Settings changes alone write nothing.
+        let modified = std::fs::metadata(&draft).unwrap().modified().unwrap();
+        rt.build_wheel(1.0);
+        rt.tick(&mut host);
+        assert_eq!(
+            std::fs::metadata(&draft).unwrap().modified().unwrap(),
+            modified
+        );
+
+        // A new session of the world: the draft comes back and the player is told.
+        let mut again = Runtime::new();
+        host.commands.retain(|c| !c.starts_with("fill "));
+        again.world_opened();
+        again.tick(&mut host);
+        again.tick(&mut host);
+        assert_eq!(again.build.ride().unwrap().nodes.len(), 4);
+        assert!(!again.build_open(), "it waits for B");
+        assert!(
+            host.tells
+                .iter()
+                .any(|(_, t)| t.contains("unfinished coaster is back"))
+        );
+        let fills_after = host
+            .commands
+            .iter()
+            .filter(|c| c.starts_with("fill "))
+            .count();
+        assert_eq!(
+            fills_after, 0,
+            "its platform is already in the world, so none is placed again"
+        );
+        again.build_key("key.keyboard.b");
+        assert!(again.build_open());
+    }
+
+    #[test]
+    fn a_broken_draft_does_not_crash_it_is_kept_aside_and_the_player_is_told() {
+        let (mut rt, mut host, dir) = world_with("builder-broken-draft", &[], bystander());
+        let draft = save::draft_path(&dir, 1);
+        std::fs::create_dir_all(draft.parent().unwrap()).unwrap();
+        std::fs::write(&draft, "{ not json").unwrap();
+        rt.world_opened();
+        rt.tick(&mut host);
+        rt.tick(&mut host);
+        assert!(rt.build.ride().is_none());
+        assert!(
+            host.tells.iter().any(|(_, t)| t.contains(".broken")),
+            "{:?}",
+            host.tells
+        );
+        assert!(!draft.exists());
+    }
+
+    #[test]
+    fn finishing_deletes_the_draft_and_the_ride_keeps_its_platform_until_it_is_deleted() {
+        let (mut rt, mut host, dir) = world_with("builder-platform", &[], bystander());
+        rt.tick(&mut host);
+        host.take_commands();
+        rt.build = crate::buildmode::tests::built_round_the_station();
+        rt.platform_display();
+        let platform = rt
+            .placed_platform
+            .expect("the platform of the built station");
+        // Make the draft exist, as it would have after the builds.
+        rt.build.draft_rev += 1;
+        rt.tick(&mut host);
+        assert!(save::draft_path(&dir, 1).exists());
+        rt.build_key("key.keyboard.h");
+        click(&mut rt);
+        rt.build_key("key.keyboard.enter");
+        for _ in 0..4 {
+            rt.tick(&mut host);
+        }
+        assert_eq!(rt.rides.len(), 1);
+        assert!(!save::draft_path(&dir, 1).exists(), "the draft is gone");
+        assert_eq!(
+            rt.rides[0].platform,
+            Some(platform),
+            "the ride owns the platform"
+        );
+        let saved = save::load_all(&dir).rides;
+        assert_eq!(saved[0].platform, Some([platform.min, platform.max]));
+        // Deleting the ride (typed twice) clears exactly those blocks.
+        host.take_commands();
+        rt.command("coaster delete coaster-1", caller());
+        rt.command("coaster delete coaster-1", caller());
+        rt.tick(&mut host);
+        assert!(host.take_commands().contains(&commands::fill(
+            platform.min,
+            platform.max,
+            "minecraft:air"
+        )));
     }
 
     #[test]
