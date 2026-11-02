@@ -29,6 +29,11 @@ pub const SLOPE_STEP: i32 = 5;
 pub const NODE_SPACING: f64 = 2.0;
 /// Nodes closer than this to each other are refused by `create` (D65), so a piece may not make them.
 pub const MIN_NODE_GAP: f64 = 1.0;
+/// Track must stay at least this far from the rest of the track (rails and trains need room), in
+/// blocks, except near the place where it joins.
+pub const CLEARANCE: f64 = 3.5;
+/// The stretch of track next to a join that is not compared (it is, of course, close).
+pub const JOIN_ZONE: f64 = 6.0;
 /// Steps used to walk along a piece when working out where it ends (more = more exact).
 const WALK_STEPS: usize = 64;
 
@@ -170,7 +175,7 @@ pub struct Piece {
     pub start_kind: Kind,
     /// Where the pen is afterwards.
     pub end: Head,
-    /// The radius of the turn in blocks (the screen shows it), or `None` for no turn.
+    /// The TIGHTEST radius of the turn in blocks (the screen shows it), or `None` for no turn.
     pub radius: Option<f64>,
 }
 
@@ -182,8 +187,10 @@ fn ease(u: f64) -> f64 {
 
 /// Heading and slope (radians) after walking `u` (0 to 1) of the piece.
 fn at(head: &Head, turn: f64, end_slope: f64, u: f64) -> (f64, f64) {
-    // The heading changes steadily (a constant-radius arc); the slope eases from the old to the new.
-    let heading = (head.heading + turn * u).to_radians();
+    // Both the heading and the slope ease in and out (smoothstep), so the sideways push ramps up
+    // gently instead of snapping on at the start of a turn, like the transition curves of a real
+    // coaster. The curvature is 0 at both ends and peaks at 1.5 times the average in the middle.
+    let heading = (head.heading + turn * ease(u)).to_radians();
     let slope = (head.slope + (end_slope - head.slope) * ease(u)).to_radians();
     (heading, slope)
 }
@@ -199,6 +206,63 @@ fn walk(head: &Head, turn: f64, end_slope: f64, length: f64, fraction: f64) -> D
         pos += direction(h, s) * (length * du);
     }
     pos
+}
+
+/// Points along the polyline through `nodes`, about one block apart, each with the distance
+/// walked from the first node.
+fn along(nodes: &[DVec3]) -> Vec<(DVec3, f64)> {
+    let mut out = Vec::new();
+    let mut walked = 0.0;
+    for pair in nodes.windows(2) {
+        let length = pair[0].distance(pair[1]);
+        let count = (length.ceil() as usize).max(1);
+        for k in 0..count {
+            let t = k as f64 / count as f64;
+            out.push((pair[0].lerp(pair[1], t), walked + length * t));
+        }
+        walked += length;
+    }
+    if let Some(last) = nodes.last() {
+        out.push((*last, walked));
+    }
+    out
+}
+
+/// Does the new stretch come within `CLEARANCE` blocks of the rest of the track? Returns the
+/// number (1 is the first) of the nearest old node to the worst spot. The new stretch starts at
+/// the last old node. The `JOIN_ZONE` blocks of old track next to that join are ignored, and so
+/// are those at the start of the lap when `closes_lap` (the finish arrives there).
+pub fn hits_track(old: &[NodeFile], new: &[NodeFile], closes_lap: bool) -> Option<usize> {
+    let to_vec = |n: &NodeFile| DVec3::new(n.pos[0], n.pos[1], n.pos[2]);
+    let old_points: Vec<DVec3> = old.iter().map(to_vec).collect();
+    let &head = old_points.last()?;
+    let old_samples = along(&old_points);
+    let total = old_samples.last().map_or(0.0, |s| s.1);
+    let mut new_points = vec![head];
+    new_points.extend(new.iter().map(to_vec));
+    let new_samples = along(&new_points);
+    let mut worst: Option<(f64, f64)> = None; // (distance, old arc length)
+    for &(a, arc) in &old_samples {
+        if total - arc < JOIN_ZONE || (closes_lap && arc < JOIN_ZONE) {
+            continue;
+        }
+        for &(b, _) in &new_samples {
+            let d = a.distance(b);
+            if d < CLEARANCE && worst.is_none_or(|w| d < w.0) {
+                worst = Some((d, arc));
+            }
+        }
+    }
+    let (_, arc) = worst?;
+    // The node at or just before that arc length.
+    let mut walked = 0.0;
+    for (i, pair) in old_points.windows(2).enumerate() {
+        walked += pair[0].distance(pair[1]);
+        if walked >= arc {
+            return Some(i + 1);
+        }
+    }
+    Some(old.len())
 }
 
 /// Build the next piece from `head`, or say in plain words why it can't be built.
@@ -240,8 +304,9 @@ pub fn build_piece(head: &Head, settings: &PieceSettings) -> Result<Piece, Strin
         heading: head.heading + turn,
         slope: end_slope,
     };
-    // A constant-radius arc: length = radius x angle.
-    let radius = (turn != 0.0).then(|| length / turn.abs().to_radians());
+    // The tightest radius, in the middle of the turn: the heading changes 1.5 times faster there
+    // than the average, so radius = length / (1.5 x angle in radians).
+    let radius = (turn != 0.0).then(|| length / (1.5 * turn.abs().to_radians()));
     Ok(Piece {
         nodes,
         start_kind: settings.element,
@@ -329,15 +394,15 @@ mod tests {
     }
 
     #[test]
-    fn a_right_turn_of_90_degrees_has_the_right_radius_and_ends_facing_west() {
+    fn a_right_turn_of_90_degrees_has_the_right_tightest_radius_and_ends_facing_west() {
         let p = build_piece(&head(), &settings(PieceType::Turn, 16, 90, 0)).unwrap();
         assert_eq!(p.end.heading, 90.0);
+        // Tightest radius = length / (1.5 x angle), because the heading eases in and out.
         let r = p.radius.unwrap();
-        assert!((r - 16.0 / (std::f64::consts::PI / 2.0)).abs() < 1e-9);
-        // Facing south, a right turn ends to the west (-X) and further south (+Z): (r, r) away.
+        assert!((r - 16.0 / (1.5 * std::f64::consts::PI / 2.0)).abs() < 1e-9);
+        // Facing south, a right turn ends to the west (-X) and further south (+Z).
         let end = DVec3::from(p.nodes.last().unwrap().pos);
-        assert!((end.x - (10.0 - r)).abs() < 0.01, "x {}", end.x);
-        assert!((end.z - (20.0 + r)).abs() < 0.01, "z {}", end.z);
+        assert!(end.x < 10.0 - 5.0 && end.z > 20.0 + 5.0, "{end:?}");
     }
 
     #[test]
@@ -461,12 +526,102 @@ mod tests {
     }
 
     #[test]
-    fn a_full_half_circle_comes_back_the_other_way() {
+    fn a_full_half_turn_comes_back_the_other_way_and_ends_level_with_where_it_began() {
         let p = build_piece(&head(), &settings(PieceType::Turn, 32, 180, 0)).unwrap();
         assert_eq!(p.end.heading, 180.0);
         let end = DVec3::from(p.nodes.last().unwrap().pos);
-        let r = p.radius.unwrap();
+        // The easing is symmetric, so the forward and back movements cancel exactly.
         assert!((end.z - 20.0).abs() < 0.05, "z {}", end.z);
-        assert!((end.x - (10.0 - 2.0 * r)).abs() < 0.05, "x {}", end.x);
+        assert!(end.x < 10.0 - 12.0 && end.x > 10.0 - 26.0, "x {}", end.x);
+    }
+
+    #[test]
+    fn the_sideways_curvature_is_tiny_at_both_ends_of_a_turn_and_peaks_in_the_middle() {
+        let h = head();
+        let rate = |u: f64| {
+            // Heading change per unit of the piece, by a small difference.
+            let (a, _) = at(&h, 90.0, 0.0, u - 1e-4);
+            let (b, _) = at(&h, 90.0, 0.0, u + 1e-4);
+            (b - a) / 2e-4
+        };
+        let peak = rate(0.5);
+        assert!((peak - 1.5 * std::f64::consts::FRAC_PI_2).abs() < 1e-3);
+        assert!(rate(0.02) < 0.1 * peak, "start {}", rate(0.02));
+        assert!(rate(0.98) < 0.1 * peak, "end {}", rate(0.98));
+    }
+
+    #[test]
+    fn two_turns_in_a_row_join_with_the_same_heading_and_slope() {
+        let first = build_piece(&head(), &settings(PieceType::TurnSlope, 20, 45, 25)).unwrap();
+        let second = build_piece(&first.end, &settings(PieceType::TurnSlope, 20, 45, -10)).unwrap();
+        assert_eq!(first.end.heading, 45.0);
+        assert_eq!(first.end.slope, 25.0);
+        assert_eq!(second.end.heading, 90.0);
+        // The second piece leaves in the direction the first arrived in.
+        let leave = (DVec3::from(second.nodes[0].pos) - first.end.pos).normalize();
+        assert!(angle_between(leave, first.end.direction()) < 8.0);
+    }
+
+    fn node_at(x: f64, y: f64, z: f64) -> NodeFile {
+        NodeFile {
+            pos: [x, y, z],
+            roll: 0.0,
+            kind: Kind::Track,
+        }
+    }
+
+    /// A straight old track along +Z from z = 0 to z = 40 at height 70.
+    fn old_track() -> Vec<NodeFile> {
+        (0..=20)
+            .map(|i| node_at(0.0, 70.0, 2.0 * i as f64))
+            .collect()
+    }
+
+    /// A path that leaves the old end sideways and crosses the old track at z = 20, at `height`.
+    fn crossing_path(height: f64) -> Vec<NodeFile> {
+        let mut path = vec![node_at(-6.0, 70.0, 44.0), node_at(-9.0, height, 30.0)];
+        path.extend((0..=6).map(|i| node_at(-9.0 + 3.0 * i as f64, height, 20.0)));
+        path
+    }
+
+    #[test]
+    fn a_new_stretch_crossing_the_old_track_at_the_same_height_is_refused() {
+        let hit = hits_track(&old_track(), &crossing_path(70.0), false);
+        // It crosses near z = 20, which is node 11 (nodes are 2 blocks apart, 1 is the first).
+        assert!(matches!(hit, Some(10..=12)), "{hit:?}");
+    }
+
+    #[test]
+    fn the_same_crossing_4_blocks_above_is_allowed() {
+        assert_eq!(hits_track(&old_track(), &crossing_path(74.0), false), None);
+    }
+
+    #[test]
+    fn leaving_straight_on_from_the_end_is_not_a_collision_with_itself() {
+        let ahead: Vec<NodeFile> = (1..=8)
+            .map(|i| node_at(0.0, 70.0, 40.0 + 2.0 * i as f64))
+            .collect();
+        assert_eq!(hits_track(&old_track(), &ahead, false), None);
+    }
+
+    #[test]
+    fn a_pass_beside_the_middle_is_caught_but_arriving_at_the_start_of_the_lap_is_not() {
+        // Running back alongside the old track, 2 blocks away: caught.
+        let beside: Vec<NodeFile> = (1..=6)
+            .map(|i| node_at(2.0, 70.0, 40.0 - 4.0 * i as f64))
+            .collect();
+        assert!(hits_track(&old_track(), &beside, true).is_some());
+        // A lap closed by a path that goes round and arrives at the first node along its line:
+        // allowed when it closes the lap (the first 6 blocks are ignored), caught if it did not.
+        let around = vec![
+            node_at(12.0, 70.0, 44.0),
+            node_at(12.0, 70.0, 0.0),
+            node_at(12.0, 70.0, -12.0),
+            node_at(0.0, 70.0, -12.0),
+            node_at(0.0, 70.0, -4.0),
+            node_at(0.0, 70.0, -1.0),
+        ];
+        assert_eq!(hits_track(&old_track(), &around, true), None);
+        assert!(hits_track(&old_track(), &around, false).is_some());
     }
 }

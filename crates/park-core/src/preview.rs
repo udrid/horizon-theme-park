@@ -15,7 +15,7 @@ use crate::coaster::physics::Train;
 use crate::coaster::sim::{self, Sample};
 use crate::coaster::spline::Track;
 use crate::coaster::table::Table;
-use crate::pieces::{Head, Piece, PieceSettings, build_piece};
+use crate::pieces::{Head, Piece, PieceSettings, build_piece, hits_track};
 use crate::report::{AIRTIME_MIN_G, LATERAL_MAX_G, RATE_MAX_G_PER_S, VALLEY_MAX_G};
 use crate::save::{Kind, NodeFile, RideFile};
 use glam::DVec3;
@@ -177,6 +177,16 @@ pub fn preview(ride: &RideFile, piece: Option<&Piece>) -> Result<Preview, String
         issues.push(
             "The train runs out of speed before the end of the track. Add a lift or lower the hills."
                 .to_string(),
+        );
+    }
+
+    // Rails through rails, or trains through trains, would be a disaster (and a shame).
+    if let Some(piece) = piece
+        && let Some(n) = hits_track(&ride.nodes, &piece.nodes, false)
+    {
+        issues.insert(
+            0,
+            format!("Would hit your track near node {n}: move it away or raise it."),
         );
     }
 

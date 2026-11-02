@@ -14,7 +14,7 @@
 //!   4. If nothing passes, we say why in plain words.
 
 use crate::builder::{cars_of, course_from, physics_of, spacing_of};
-use crate::pieces::{Head, MIN_NODE_GAP, NODE_SPACING};
+use crate::pieces::{Head, MIN_NODE_GAP, NODE_SPACING, hits_track};
 use crate::report::{self, Blocker};
 use crate::save::{Kind, NodeFile, RideFile};
 use glam::DVec3;
@@ -138,7 +138,7 @@ pub fn finish(ride: &RideFile, head: &Head) -> Result<Finish, String> {
         // The curve's last node (the target) starts the brake zone.
         let curve_end = new_nodes.len() - (brake_nodes - 1) - 1;
         new_nodes[curve_end].kind = Kind::Brake;
-        match check(ride, &new_nodes) {
+        match check(ride, &new_nodes, target.y > head.pos.y + 1.0) {
             Ok(()) => {
                 return Ok(Finish {
                     nodes: new_nodes,
@@ -174,8 +174,19 @@ fn sample(p0: DVec3, m0: DVec3, p1: DVec3, m1: DVec3) -> (Vec<NodeFile>, f64) {
     (nodes, length)
 }
 
+/// What to tell the builder when the train runs out of speed before the station.
+fn stall_message(station_above: bool) -> String {
+    if station_above {
+        "The station is above your track's end: build up to about its height first, or add a lift piece."
+            .to_string()
+    } else {
+        "The train runs out of speed before the station. Make the last hill lower so it keeps its speed, or add a lift."
+            .to_string()
+    }
+}
+
 /// Try the ride with the new nodes added: valid, stoppable, and within the limits near the new part.
-fn check(ride: &RideFile, new_nodes: &[NodeFile]) -> Result<(), String> {
+fn check(ride: &RideFile, new_nodes: &[NodeFile], station_above: bool) -> Result<(), String> {
     let mut trial = ride.clone();
     trial.nodes.extend(new_nodes.iter().cloned());
     // Nodes too close together (the end of a tight curve) would be refused by `create`.
@@ -187,6 +198,12 @@ fn check(ride: &RideFile, new_nodes: &[NodeFile]) -> Result<(), String> {
         }
         previous = p;
     }
+    // The path must not run through the track you already have (a tight loop-back can).
+    if let Some(n) = hits_track(&ride.nodes, new_nodes, true) {
+        return Err(format!(
+            "The path would run into your track near node {n}. End your track farther from the station, or on a different side of it."
+        ));
+    }
     let course = course_from(&trial)?;
     let cars = cars_of(&trial);
     let spacing = spacing_of(&trial);
@@ -197,7 +214,7 @@ fn check(ride: &RideFile, new_nodes: &[NodeFile]) -> Result<(), String> {
                 "The train arrives too fast for the brake run. Make the last hill lower, or end farther from the station.".to_string()
             }
             Blocker::Stall { .. } => {
-                "The train runs out of speed before the station. Make the last hill lower so it keeps its speed, or add a lift.".to_string()
+                stall_message(station_above)
             }
         });
     }
@@ -384,5 +401,39 @@ mod tests {
             e.contains("wider") || e.contains("too tight") || e.contains("too fast"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn the_stall_message_depends_on_whether_the_station_is_above() {
+        assert!(stall_message(true).contains("station is above your track's end"));
+        assert!(stall_message(true).contains("add a lift piece"));
+        assert!(stall_message(false).contains("hill lower"));
+    }
+
+    #[test]
+    fn no_accepted_finish_ever_runs_into_the_old_track_even_with_the_stiffest_curves() {
+        // Heads close to the approach, pointing every which way: whatever is accepted is clear.
+        let (ride, _) = ride_round_the_station();
+        let mut accepted = 0;
+        for (x, z) in [
+            (14.0, -20.0),
+            (8.0, -30.0),
+            (20.0, -18.0),
+            (6.0, -22.0),
+            (30.0, -40.0),
+        ] {
+            for heading in [0.0, 45.0, 90.0, -45.0, -90.0, 135.0] {
+                let head = Head {
+                    pos: DVec3::new(x, 70.0, z),
+                    heading,
+                    slope: 0.0,
+                };
+                if let Ok(f) = finish(&ride, &head) {
+                    accepted += 1;
+                    assert_eq!(hits_track(&ride.nodes, &f.nodes, true), None);
+                }
+            }
+        }
+        let _ = accepted;
     }
 }

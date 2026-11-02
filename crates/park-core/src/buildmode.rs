@@ -19,7 +19,7 @@ use crate::coaster::table::Table;
 use crate::finish::{self, Finish};
 use crate::pieces::{
     Head, MAX_LENGTH, MAX_SLOPE, MAX_TURN, MIN_LENGTH, Piece, PieceSettings, PieceType, SLOPE_STEP,
-    TURN_STEP, build_piece,
+    TURN_STEP, build_piece, hits_track,
 };
 use crate::preview::{self, Preview, Setting};
 use crate::report::{self, Blocker};
@@ -385,6 +385,14 @@ impl BuildMode {
                 return;
             }
         };
+        if let Some(n) = hits_track(&ride.nodes, &piece.nodes, false) {
+            self.message = Some((
+                format!("Would hit your track near node {n}: move it away or raise it."),
+                Tone::Red,
+            ));
+            self.version += 1;
+            return;
+        }
         let last = ride.nodes.len() - 1;
         let step = Step {
             piece: piece.clone(),
