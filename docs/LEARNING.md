@@ -455,3 +455,5 @@ A tool that draws the last part of the track for you, smoothly back into the sta
 - **Easing**: starting and ending a change gently (like a car pulling away), so a slope never changes in a sudden kink.
 - **Invisible nodes (phantoms)**: the physics wants a closed loop, but a half-built track is open. For each preview we add two helper nodes straight ahead of the end and two behind the station. They are never drawn or saved; they only close the loop on paper.
 - **Dry run**: driving the train over the track in the computer, with no game, to read its speed and g-forces.
+- **Hermite curve**: a smooth curve defined by its two end points and the direction (and "stiffness") to leave and arrive with. The finish helper uses it to join your track's end to the station.
+- **Brake run**: the straight stretch of brake track just before the station that slows the train so it can stop.

@@ -8,6 +8,7 @@
 pub mod builder;
 pub mod coaster;
 pub mod commands;
+pub mod finish;
 pub mod host;
 pub mod pieces;
 pub mod preview;
