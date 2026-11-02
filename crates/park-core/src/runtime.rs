@@ -647,17 +647,6 @@ impl Runtime {
     /// A key went down (`key.keyboard.b`). B opens and closes the panel; while it is open R, Z,
     /// Y and H do their jobs and any other key cancels the finish ghost.
     pub fn build_key(&mut self, key: &str) {
-        // While the panel asks for a name, every key is typing (D76). The game cannot be told to
-        // ignore them, so W/A/S/D still walk and E still opens the inventory.
-        if self.build.is_naming() {
-            let rides = &self.rides;
-            let locked = &self.locked;
-            let outcome = self.build.name_key(key, |id| {
-                rides.iter().any(|r| r.id == id) || locked.iter().any(|l| l == id)
-            });
-            self.finished(outcome);
-            return;
-        }
         match key {
             "key.keyboard.b" => self.build.toggle(),
             _ if !self.build.is_open() => {}
@@ -701,6 +690,17 @@ impl Runtime {
             }
             self.build.new_coaster(&format!("coaster-{n}"), feet, yaw);
             return;
+        }
+        // The suggested name may have been taken since the coaster was started (by the wand, say).
+        if self.build.is_finishing()
+            && let Some(name) = self.build.name().map(str::to_string)
+            && self.name_taken(&name)
+        {
+            let mut n = 1;
+            while self.name_taken(&format!("coaster-{n}")) {
+                n += 1;
+            }
+            self.build.rename(&format!("coaster-{n}"));
         }
         let outcome = self.build.confirm();
         self.finished(outcome);
@@ -2386,14 +2386,7 @@ mod tests {
             drawn.iter().any(|c| c.contains("htp:ghost_rail")),
             "the finish path is drawn as ghost rails"
         );
-        click(&mut rt); // accept the path: the panel asks for the name
-        assert!(rt.build.is_naming());
-        for key in ["backspace"; 9] {
-            rt.build_key(&format!("key.keyboard.{key}"));
-        }
-        for key in ["m", "a", "g", "i", "c", "minus", "1", "enter"] {
-            rt.build_key(&format!("key.keyboard.{key}"));
-        }
+        click(&mut rt); // accept the path: the ride is saved at once as coaster-1
         for _ in 0..3 {
             rt.tick(&mut host);
         }
@@ -2401,14 +2394,14 @@ mod tests {
         assert!(
             dir.join("horizon-theme-park")
                 .join("rides")
-                .join("magic-1.json")
+                .join("coaster-1.json")
                 .exists(),
             "and saved"
         );
         assert!(!rt.build_open(), "the panel closes when the ride opens");
         let told: Vec<String> = host.tells.iter().map(|(_, t)| t.clone()).collect();
         assert!(
-            told.iter().any(|t| t.contains("Ride magic-1 is built")),
+            told.iter().any(|t| t.contains("Ride coaster-1 is built")),
             "{told:?}"
         );
     }
@@ -2506,7 +2499,6 @@ mod tests {
         assert!(save::draft_path(&dir, 1).exists());
         rt.build_key("key.keyboard.h");
         click(&mut rt);
-        rt.build_key("key.keyboard.enter");
         for _ in 0..4 {
             rt.tick(&mut host);
         }

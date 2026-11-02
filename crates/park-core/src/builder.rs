@@ -23,7 +23,7 @@ pub const MIN_NODES: usize = 4;
 /// Two neighbouring nodes must be at least this far apart, in blocks (D65).
 pub const MIN_GAP: f64 = 1.0;
 /// The longest ride name (S1).
-pub const MAX_NAME: usize = 32;
+const MAX_NAME: usize = 32;
 /// The preview and the node markers stay for this many ticks after the last wand use (S2: 30 s).
 pub const PREVIEW_TICKS: u64 = 600;
 /// A node is placed this far above the clicked block's centre (D62).

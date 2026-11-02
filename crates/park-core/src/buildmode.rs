@@ -13,9 +13,7 @@
 //!   4. **H** asks the finish helper for a path back to the station; right-click accepts it and
 //!      the ride is complete; any other key cancels it.
 
-use crate::builder::{
-    STOP_MARGIN, cars_of, check_name, course_from, node_distances, physics_of, spacing_of,
-};
+use crate::builder::{STOP_MARGIN, cars_of, course_from, node_distances, physics_of, spacing_of};
 use crate::coaster::spline::Track;
 use crate::coaster::table::Table;
 use crate::finish::{self, Finish};
@@ -72,14 +70,6 @@ enum Screen {
     Building,
     /// The finish helper's ghost is on show.
     Finishing(Finish),
-    /// The path was accepted; the player is typing the ride's name (D76). `done` is the whole
-    /// checked ride.
-    Naming {
-        plan: Finish,
-        done: Box<RideFile>,
-        text: String,
-        error: Option<String>,
-    },
 }
 
 /// What a panel line looks like.
@@ -259,9 +249,6 @@ impl BuildMode {
 
     /// **B**: open or close the panel. Closing keeps the unfinished coaster for next time.
     pub fn toggle(&mut self) {
-        if self.is_naming() {
-            return;
-        }
         self.open = !self.open;
         self.message = None;
         if let Screen::Finishing(_) = self.screen {
@@ -384,7 +371,6 @@ impl BuildMode {
                 Outcome::Nothing
             }
             Screen::Finishing(plan) => self.accept_finish(&plan),
-            Screen::Naming { .. } => Outcome::Nothing,
         }
     }
 
@@ -494,7 +480,7 @@ impl BuildMode {
                 }
                 self.changed();
             }
-            Screen::Menu | Screen::Naming { .. } => {}
+            Screen::Menu => {}
         }
     }
 
@@ -528,95 +514,31 @@ impl BuildMode {
             self.changed();
             return Outcome::Nothing;
         }
-        // The path is good: ask for the name, with the suggested one already typed in (D76).
+        // The path is good: the coaster is complete and the next B starts a fresh menu (D77: the
+        // name stays coaster-N; renaming lives on M4's control panel).
+        self.ride = None;
+        self.screen = Screen::Menu;
+        self.undo.clear();
+        self.redo.clear();
+        self.open = false;
         self.message = None;
-        let text = done.id.clone();
-        self.screen = Screen::Naming {
-            plan: plan.clone(),
-            text,
-            done: Box::new(done),
-            error: None,
-        };
+        self.draft_rev += 1;
         self.changed();
-        Outcome::Nothing
+        Outcome::Finished(done)
     }
 
-    /// Is the panel asking for the ride's name?
-    pub fn is_naming(&self) -> bool {
-        matches!(self.screen, Screen::Naming { .. })
-    }
-
-    /// A key while naming (D76): letters, digits and `-` type, Backspace deletes, Enter confirms,
-    /// Escape goes back to the finish ghost. Returns the finished ride on Enter.
-    pub fn name_key(&mut self, key: &str, exists: impl Fn(&str) -> bool) -> Outcome {
-        let Screen::Naming {
-            plan,
-            done,
-            text,
-            error,
-        } = &mut self.screen
-        else {
-            return Outcome::Nothing;
-        };
-        let name = key.strip_prefix("key.keyboard.").unwrap_or("");
-        match name {
-            "escape" => {
-                let plan = plan.clone();
-                self.screen = Screen::Finishing(plan);
-                self.message = Some((
-                    "Finish path ready. Right-click to accept, any other key to cancel."
-                        .to_string(),
-                    Tone::Good,
-                ));
-                self.changed();
-            }
-            "backspace" => {
-                text.pop();
-                *error = None;
-                self.changed();
-            }
-            "enter" | "keypad.enter" => {
-                if let Err(why) = check_name(text) {
-                    *error = Some(why);
-                } else if exists(text) {
-                    *error = Some(format!("A ride called {text} already exists."));
-                } else {
-                    let mut ride = (**done).clone();
-                    ride.id = text.clone();
-                    // The coaster is complete: the next B starts a fresh menu.
-                    self.ride = None;
-                    self.screen = Screen::Menu;
-                    self.undo.clear();
-                    self.redo.clear();
-                    self.open = false;
-                    self.message = None;
-                    self.draft_rev += 1;
-                    self.changed();
-                    return Outcome::Finished(ride);
-                }
-                self.changed();
-            }
-            other => {
-                let typed = match other {
-                    "minus" => Some('-'),
-                    s if s.len() == 1
-                        && s.chars()
-                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) =>
-                    {
-                        s.chars().next()
-                    }
-                    _ => None,
-                };
-                if let Some(c) = typed {
-                    if text.chars().count() < crate::builder::MAX_NAME {
-                        text.push(c);
-                    }
-                    *error = None;
-                    self.changed();
-                }
-            }
+    /// Give the coaster being built another name (used when its suggested name has been taken
+    /// meanwhile).
+    pub fn rename(&mut self, name: &str) {
+        if let Some(ride) = self.ride.as_mut() {
+            ride.id = name.to_string();
+            self.draft_rev += 1;
         }
-        Outcome::Nothing
+    }
+
+    /// The name the coaster will get, if there is one.
+    pub fn name(&self) -> Option<&str> {
+        self.ride.as_ref().map(|r| r.id.as_str())
     }
 
     /// The preview for the current settings, computed only when something changed.
@@ -786,7 +708,7 @@ impl BuildMode {
                     is_finish: false,
                 })
             }
-            Screen::Finishing(plan) | Screen::Naming { plan, .. } => Some(Ghost {
+            Screen::Finishing(plan) => Some(Ghost {
                 lead_in,
                 new: plan.nodes.iter().map(|n| n.pos).collect(),
                 is_finish: true,
@@ -827,20 +749,6 @@ impl BuildMode {
                 }
                 return Some(Panel {
                     title: "Finish helper".to_string(),
-                    lines,
-                });
-            }
-            Screen::Naming { text, error, .. } => {
-                lines.push(line("Name your coaster:", Tone::Normal));
-                lines.push(line(format!("> {text}_"), Tone::Selected));
-                if let Some(why) = error {
-                    lines.push(line(why, Tone::Red));
-                }
-                lines.push(line("Letters, digits and - (up to 32)", Tone::Grey));
-                lines.push(line("Enter: open the ride", Tone::Normal));
-                lines.push(line("Backspace: delete  Esc: back", Tone::Grey));
-                return Some(Panel {
-                    title: "Name".to_string(),
                     lines,
                 });
             }
@@ -975,10 +883,6 @@ pub(crate) mod tests {
         b.toggle();
         b.new_coaster("coaster-1", DVec3::new(100.3, 64.0, 200.7), 0.0);
         b
-    }
-
-    fn no_rides(_: &str) -> bool {
-        false
     }
 
     #[test]
@@ -1210,7 +1114,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn h_shows_the_finish_ghost_any_key_cancels_and_right_click_leads_to_naming() {
+    fn h_shows_the_finish_ghost_any_key_cancels_and_right_click_completes_the_ride_as_coaster_n() {
         let mut b = built_round_the_station();
         b.finish();
         if !b.is_finishing() {
@@ -1228,119 +1132,28 @@ pub(crate) mod tests {
         assert!(!b.is_finishing());
         b.finish();
         assert!(b.is_finishing());
-        // Accepting does not finish yet: the panel asks for the name, with coaster-1 typed in.
-        assert_eq!(b.confirm(), Outcome::Nothing);
-        assert!(b.is_naming());
-        let text: Vec<String> = b
-            .panel()
-            .unwrap()
-            .lines
-            .iter()
-            .map(|l| l.text.clone())
-            .collect();
-        assert!(text.iter().any(|t| t == "> coaster-1_"), "{text:?}");
-        assert!(b.ghost().unwrap().is_finish, "the path stays on show");
-    }
-
-    fn typed(b: &mut BuildMode, keys: &[&str]) -> Outcome {
-        let mut out = Outcome::Nothing;
-        for k in keys {
-            out = b.name_key(&format!("key.keyboard.{k}"), no_rides);
-        }
-        out
-    }
-
-    #[test]
-    fn naming_types_letters_digits_and_dashes_backspace_deletes_enter_finishes() {
-        let mut b = built_round_the_station();
-        b.finish();
-        b.confirm();
-        // Clear the suggestion (9 characters), then type a new name.
-        typed(&mut b, &["backspace"; 9]);
-        typed(
-            &mut b,
-            &[
-                "t", "h", "u", "n", "d", "e", "r", "minus", "2", "shift", "f1",
-            ],
-        );
-        let text: Vec<String> = b
-            .panel()
-            .unwrap()
-            .lines
-            .iter()
-            .map(|l| l.text.clone())
-            .collect();
-        assert!(text.iter().any(|t| t == "> thunder-2_"), "{text:?}");
-        let Outcome::Finished(ride) = typed(&mut b, &["enter"]) else {
-            panic!("did not finish");
+        let rev = b.draft_rev;
+        // No naming step (D77): the ride is complete at once, under its suggested name.
+        let Outcome::Finished(ride) = b.confirm() else {
+            panic!("the ride did not finish");
         };
-        assert_eq!(ride.id, "thunder-2");
+        assert_eq!(ride.id, "coaster-1");
         assert!(course_from(&ride).is_ok());
         assert!(b.in_menu() && b.ride().is_none() && !b.is_open());
+        assert!(b.draft_rev > rev, "the draft is deleted");
+        assert!(b.to_draft().is_none());
     }
 
     #[test]
-    fn a_refused_name_shows_a_red_reason_and_a_taken_name_too() {
+    fn a_name_taken_meanwhile_can_be_changed_before_finishing() {
         let mut b = built_round_the_station();
+        assert_eq!(b.name(), Some("coaster-1"));
+        b.rename("coaster-2");
         b.finish();
-        b.confirm();
-        typed(&mut b, &["backspace"; 9]);
-        // Empty name.
-        assert_eq!(typed(&mut b, &["enter"]), Outcome::Nothing);
-        let panel = b.panel().unwrap();
-        assert!(panel.lines.iter().any(|l| l.tone == Tone::Red), "{panel:?}");
-        // "demo" is reserved (S1 rules).
-        typed(&mut b, &["d", "e", "m", "o", "enter"]);
-        assert!(b.is_naming());
-        // A name already used by another ride.
-        typed(&mut b, &["backspace"; 4]);
-        typed(&mut b, &["a", "b"]);
-        assert_eq!(
-            b.name_key("key.keyboard.enter", |n| n == "ab"),
-            Outcome::Nothing
-        );
-        let red: Vec<String> = b
-            .panel()
-            .unwrap()
-            .lines
-            .iter()
-            .filter(|l| l.tone == Tone::Red)
-            .map(|l| l.text.clone())
-            .collect();
-        assert!(red.iter().any(|t| t.contains("already exists")), "{red:?}");
-        // Typing clears the red line; the length stops at 32.
-        typed(&mut b, &["x"; 40]);
-        let text: Vec<String> = b
-            .panel()
-            .unwrap()
-            .lines
-            .iter()
-            .map(|l| l.text.clone())
-            .collect();
-        assert!(
-            text.iter().any(|t| t.chars().count() == 2 + 32 + 1),
-            "{text:?}"
-        );
-    }
-
-    #[test]
-    fn escape_goes_back_to_the_finish_ghost_and_b_is_just_a_letter_while_naming() {
-        let mut b = built_round_the_station();
-        b.finish();
-        b.confirm();
-        b.toggle(); // ignored while naming
-        assert!(b.is_open() && b.is_naming());
-        typed(&mut b, &["b"]);
-        let text: Vec<String> = b
-            .panel()
-            .unwrap()
-            .lines
-            .iter()
-            .map(|l| l.text.clone())
-            .collect();
-        assert!(text.iter().any(|t| t == "> coaster-1b_"), "{text:?}");
-        typed(&mut b, &["escape"]);
-        assert!(b.is_finishing() && !b.is_naming());
+        let Outcome::Finished(ride) = b.confirm() else {
+            panic!("the ride did not finish");
+        };
+        assert_eq!(ride.id, "coaster-2");
     }
 
     #[test]
