@@ -450,3 +450,6 @@ A tool that draws the last part of the track for you, smoothly back into the sta
 - **Client and server**: the *client* is the part that draws the screen and hears your keys. The *server* is the part that runs the world. In single-player both run inside one program.
 - **Static (shared state)**: one value that lives for the whole program, like a noticeboard on a wall. Client code writes a note on it, server code reads it. T0 checks that this really works in single-player.
 - **Claiming the wheel**: when our code says "I'll take this scroll", the hotbar does not also scroll.
+- **Head (the pen)**: where the track ends right now, which way it points and how steep it is. Each new piece starts from the head, so joins are smooth.
+- **Heading / yaw**: the compass direction in degrees. In Minecraft 0 is south and 90 is west. Turning right adds degrees.
+- **Easing**: starting and ending a change gently (like a car pulling away), so a slope never changes in a sudden kink.

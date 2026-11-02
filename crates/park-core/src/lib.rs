@@ -9,6 +9,7 @@ pub mod builder;
 pub mod coaster;
 pub mod commands;
 pub mod host;
+pub mod pieces;
 pub mod render;
 pub mod report;
 pub mod runtime;
